@@ -1,0 +1,23 @@
+{
+  "name": "opencode-openai-proxy",
+  "version": "1.0.0",
+  "description": "OpenCode plugin that exposes an OpenAI-compatible HTTP proxy backed by your OpenCode providers",
+  "main": "index.js",
+  "type": "module",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "openai",
+    "proxy",
+    "llm"
+  ],
+  "author": "KochC",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KochC/opencode-openai-proxy.git"
+  },
+  "peerDependencies": {
+    "opencode-ai": "*"
+  }
+}
