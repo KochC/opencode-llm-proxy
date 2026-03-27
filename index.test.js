@@ -32,6 +32,47 @@ function createClient() {
   }
 }
 
+function createStreamingClient(chunks) {
+  async function* makeStream() {
+    for (const chunk of chunks) {
+      yield chunk
+    }
+  }
+
+  return {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: {
+          providers: [
+            {
+              id: "openai",
+              models: { "gpt-4o": { id: "gpt-4o", name: "GPT-4o" } },
+            },
+          ],
+        },
+      }),
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-123" } }),
+      promptAsync: async () => {},
+      messages: async () => ({
+        data: [
+          {
+            role: "assistant",
+            tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+            finish: "end_turn",
+          },
+        ],
+      }),
+    },
+    event: {
+      subscribe: async () => ({ stream: makeStream() }),
+    },
+  }
+}
+
 test("OPTIONS preflight returns CORS headers", async () => {
   const handler = createProxyFetchHandler(createClient())
   const request = new Request("http://127.0.0.1:4010/v1/models", {
@@ -260,8 +301,26 @@ test("missing messages field returns 400", async () => {
   assert.ok(body.error.message.includes("messages"))
 })
 
-test("stream: true returns 400 (not implemented)", async () => {
-  const handler = createProxyFetchHandler(createClient())
+test("stream: true returns SSE response", async () => {
+  const events = [
+    {
+      type: "message.part.updated",
+      properties: {
+        part: { sessionID: "sess-123", type: "text" },
+        delta: "Hello",
+      },
+    },
+    {
+      type: "message.part.updated",
+      properties: {
+        part: { sessionID: "sess-123", type: "text" },
+        delta: " world",
+      },
+    },
+    { type: "session.idle", properties: { sessionID: "sess-123" } },
+  ]
+
+  const handler = createProxyFetchHandler(createStreamingClient(events))
   const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -273,10 +332,66 @@ test("stream: true returns 400 (not implemented)", async () => {
   })
 
   const response = await handler(request)
+
+  assert.equal(response.status, 200)
+  assert.ok(response.headers.get("content-type")?.includes("text/event-stream"))
+
+  const text = await response.text()
+  assert.ok(text.includes("chat.completion.chunk"))
+  assert.ok(text.includes("Hello"))
+  assert.ok(text.includes(" world"))
+  assert.ok(text.includes("[DONE]"))
+})
+
+test("stream: true with unknown model returns 502", async () => {
+  const handler = createProxyFetchHandler(createClient()) // no providers
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "nonexistent-model",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
   const body = await response.json()
 
-  assert.equal(response.status, 400)
-  assert.ok(body.error.message.toLowerCase().includes("stream"))
+  assert.equal(response.status, 502)
+  assert.ok(body.error.message.includes("nonexistent-model"))
+})
+
+test("stream: true propagates session.error into the SSE stream", async () => {
+  const events = [
+    {
+      type: "session.error",
+      properties: {
+        sessionID: "sess-123",
+        error: { message: "Model overloaded" },
+      },
+    },
+    { type: "session.idle", properties: { sessionID: "sess-123" } },
+  ]
+
+  const handler = createProxyFetchHandler(createStreamingClient(events))
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+  assert.ok(response.headers.get("content-type")?.includes("text/event-stream"))
+
+  const text = await response.text()
+  assert.ok(text.includes("server_error") || text.includes("Model overloaded"))
+  assert.ok(text.includes("[DONE]"))
 })
 
 test("unknown model returns 502", async () => {
@@ -446,7 +561,7 @@ describe("buildSystemPrompt", () => {
 
   it("always includes the proxy hint lines", () => {
     const result = buildSystemPrompt([], {})
-    assert.ok(result.includes("OpenAI-compatible proxy"))
+    assert.ok(result.includes("proxy backed by OpenCode"))
     assert.ok(result.includes("Return only the assistant"))
   })
 
