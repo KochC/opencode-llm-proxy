@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.2.0...v1.3.0) (2026-03-27)
+
+
+### Features
+
+* expand tests, add ESLint, update README ([b15cb94](https://github.com/KochC/opencode-llm-proxy/commit/b15cb94b794ccb87ce0b99c32acce2cc496b5784))
+
 ## [1.2.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.1.0...v1.2.0) (2026-03-27)
 
 
