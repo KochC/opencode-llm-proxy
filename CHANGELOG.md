@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.5.0...v1.6.0) (2026-03-27)
+
+
+### Features
+
+* add Anthropic Messages API and Google Gemini API endpoints ([#40](https://github.com/KochC/opencode-llm-proxy/issues/40)) ([c516686](https://github.com/KochC/opencode-llm-proxy/commit/c51668634e1a25ff0fd2fb21e9c9263f2f841535))
+
 ## [1.5.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.4.0...v1.5.0) (2026-03-27)
 
 
