@@ -1,0 +1,65 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in as much detail as you can.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: How do we reproduce the issue?
+      placeholder: |
+        1. Start opencode with the plugin loaded
+        2. Send a request to POST /v1/chat/completions with ...
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: request
+    attributes:
+      label: Request / response (if applicable)
+      description: Paste the curl command or request body and the response you received.
+      render: bash
+
+  - type: input
+    id: version
+    attributes:
+      label: opencode-llm-proxy version
+      placeholder: "e.g. 1.6.1"
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime and OS
+      placeholder: "e.g. Node.js 22, macOS 14 / Bun 1.2, Ubuntu 24.04"
+    validations:
+      required: true
+
+  - type: input
+    id: provider
+    attributes:
+      label: Provider / model
+      placeholder: "e.g. github-copilot/claude-sonnet-4.6"
