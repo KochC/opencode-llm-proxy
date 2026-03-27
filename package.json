@@ -1,6 +1,6 @@
 {
   "name": "opencode-llm-proxy",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "Local AI gateway for OpenCode — use any model via OpenAI, Anthropic, or Gemini API format",
   "main": "index.js",
   "type": "module",
