@@ -1,6 +1,6 @@
 {
   "name": "opencode-llm-proxy",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "OpenCode plugin that exposes an OpenAI-compatible HTTP proxy backed by any LLM provider configured in OpenCode",
   "main": "index.js",
   "type": "module",
