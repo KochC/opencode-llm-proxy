@@ -102,7 +102,7 @@ function isAuthorized(request) {
   return getBearerToken(request) === configured
 }
 
-function toTextContent(content) {
+export function toTextContent(content) {
   if (typeof content === "string") return content
   if (!Array.isArray(content)) return ""
   return content
@@ -112,7 +112,7 @@ function toTextContent(content) {
     .join("\n\n")
 }
 
-function normalizeMessages(messages) {
+export function normalizeMessages(messages) {
   return messages
     .map((message) => ({
       role: message.role,
@@ -121,7 +121,7 @@ function normalizeMessages(messages) {
     .filter((message) => message.content.length > 0)
 }
 
-function normalizeResponseInput(input) {
+export function normalizeResponseInput(input) {
   if (typeof input === "string") {
     return [{ role: "user", content: input.trim() }].filter((message) => message.content)
   }
@@ -172,7 +172,7 @@ function normalizeResponseInput(input) {
     .filter((message) => message.content.length > 0)
 }
 
-function buildSystemPrompt(messages, request) {
+export function buildSystemPrompt(messages, request) {
   const systemMessages = messages
     .filter((message) => message.role === "system" || message.role === "developer")
     .map((message) => message.content)
@@ -193,7 +193,7 @@ function buildSystemPrompt(messages, request) {
   return [...systemMessages, ...hints].join("\n\n").trim()
 }
 
-function buildPrompt(messages) {
+export function buildPrompt(messages) {
   const chatMessages = messages.filter(
     (message) => message.role !== "system" && message.role !== "developer",
   )
@@ -218,7 +218,7 @@ function buildPrompt(messages) {
   ].join("\n\n")
 }
 
-function extractAssistantText(parts) {
+export function extractAssistantText(parts) {
   return parts
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
@@ -345,7 +345,7 @@ function createResponsesApiResponse(result, model) {
   }
 }
 
-function mapFinishReason(finish) {
+export function mapFinishReason(finish) {
   if (!finish) return "stop"
   if (finish.includes("length")) return "length"
   if (finish.includes("tool")) return "tool_calls"
@@ -392,7 +392,7 @@ async function listModels(client) {
   })
 }
 
-async function resolveModel(client, requestedModel, providerOverride) {
+export async function resolveModel(client, requestedModel, providerOverride) {
   const allModels = await listModels(client)
   if (providerOverride) {
     const match = allModels.find(
