@@ -12,7 +12,8 @@ function corsHeaders(request) {
   const requestedHeaders = request?.headers.get("access-control-request-headers")
   const requestedMethod = request?.headers.get("access-control-request-method")
   const requestedPrivateNetwork = request?.headers.get("access-control-request-private-network")
-  const allowOrigin = configuredOrigin === "*" ? "*" : configuredOrigin
+  const requestOrigin = request?.headers.get("origin") ?? ""
+  const allowOrigin = configuredOrigin === "*" ? "*" : (requestOrigin === configuredOrigin ? requestOrigin : configuredOrigin)
 
   const headers = {
     vary: "origin, access-control-request-method, access-control-request-headers",
