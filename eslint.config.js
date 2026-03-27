@@ -17,6 +17,8 @@ export default [
         Request: "readonly",
         Response: "readonly",
         URL: "readonly",
+        TextEncoder: "readonly",
+        ReadableStream: "readonly",
       },
     },
     rules: {
