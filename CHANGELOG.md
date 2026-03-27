@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.4.0...v1.5.0) (2026-03-27)
+
+
+### Features
+
+* refactor SSE queue, expand test coverage, fix package metadata ([#36](https://github.com/KochC/opencode-llm-proxy/issues/36)) ([0d96582](https://github.com/KochC/opencode-llm-proxy/commit/0d96582456761ca62b3f59e65128fd7e4be77519))
+
 ## [1.4.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.3.0...v1.4.0) (2026-03-27)
 
 
