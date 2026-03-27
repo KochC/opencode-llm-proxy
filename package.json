@@ -4,6 +4,9 @@
   "description": "OpenCode plugin that exposes an OpenAI-compatible HTTP proxy backed by your OpenCode providers",
   "main": "index.js",
   "type": "module",
+  "scripts": {
+    "test": "node --test --experimental-test-coverage"
+  },
   "keywords": [
     "opencode",
     "opencode-plugin",

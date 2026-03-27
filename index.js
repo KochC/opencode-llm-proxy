@@ -7,34 +7,47 @@ function getState() {
   return globalThis[STATE_KEY]
 }
 
-function corsHeaders() {
-  const origin = process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN ?? "*"
-  return {
-    "access-control-allow-origin": origin,
-    "access-control-allow-headers": "authorization, content-type, x-opencode-provider",
-    "access-control-allow-methods": "GET, POST, OPTIONS",
+function corsHeaders(request) {
+  const configuredOrigin = process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN ?? "*"
+  const requestedHeaders = request?.headers.get("access-control-request-headers")
+  const requestedMethod = request?.headers.get("access-control-request-method")
+  const requestedPrivateNetwork = request?.headers.get("access-control-request-private-network")
+  const allowOrigin = configuredOrigin === "*" ? "*" : configuredOrigin
+
+  const headers = {
+    vary: "origin, access-control-request-method, access-control-request-headers",
+    "access-control-allow-origin": allowOrigin,
+    "access-control-allow-headers": requestedHeaders ?? "authorization, content-type, x-opencode-provider",
+    "access-control-allow-methods": requestedMethod ?? "GET, POST, OPTIONS",
+    "access-control-max-age": "86400",
   }
+
+  if (requestedPrivateNetwork === "true") {
+    headers["access-control-allow-private-network"] = "true"
+  }
+
+  return headers
 }
 
-function json(data, status = 200, headers = {}) {
+function json(data, status = 200, headers = {}, request) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      ...corsHeaders(),
+      ...corsHeaders(request),
       ...headers,
     },
   })
 }
 
-function text(message, status = 200) {
+function text(message, status = 200, request) {
   return new Response(message, {
     status,
-    headers: corsHeaders(),
+    headers: corsHeaders(request),
   })
 }
 
-function unauthorized() {
+function unauthorized(request) {
   return json(
     {
       error: {
@@ -44,10 +57,11 @@ function unauthorized() {
     },
     401,
     { "www-authenticate": 'Bearer realm="OpenCode LLM Proxy"' },
+    request,
   )
 }
 
-function badRequest(message, status = 400) {
+function badRequest(message, status = 400, request) {
   return json(
     {
       error: {
@@ -56,10 +70,12 @@ function badRequest(message, status = 400) {
       },
     },
     status,
+    {},
+    request,
   )
 }
 
-function internalError(message, status = 500) {
+function internalError(message, status = 500, request) {
   return json(
     {
       error: {
@@ -68,6 +84,8 @@ function internalError(message, status = 500) {
       },
     },
     status,
+    {},
+    request,
   )
 }
 
@@ -419,6 +437,125 @@ function createModelResponse(models) {
   }
 }
 
+export function createProxyFetchHandler(client) {
+  return async (request) => {
+    const url = new URL(request.url)
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders(request) })
+    }
+
+    if (!isAuthorized(request)) {
+      return unauthorized(request)
+    }
+
+    if (request.method === "GET" && url.pathname === "/health") {
+      return json({ healthy: true, service: "opencode-openai-proxy" }, 200, {}, request)
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/models") {
+      try {
+        const models = await listModels(client)
+        return json(createModelResponse(models), 200, {}, request)
+      } catch (error) {
+        await safeLog(client, "error", "Failed to list proxy models", {
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return internalError("Failed to load models from OpenCode.", 500, request)
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
+      let body
+      try {
+        body = await request.json()
+      } catch {
+        return badRequest("Request body must be valid JSON.", 400, request)
+      }
+
+      if (body.stream) {
+        return badRequest("Streaming is not implemented yet.", 400, request)
+      }
+
+      if (!body.model) {
+        return badRequest("The 'model' field is required.", 400, request)
+      }
+
+      if (!Array.isArray(body.messages) || body.messages.length === 0) {
+        return badRequest("The 'messages' field must contain at least one message.", 400, request)
+      }
+
+      const messages = normalizeMessages(body.messages)
+      if (messages.length === 0) {
+        return badRequest("No text content was found in the supplied messages.", 400, request)
+      }
+
+      try {
+        const providerOverride = request.headers.get("x-opencode-provider")
+        const model = await resolveModel(client, body.model, providerOverride)
+        const system = buildSystemPrompt(messages, body)
+        const result = await executePrompt(client, body, model, messages, system)
+        return json(createChatCompletionResponse(result, model), 200, {}, request)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        await safeLog(client, "error", "Proxy completion failed", {
+          error: message,
+          requestedModel: body.model,
+        })
+        return badRequest(message, 502, request)
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/responses") {
+      let body
+      try {
+        body = await request.json()
+      } catch {
+        return badRequest("Request body must be valid JSON.", 400, request)
+      }
+
+      if (body.stream) {
+        return badRequest("Streaming is not implemented yet.", 400, request)
+      }
+
+      if (!body.model) {
+        return badRequest("The 'model' field is required.", 400, request)
+      }
+
+      const messages = normalizeResponseInput(body.input)
+      if (messages.length === 0) {
+        return badRequest("The 'input' field must contain at least one text message.", 400, request)
+      }
+
+      try {
+        const providerOverride = request.headers.get("x-opencode-provider")
+        const model = await resolveModel(client, body.model, providerOverride)
+        const system = buildSystemPrompt(
+          typeof body.instructions === "string" && body.instructions.trim()
+            ? [{ role: "system", content: body.instructions.trim() }, ...messages]
+            : messages,
+          {
+            temperature: body.temperature,
+            max_tokens: body.max_output_tokens,
+            max_completion_tokens: body.max_output_tokens,
+          },
+        )
+        const result = await executePrompt(client, body, model, messages, system)
+        return json(createResponsesApiResponse(result, model), 200, {}, request)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        await safeLog(client, "error", "Proxy responses call failed", {
+          error: message,
+          requestedModel: body.model,
+        })
+        return badRequest(message, 502, request)
+      }
+    }
+
+    return text("Not found", 404, request)
+  }
+}
+
 export const OpenAIProxyPlugin = async ({ client }) => {
   const state = getState()
   if (state.started) {
@@ -435,122 +572,7 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     server = Bun.serve({
       hostname,
       port,
-      fetch: async (request) => {
-        const url = new URL(request.url)
-
-        if (request.method === "OPTIONS") {
-          return new Response(null, { status: 204, headers: corsHeaders() })
-        }
-
-        if (!isAuthorized(request)) {
-          return unauthorized()
-        }
-
-        if (request.method === "GET" && url.pathname === "/health") {
-          return json({ healthy: true, service: "opencode-openai-proxy" })
-        }
-
-        if (request.method === "GET" && url.pathname === "/v1/models") {
-          try {
-            const models = await listModels(client)
-            return json(createModelResponse(models))
-          } catch (error) {
-            await safeLog(client, "error", "Failed to list proxy models", {
-              error: error instanceof Error ? error.message : String(error),
-            })
-            return internalError("Failed to load models from OpenCode.")
-          }
-        }
-
-        if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
-          let body
-          try {
-            body = await request.json()
-          } catch {
-            return badRequest("Request body must be valid JSON.")
-          }
-
-          if (body.stream) {
-            return badRequest("Streaming is not implemented yet.")
-          }
-
-          if (!body.model) {
-            return badRequest("The 'model' field is required.")
-          }
-
-          if (!Array.isArray(body.messages) || body.messages.length === 0) {
-            return badRequest("The 'messages' field must contain at least one message.")
-          }
-
-          const messages = normalizeMessages(body.messages)
-          if (messages.length === 0) {
-            return badRequest("No text content was found in the supplied messages.")
-          }
-
-          try {
-            const providerOverride = request.headers.get("x-opencode-provider")
-            const model = await resolveModel(client, body.model, providerOverride)
-            const system = buildSystemPrompt(messages, body)
-            const result = await executePrompt(client, body, model, messages, system)
-            return json(createChatCompletionResponse(result, model))
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error)
-            await safeLog(client, "error", "Proxy completion failed", {
-              error: message,
-              requestedModel: body.model,
-            })
-            return badRequest(message, 502)
-          }
-        }
-
-        if (request.method === "POST" && url.pathname === "/v1/responses") {
-          let body
-          try {
-            body = await request.json()
-          } catch {
-            return badRequest("Request body must be valid JSON.")
-          }
-
-          if (body.stream) {
-            return badRequest("Streaming is not implemented yet.")
-          }
-
-          if (!body.model) {
-            return badRequest("The 'model' field is required.")
-          }
-
-          const messages = normalizeResponseInput(body.input)
-          if (messages.length === 0) {
-            return badRequest("The 'input' field must contain at least one text message.")
-          }
-
-          try {
-            const providerOverride = request.headers.get("x-opencode-provider")
-            const model = await resolveModel(client, body.model, providerOverride)
-            const system = buildSystemPrompt(
-              typeof body.instructions === "string" && body.instructions.trim()
-                ? [{ role: "system", content: body.instructions.trim() }, ...messages]
-                : messages,
-              {
-                temperature: body.temperature,
-                max_tokens: body.max_output_tokens,
-                max_completion_tokens: body.max_output_tokens,
-              },
-            )
-            const result = await executePrompt(client, body, model, messages, system)
-            return json(createResponsesApiResponse(result, model))
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error)
-            await safeLog(client, "error", "Proxy responses call failed", {
-              error: message,
-              requestedModel: body.model,
-            })
-            return badRequest(message, 502)
-          }
-        }
-
-        return text("Not found", 404)
-      },
+      fetch: createProxyFetchHandler(client),
     })
   } catch (error) {
     // Never fail OpenCode startup because the proxy port is busy.

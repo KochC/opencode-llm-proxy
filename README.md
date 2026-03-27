@@ -85,7 +85,9 @@ curl http://127.0.0.1:4010/v1/responses \
 | `OPENCODE_LLM_PROXY_HOST` | `127.0.0.1` | Bind host. Set to `0.0.0.0` to expose on LAN. |
 | `OPENCODE_LLM_PROXY_PORT` | `4010` | Bind port. |
 | `OPENCODE_LLM_PROXY_TOKEN` | _(none)_ | Optional bearer token. If set, all requests must include `Authorization: Bearer <token>`. |
-| `OPENCODE_LLM_PROXY_CORS_ORIGIN` | `*` | CORS `Access-Control-Allow-Origin` header value. |
+| `OPENCODE_LLM_PROXY_CORS_ORIGIN` | `*` | CORS `Access-Control-Allow-Origin` header value. Use a specific origin if browser clients send credentials. |
+
+The proxy answers browser preflight requests and adds CORS headers on success and error responses for `/health`, `/v1/models`, `/v1/chat/completions`, and `/v1/responses`.
 
 ### LAN example
 
