@@ -1,2 +1,6 @@
 .github/
 index.test.js
+.release-please-manifest.json
+release-please-config.json
+CHANGELOG.md
+
