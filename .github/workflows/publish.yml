@@ -43,7 +43,7 @@ jobs:
       - name: Check release was created
         id: check
         run: |
-          TAG=$(git tag --points-at HEAD | grep '^v' | head -1)
+          TAG=$(git tag --points-at HEAD | grep -E '^v|^opencode-llm-proxy-v' | head -1)
           if [ -z "$TAG" ]; then
             echo "No release tag on this commit, skipping publish"
             echo "skip=true" >> "$GITHUB_OUTPUT"
