@@ -1,7 +1,7 @@
 {
   "name": "opencode-llm-proxy",
   "version": "1.6.0",
-  "description": "OpenCode plugin that exposes an OpenAI-compatible HTTP proxy backed by any LLM provider configured in OpenCode",
+  "description": "Local AI gateway for OpenCode — use any model via OpenAI, Anthropic, or Gemini API format",
   "main": "index.js",
   "type": "module",
   "engines": {
@@ -16,8 +16,23 @@
     "opencode",
     "opencode-plugin",
     "openai",
+    "openai-compatible",
+    "anthropic",
+    "gemini",
+    "ollama",
     "proxy",
-    "llm"
+    "llm",
+    "ai",
+    "gateway",
+    "local-llm",
+    "github-copilot",
+    "langchain",
+    "open-webui",
+    "llm-proxy",
+    "ai-gateway",
+    "model-router",
+    "openrouter",
+    "bedrock"
   ],
   "author": "KochC",
   "license": "MIT",
