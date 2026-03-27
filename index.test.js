@@ -92,8 +92,220 @@ test("configured origin is returned for normal requests", async () => {
   }
 })
 
+test("disallowed origin does not receive its own origin back", async () => {
+  process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN = "https://allowed.example.com"
+
+  try {
+    const handler = createProxyFetchHandler(createClient())
+    const request = new Request("http://127.0.0.1:4010/health", {
+      headers: { Origin: "https://evil.example.com" },
+    })
+
+    const response = await handler(request)
+
+    // The header must be the configured origin, not the request's origin
+    assert.equal(response.headers.get("access-control-allow-origin"), "https://allowed.example.com")
+    assert.notEqual(response.headers.get("access-control-allow-origin"), "https://evil.example.com")
+  } finally {
+    delete process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN
+  }
+})
+
+test("request with no Origin header is handled gracefully", async () => {
+  const handler = createProxyFetchHandler(createClient())
+  const request = new Request("http://127.0.0.1:4010/health")
+
+  const response = await handler(request)
+
+  assert.equal(response.status, 200)
+  // CORS header is still present (wildcard default) even without an Origin
+  assert.equal(response.headers.get("access-control-allow-origin"), "*")
+})
+
+test("OPTIONS preflight for disallowed origin returns configured origin, not request origin", async () => {
+  process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN = "https://allowed.example.com"
+
+  try {
+    const handler = createProxyFetchHandler(createClient())
+    const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://evil.example.com",
+        "Access-Control-Request-Method": "POST",
+      },
+    })
+
+    const response = await handler(request)
+
+    assert.equal(response.status, 204)
+    assert.equal(response.headers.get("access-control-allow-origin"), "https://allowed.example.com")
+    assert.notEqual(response.headers.get("access-control-allow-origin"), "https://evil.example.com")
+  } finally {
+    delete process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN
+  }
+})
+
 // ---------------------------------------------------------------------------
-// Unit: toTextContent
+// Integration: authentication
+// ---------------------------------------------------------------------------
+
+test("missing token returns 401 when token is configured", async () => {
+  process.env.OPENCODE_LLM_PROXY_TOKEN = "secret-token"
+
+  try {
+    const handler = createProxyFetchHandler(createClient())
+    const request = new Request("http://127.0.0.1:4010/health")
+
+    const response = await handler(request)
+    const body = await response.json()
+
+    assert.equal(response.status, 401)
+    assert.equal(body.error.type, "invalid_request_error")
+    assert.ok(response.headers.get("www-authenticate")?.includes("Bearer"))
+  } finally {
+    delete process.env.OPENCODE_LLM_PROXY_TOKEN
+  }
+})
+
+test("wrong token returns 401", async () => {
+  process.env.OPENCODE_LLM_PROXY_TOKEN = "secret-token"
+
+  try {
+    const handler = createProxyFetchHandler(createClient())
+    const request = new Request("http://127.0.0.1:4010/health", {
+      headers: { Authorization: "Bearer wrong-token" },
+    })
+
+    const response = await handler(request)
+
+    assert.equal(response.status, 401)
+  } finally {
+    delete process.env.OPENCODE_LLM_PROXY_TOKEN
+  }
+})
+
+test("correct token passes through", async () => {
+  process.env.OPENCODE_LLM_PROXY_TOKEN = "secret-token"
+
+  try {
+    const handler = createProxyFetchHandler(createClient())
+    const request = new Request("http://127.0.0.1:4010/health", {
+      headers: { Authorization: "Bearer secret-token" },
+    })
+
+    const response = await handler(request)
+
+    assert.equal(response.status, 200)
+  } finally {
+    delete process.env.OPENCODE_LLM_PROXY_TOKEN
+  }
+})
+
+test("no token configured allows all requests through", async () => {
+  delete process.env.OPENCODE_LLM_PROXY_TOKEN
+  const handler = createProxyFetchHandler(createClient())
+  const request = new Request("http://127.0.0.1:4010/health")
+
+  const response = await handler(request)
+
+  assert.equal(response.status, 200)
+})
+
+// ---------------------------------------------------------------------------
+// Integration: /v1/chat/completions error handling
+// ---------------------------------------------------------------------------
+
+test("malformed JSON body returns 400", async () => {
+  const handler = createProxyFetchHandler(createClient())
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{ not valid json",
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 400)
+  assert.equal(body.error.type, "invalid_request_error")
+})
+
+test("missing model field returns 400", async () => {
+  const handler = createProxyFetchHandler(createClient())
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 400)
+  assert.ok(body.error.message.includes("model"))
+})
+
+test("missing messages field returns 400", async () => {
+  const handler = createProxyFetchHandler(createClient())
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o" }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 400)
+  assert.ok(body.error.message.includes("messages"))
+})
+
+test("stream: true returns 400 (not implemented)", async () => {
+  const handler = createProxyFetchHandler(createClient())
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 400)
+  assert.ok(body.error.message.toLowerCase().includes("stream"))
+})
+
+test("unknown model returns 502", async () => {
+  const handler = createProxyFetchHandler(createClient()) // client returns no providers
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "nonexistent-model",
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 502)
+  assert.ok(body.error.message.includes("nonexistent-model"))
+})
+
+test("unknown route returns 404", async () => {
+  const handler = createProxyFetchHandler(createClient())
+  const request = new Request("http://127.0.0.1:4010/unknown-path")
+
+  const response = await handler(request)
+
+  assert.equal(response.status, 404)
+})
+
 // ---------------------------------------------------------------------------
 describe("toTextContent", () => {
   it("returns a string unchanged", () => {

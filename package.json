@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test --experimental-test-coverage",
+    "lint": "eslint .",
     "start": "node index.js"
   },
   "keywords": [
@@ -23,5 +24,9 @@
   },
   "peerDependencies": {
     "opencode-ai": "*"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.1.0"
   }
 }
