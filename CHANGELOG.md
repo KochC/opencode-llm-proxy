@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.3.0...v1.4.0) (2026-03-27)
+
+
+### Features
+
+* implement SSE streaming and support all opencode providers ([d9f2662](https://github.com/KochC/opencode-llm-proxy/commit/d9f2662cf6c0d8119d185864acc826186ecf7c40))
+
 ## [1.3.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.2.0...v1.3.0) (2026-03-27)
 
 
