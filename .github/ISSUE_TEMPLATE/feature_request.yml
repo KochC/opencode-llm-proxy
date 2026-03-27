@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest a new feature or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Please describe the use case clearly so we can understand what you need.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation where this would be useful.
+      placeholder: "e.g. I use the Vercel AI SDK and currently have to..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would you like to see added or changed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Any workarounds you're using today?
+
+  - type: dropdown
+    id: api_format
+    attributes:
+      label: Which API format does this relate to? (if any)
+      options:
+        - OpenAI Chat Completions
+        - OpenAI Responses API
+        - Anthropic Messages API
+        - Google Gemini
+        - All / general
+        - Not API-format specific
