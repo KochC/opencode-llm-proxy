@@ -569,6 +569,130 @@ function createModelResponse(models) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Anthropic Messages API helpers
+// ---------------------------------------------------------------------------
+
+export function normalizeAnthropicMessages(messages) {
+  return messages
+    .map((message) => {
+      let content = ""
+      if (typeof message.content === "string") {
+        content = message.content.trim()
+      } else if (Array.isArray(message.content)) {
+        content = message.content
+          .filter((block) => block && block.type === "text" && typeof block.text === "string")
+          .map((block) => block.text.trim())
+          .filter(Boolean)
+          .join("\n\n")
+      }
+      return { role: message.role, content }
+    })
+    .filter((message) => message.content.length > 0)
+}
+
+export function mapFinishReasonToAnthropic(finish) {
+  if (!finish) return "end_turn"
+  if (finish.includes("length")) return "max_tokens"
+  if (finish.includes("tool")) return "tool_use"
+  return "end_turn"
+}
+
+function createAnthropicResponse(result, model) {
+  const tokensIn = result.completion.data.info?.tokens?.input ?? 0
+  const tokensOut = result.completion.data.info?.tokens?.output ?? 0
+  return {
+    id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
+    type: "message",
+    role: "assistant",
+    content: [{ type: "text", text: result.content }],
+    model: model.id,
+    stop_reason: mapFinishReasonToAnthropic(result.completion.data.info?.finish),
+    stop_sequence: null,
+    usage: { input_tokens: tokensIn, output_tokens: tokensOut },
+  }
+}
+
+function anthropicBadRequest(message, status = 400, request) {
+  return json(
+    { type: "error", error: { type: "invalid_request_error", message } },
+    status,
+    {},
+    request,
+  )
+}
+
+function anthropicInternalError(message, status = 500, request) {
+  return json(
+    { type: "error", error: { type: "api_error", message } },
+    status,
+    {},
+    request,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Google Gemini API helpers
+// ---------------------------------------------------------------------------
+
+export function normalizeGeminiContents(contents) {
+  if (!Array.isArray(contents)) return []
+  return contents
+    .map((item) => {
+      const role = item.role === "model" ? "assistant" : (item.role ?? "user")
+      const content = Array.isArray(item.parts)
+        ? item.parts
+            .map((part) => (typeof part?.text === "string" ? part.text.trim() : ""))
+            .filter(Boolean)
+            .join("\n\n")
+        : ""
+      return { role, content }
+    })
+    .filter((m) => m.content.length > 0)
+}
+
+export function extractGeminiSystemInstruction(systemInstruction) {
+  if (!systemInstruction) return null
+  if (typeof systemInstruction === "string") return systemInstruction.trim()
+  if (Array.isArray(systemInstruction.parts)) {
+    return systemInstruction.parts
+      .map((part) => (typeof part?.text === "string" ? part.text.trim() : ""))
+      .filter(Boolean)
+      .join("\n\n")
+  }
+  return null
+}
+
+export function mapFinishReasonToGemini(finish) {
+  if (!finish) return "STOP"
+  if (finish.includes("length")) return "MAX_TOKENS"
+  if (finish.includes("tool")) return "STOP"
+  return "STOP"
+}
+
+function createGeminiResponse(content, finish, tokens) {
+  return {
+    candidates: [
+      {
+        content: { role: "model", parts: [{ text: content }] },
+        finishReason: mapFinishReasonToGemini(finish),
+        index: 0,
+      },
+    ],
+    usageMetadata: {
+      promptTokenCount: tokens?.input ?? 0,
+      candidatesTokenCount: tokens?.output ?? 0,
+      totalTokenCount: (tokens?.input ?? 0) + (tokens?.output ?? 0),
+    },
+  }
+}
+
+function geminiModelFromPath(pathname) {
+  // Matches /v1beta/models/some-model:generateContent or :streamGenerateContent
+  const match = pathname.match(/^\/v1beta\/models\/([^/:]+)(?::(?:generate|stream)(?:Content|GenerateContent))?$/)
+  return match ? match[1] : null
+}
+
 export function createProxyFetchHandler(client) {
   return async (request) => {
     const url = new URL(request.url)
@@ -887,6 +1011,250 @@ export function createProxyFetchHandler(client) {
           requestedModel: body.model,
         })
         return badRequest(message, 502, request)
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Anthropic Messages API  POST /v1/messages
+    // -----------------------------------------------------------------------
+
+    if (request.method === "POST" && url.pathname === "/v1/messages") {
+      let body
+      try {
+        body = await request.json()
+      } catch {
+        return anthropicBadRequest("Request body must be valid JSON.", 400, request)
+      }
+
+      if (!body.model) {
+        return anthropicBadRequest("The 'model' field is required.", 400, request)
+      }
+
+      if (!Array.isArray(body.messages) || body.messages.length === 0) {
+        return anthropicBadRequest("The 'messages' field must contain at least one message.", 400, request)
+      }
+
+      const messages = normalizeAnthropicMessages(body.messages)
+      if (messages.length === 0) {
+        return anthropicBadRequest("No text content was found in the supplied messages.", 400, request)
+      }
+
+      // Prepend Anthropic top-level system string as a system message so buildSystemPrompt picks it up.
+      const allMessages =
+        typeof body.system === "string" && body.system.trim()
+          ? [{ role: "system", content: body.system.trim() }, ...messages]
+          : messages
+
+      const system = buildSystemPrompt(allMessages, {
+        temperature: body.temperature,
+        max_tokens: body.max_tokens,
+      })
+
+      let model
+      try {
+        const providerOverride = request.headers.get("x-opencode-provider")
+        model = await resolveModel(client, body.model, providerOverride)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        await safeLog(client, "error", "Anthropic proxy call failed (model resolve)", { error: message, requestedModel: body.model })
+        return anthropicBadRequest(message, 400, request)
+      }
+
+      if (body.stream) {
+        const msgID = `msg_${crypto.randomUUID().replace(/-/g, "")}`
+        const queue = createSseQueue()
+
+        function sseEvent(eventType, data) {
+          return `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`
+        }
+
+        async function* generateSse() {
+          queue.enqueue(sseEvent("message_start", {
+            type: "message_start",
+            message: {
+              id: msgID,
+              type: "message",
+              role: "assistant",
+              content: [],
+              model: model.id,
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
+          }))
+          queue.enqueue(sseEvent("content_block_start", {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          }))
+
+          const runPromise = executePromptStreaming(
+            client,
+            model,
+            messages,
+            system,
+            (delta) => {
+              queue.enqueue(sseEvent("content_block_delta", {
+                type: "content_block_delta",
+                index: 0,
+                delta: { type: "text_delta", text: delta },
+              }))
+            },
+          )
+            .then((streamResult) => {
+              queue.enqueue(sseEvent("content_block_stop", { type: "content_block_stop", index: 0 }))
+              queue.enqueue(sseEvent("message_delta", {
+                type: "message_delta",
+                delta: {
+                  stop_reason: mapFinishReasonToAnthropic(streamResult.finish),
+                  stop_sequence: null,
+                },
+                usage: { output_tokens: streamResult.tokens.output },
+              }))
+              queue.enqueue(sseEvent("message_stop", { type: "message_stop" }))
+            })
+            .catch(async (err) => {
+              const errMsg = err instanceof Error ? err.message : String(err)
+              await safeLog(client, "error", "Anthropic proxy streaming call failed", { error: errMsg, requestedModel: body.model })
+              queue.enqueue(sseEvent("error", { type: "error", error: { type: "api_error", message: errMsg } }))
+            })
+            .finally(() => {
+              queue.finish()
+            })
+
+          yield* queue.generateChunks()
+          await runPromise
+        }
+
+        return sseResponse(corsHeaders(request), generateSse())
+      }
+
+      try {
+        const result = await executePrompt(client, body, model, messages, system)
+        return json(createAnthropicResponse(result, model), 200, {}, request)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        await safeLog(client, "error", "Anthropic proxy call failed", { error: message, requestedModel: body.model })
+        return anthropicInternalError(message, 500, request)
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Google Gemini API  POST /v1beta/models/:model:generateContent (non-streaming)
+    //                    POST /v1beta/models/:model:streamGenerateContent (streaming)
+    // -----------------------------------------------------------------------
+
+    const isGeminiNonStream = request.method === "POST" && url.pathname.endsWith(":generateContent")
+    const isGeminiStream = request.method === "POST" && url.pathname.endsWith(":streamGenerateContent")
+
+    if (isGeminiNonStream || isGeminiStream) {
+      const geminiModelName = geminiModelFromPath(url.pathname)
+      if (!geminiModelName) {
+        return badRequest("Could not extract model name from URL.", 400, request)
+      }
+
+      let body
+      try {
+        body = await request.json()
+      } catch {
+        return badRequest("Request body must be valid JSON.", 400, request)
+      }
+
+      if (!Array.isArray(body.contents) || body.contents.length === 0) {
+        return badRequest("The 'contents' field must contain at least one item.", 400, request)
+      }
+
+      const messages = normalizeGeminiContents(body.contents)
+      if (messages.length === 0) {
+        return badRequest("No text content was found in the supplied contents.", 400, request)
+      }
+
+      const systemText = extractGeminiSystemInstruction(body.systemInstruction)
+      const systemMessages = systemText ? [{ role: "system", content: systemText }, ...messages] : messages
+      const system = buildSystemPrompt(systemMessages, {
+        temperature: body.generationConfig?.temperature,
+        max_tokens: body.generationConfig?.maxOutputTokens,
+      })
+
+      let model
+      try {
+        const providerOverride = request.headers.get("x-opencode-provider")
+        model = await resolveModel(client, geminiModelName, providerOverride)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        await safeLog(client, "error", "Gemini proxy call failed (model resolve)", { error: message, requestedModel: geminiModelName })
+        return badRequest(message, 400, request)
+      }
+
+      if (isGeminiStream) {
+        const queue = createSseQueue()
+
+        async function* generateNdJson() {
+          const runPromise = executePromptStreaming(
+            client,
+            model,
+            messages,
+            system,
+            (delta) => {
+              const chunk = JSON.stringify(createGeminiResponse(delta, null, null))
+              queue.enqueue(chunk + "\n")
+            },
+          )
+            .then((streamResult) => {
+              const finalChunk = JSON.stringify(
+                createGeminiResponse("", streamResult.finish, streamResult.tokens),
+              )
+              queue.enqueue(finalChunk + "\n")
+            })
+            .catch(async (err) => {
+              const errMsg = err instanceof Error ? err.message : String(err)
+              await safeLog(client, "error", "Gemini proxy streaming call failed", { error: errMsg, requestedModel: geminiModelName })
+              const errChunk = JSON.stringify({ error: { code: 500, message: errMsg, status: "INTERNAL" } })
+              queue.enqueue(errChunk + "\n")
+            })
+            .finally(() => {
+              queue.finish()
+            })
+
+          yield* queue.generateChunks()
+          await runPromise
+        }
+
+        const encoder = new TextEncoder()
+        const body_ = new ReadableStream({
+          async start(controller) {
+            try {
+              for await (const chunk of generateNdJson()) {
+                controller.enqueue(encoder.encode(chunk))
+              }
+            } catch {
+              // errors surfaced via data
+            } finally {
+              controller.close()
+            }
+          },
+        })
+
+        return new Response(body_, {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "cache-control": "no-cache",
+            connection: "keep-alive",
+            ...corsHeaders(request),
+          },
+        })
+      }
+
+      try {
+        const result = await executePrompt(client, body, model, messages, system)
+        const finish = result.completion.data.info?.finish
+        const tokens = result.completion.data.info?.tokens
+        return json(createGeminiResponse(result.content, finish, tokens), 200, {}, request)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        await safeLog(client, "error", "Gemini proxy call failed", { error: message, requestedModel: geminiModelName })
+        return badRequest(message, 500, request)
       }
     }
 

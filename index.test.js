@@ -12,6 +12,11 @@ import {
   extractAssistantText,
   mapFinishReason,
   resolveModel,
+  normalizeAnthropicMessages,
+  mapFinishReasonToAnthropic,
+  normalizeGeminiContents,
+  extractGeminiSystemInstruction,
+  mapFinishReasonToGemini,
 } from "./index.js"
 
 // ---------------------------------------------------------------------------
@@ -1130,4 +1135,554 @@ test("POST /v1/responses stream: true with session.error emits response.failed",
 
   const text = await response.text()
   assert.ok(text.includes("response.failed") || text.includes("Rate limit exceeded"))
+})
+
+// ---------------------------------------------------------------------------
+// Unit: normalizeAnthropicMessages
+// ---------------------------------------------------------------------------
+describe("normalizeAnthropicMessages", () => {
+  it("passes through string content unchanged", () => {
+    const input = [{ role: "user", content: "hello" }]
+    assert.deepEqual(normalizeAnthropicMessages(input), [{ role: "user", content: "hello" }])
+  })
+
+  it("trims whitespace from string content", () => {
+    const input = [{ role: "user", content: "  hi  " }]
+    assert.deepEqual(normalizeAnthropicMessages(input), [{ role: "user", content: "hi" }])
+  })
+
+  it("joins text blocks from array content", () => {
+    const input = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "first" },
+          { type: "text", text: "second" },
+        ],
+      },
+    ]
+    assert.deepEqual(normalizeAnthropicMessages(input), [{ role: "user", content: "first\n\nsecond" }])
+  })
+
+  it("ignores non-text blocks in array content", () => {
+    const input = [
+      {
+        role: "user",
+        content: [
+          { type: "image", source: {} },
+          { type: "text", text: "only this" },
+        ],
+      },
+    ]
+    assert.deepEqual(normalizeAnthropicMessages(input), [{ role: "user", content: "only this" }])
+  })
+
+  it("drops messages with empty content", () => {
+    const input = [
+      { role: "user", content: "" },
+      { role: "assistant", content: "response" },
+    ]
+    assert.deepEqual(normalizeAnthropicMessages(input), [{ role: "assistant", content: "response" }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Unit: mapFinishReasonToAnthropic
+// ---------------------------------------------------------------------------
+describe("mapFinishReasonToAnthropic", () => {
+  it("returns end_turn for undefined", () => {
+    assert.equal(mapFinishReasonToAnthropic(undefined), "end_turn")
+  })
+
+  it("returns end_turn for null", () => {
+    assert.equal(mapFinishReasonToAnthropic(null), "end_turn")
+  })
+
+  it("returns max_tokens when finish includes length", () => {
+    assert.equal(mapFinishReasonToAnthropic("max_length"), "max_tokens")
+  })
+
+  it("returns tool_use when finish includes tool", () => {
+    assert.equal(mapFinishReasonToAnthropic("tool_use"), "tool_use")
+  })
+
+  it("returns end_turn for unrecognised values", () => {
+    assert.equal(mapFinishReasonToAnthropic("stop"), "end_turn")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Unit: normalizeGeminiContents
+// ---------------------------------------------------------------------------
+describe("normalizeGeminiContents", () => {
+  it("returns empty array for non-array input", () => {
+    assert.deepEqual(normalizeGeminiContents(null), [])
+    assert.deepEqual(normalizeGeminiContents("string"), [])
+  })
+
+  it("converts user role and joins text parts", () => {
+    const contents = [{ role: "user", parts: [{ text: "hello" }] }]
+    assert.deepEqual(normalizeGeminiContents(contents), [{ role: "user", content: "hello" }])
+  })
+
+  it("maps model role to assistant", () => {
+    const contents = [{ role: "model", parts: [{ text: "hi there" }] }]
+    assert.deepEqual(normalizeGeminiContents(contents), [{ role: "assistant", content: "hi there" }])
+  })
+
+  it("joins multiple parts with double newline", () => {
+    const contents = [{ role: "user", parts: [{ text: "line one" }, { text: "line two" }] }]
+    assert.deepEqual(normalizeGeminiContents(contents), [{ role: "user", content: "line one\n\nline two" }])
+  })
+
+  it("drops items with no text content", () => {
+    const contents = [
+      { role: "user", parts: [{ text: "" }] },
+      { role: "user", parts: [{ text: "kept" }] },
+    ]
+    assert.deepEqual(normalizeGeminiContents(contents), [{ role: "user", content: "kept" }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Unit: extractGeminiSystemInstruction
+// ---------------------------------------------------------------------------
+describe("extractGeminiSystemInstruction", () => {
+  it("returns null for null/undefined input", () => {
+    assert.equal(extractGeminiSystemInstruction(null), null)
+    assert.equal(extractGeminiSystemInstruction(undefined), null)
+  })
+
+  it("returns trimmed string for string input", () => {
+    assert.equal(extractGeminiSystemInstruction("  be helpful  "), "be helpful")
+  })
+
+  it("joins parts array", () => {
+    const si = { parts: [{ text: "be concise" }, { text: "and clear" }] }
+    assert.equal(extractGeminiSystemInstruction(si), "be concise\n\nand clear")
+  })
+
+  it("returns null for object without parts", () => {
+    assert.equal(extractGeminiSystemInstruction({ role: "system" }), null)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Unit: mapFinishReasonToGemini
+// ---------------------------------------------------------------------------
+describe("mapFinishReasonToGemini", () => {
+  it("returns STOP for undefined", () => {
+    assert.equal(mapFinishReasonToGemini(undefined), "STOP")
+  })
+
+  it("returns MAX_TOKENS when finish includes length", () => {
+    assert.equal(mapFinishReasonToGemini("max_length"), "MAX_TOKENS")
+  })
+
+  it("returns STOP for tool_use", () => {
+    assert.equal(mapFinishReasonToGemini("tool_use"), "STOP")
+  })
+
+  it("returns STOP for end_turn", () => {
+    assert.equal(mapFinishReasonToGemini("end_turn"), "STOP")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Integration: POST /v1/messages (Anthropic Messages API)
+// ---------------------------------------------------------------------------
+
+function createAnthropicClient(responseContent = "Hello from Anthropic.") {
+  return {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: {
+          providers: [
+            {
+              id: "anthropic",
+              models: { "claude-3-5-sonnet": { id: "claude-3-5-sonnet", name: "Claude 3.5 Sonnet" } },
+            },
+          ],
+        },
+      }),
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-ant-1" } }),
+      prompt: async () => ({
+        data: {
+          parts: [{ type: "text", text: responseContent }],
+          info: { tokens: { input: 15, output: 10, reasoning: 0, cache: { read: 0, write: 0 } }, finish: "end_turn" },
+        },
+      }),
+    },
+  }
+}
+
+test("POST /v1/messages returns a well-formed Anthropic response", async () => {
+  const handler = createProxyFetchHandler(createAnthropicClient("Hi there!"))
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "anthropic/claude-3-5-sonnet",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Say hello." }],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.type, "message")
+  assert.equal(body.role, "assistant")
+  assert.ok(body.id.startsWith("msg_"))
+  assert.ok(Array.isArray(body.content))
+  assert.equal(body.content[0].type, "text")
+  assert.equal(body.content[0].text, "Hi there!")
+  assert.equal(body.stop_reason, "end_turn")
+  assert.equal(body.usage.input_tokens, 15)
+  assert.equal(body.usage.output_tokens, 10)
+})
+
+test("POST /v1/messages system string is included in prompt", async () => {
+  let capturedSystem = null
+  const client = {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: {
+          providers: [{ id: "anthropic", models: { "claude-3-5-sonnet": { id: "claude-3-5-sonnet" } } }],
+        },
+      }),
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-ant-sys" } }),
+      prompt: async ({ body }) => {
+        capturedSystem = body.system
+        return {
+          data: {
+            parts: [{ type: "text", text: "ok" }],
+            info: { tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, finish: "end_turn" },
+          },
+        }
+      },
+    },
+  }
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "anthropic/claude-3-5-sonnet",
+      system: "You are a pirate.",
+      messages: [{ role: "user", content: "Hello." }],
+    }),
+  })
+
+  await handler(request)
+  assert.ok(capturedSystem?.includes("You are a pirate."))
+})
+
+test("POST /v1/messages missing model returns Anthropic error format", async () => {
+  const handler = createProxyFetchHandler(createAnthropicClient())
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 400)
+  assert.equal(body.type, "error")
+  assert.ok(body.error.type === "invalid_request_error")
+  assert.ok(body.error.message.includes("model"))
+})
+
+test("POST /v1/messages missing messages returns 400", async () => {
+  const handler = createProxyFetchHandler(createAnthropicClient())
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "anthropic/claude-3-5-sonnet" }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 400)
+  assert.equal(body.type, "error")
+})
+
+test("POST /v1/messages malformed JSON returns 400", async () => {
+  const handler = createProxyFetchHandler(createAnthropicClient())
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{ bad json",
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 400)
+  assert.equal(body.type, "error")
+})
+
+test("POST /v1/messages stream: true returns Anthropic SSE events", async () => {
+  const events = [
+    {
+      type: "message.part.updated",
+      properties: {
+        part: { sessionID: "sess-123", type: "text" },
+        delta: "Hello",
+      },
+    },
+    {
+      type: "message.part.updated",
+      properties: {
+        part: { sessionID: "sess-123", type: "text" },
+        delta: " world",
+      },
+    },
+    { type: "session.idle", properties: { sessionID: "sess-123" } },
+  ]
+
+  const handler = createProxyFetchHandler(createStreamingClient(events))
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
+
+  assert.equal(response.status, 200)
+  assert.ok(response.headers.get("content-type")?.includes("text/event-stream"))
+
+  const text = await response.text()
+  assert.ok(text.includes("message_start"))
+  assert.ok(text.includes("content_block_start"))
+  assert.ok(text.includes("content_block_delta"))
+  assert.ok(text.includes("Hello"))
+  assert.ok(text.includes(" world"))
+  assert.ok(text.includes("message_stop"))
+})
+
+test("POST /v1/messages stream: true with session.error emits SSE error event", async () => {
+  const events = [
+    {
+      type: "session.error",
+      properties: {
+        sessionID: "sess-123",
+        error: { message: "Model overloaded" },
+      },
+    },
+    { type: "session.idle", properties: { sessionID: "sess-123" } },
+  ]
+
+  const handler = createProxyFetchHandler(createStreamingClient(events))
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  })
+
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+
+  const text = await response.text()
+  assert.ok(text.includes("error") || text.includes("Model overloaded"))
+})
+
+// ---------------------------------------------------------------------------
+// Integration: POST /v1beta/models/:model:generateContent (Gemini API)
+// ---------------------------------------------------------------------------
+
+function createGeminiClient(responseContent = "Hello from Gemini.") {
+  return {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: {
+          providers: [
+            {
+              id: "google",
+              models: { "gemini-2.0-flash": { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash" } },
+            },
+          ],
+        },
+      }),
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-gem-1" } }),
+      prompt: async () => ({
+        data: {
+          parts: [{ type: "text", text: responseContent }],
+          info: { tokens: { input: 12, output: 7, reasoning: 0, cache: { read: 0, write: 0 } }, finish: "end_turn" },
+        },
+      }),
+    },
+  }
+}
+
+test("POST /v1beta/models/gemini-2.0-flash:generateContent returns Gemini response", async () => {
+  const handler = createProxyFetchHandler(createGeminiClient("Gemini says hi!"))
+  const request = new Request("http://127.0.0.1:4010/v1beta/models/gemini-2.0-flash:generateContent", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: "Say hi." }] }],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.ok(Array.isArray(body.candidates))
+  assert.equal(body.candidates[0].content.role, "model")
+  assert.equal(body.candidates[0].content.parts[0].text, "Gemini says hi!")
+  assert.equal(body.candidates[0].finishReason, "STOP")
+  assert.equal(body.usageMetadata.promptTokenCount, 12)
+  assert.equal(body.usageMetadata.candidatesTokenCount, 7)
+  assert.equal(body.usageMetadata.totalTokenCount, 19)
+})
+
+test("POST /v1beta/models/:model:generateContent systemInstruction is included", async () => {
+  let capturedSystem = null
+  const client = {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: {
+          providers: [{ id: "google", models: { "gemini-2.0-flash": { id: "gemini-2.0-flash" } } }],
+        },
+      }),
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-gem-sys" } }),
+      prompt: async ({ body }) => {
+        capturedSystem = body.system
+        return {
+          data: {
+            parts: [{ type: "text", text: "ok" }],
+            info: { tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, finish: "end_turn" },
+          },
+        }
+      },
+    },
+  }
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1beta/models/gemini-2.0-flash:generateContent", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: "Hello." }] }],
+      systemInstruction: { parts: [{ text: "You are a helpful assistant." }] },
+    }),
+  })
+
+  await handler(request)
+  assert.ok(capturedSystem?.includes("You are a helpful assistant."))
+})
+
+test("POST /v1beta/models/:model:generateContent missing contents returns 400", async () => {
+  const handler = createProxyFetchHandler(createGeminiClient())
+  const request = new Request("http://127.0.0.1:4010/v1beta/models/gemini-2.0-flash:generateContent", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ generationConfig: { maxOutputTokens: 100 } }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 400)
+  assert.ok(body.error.message.includes("contents"))
+})
+
+test("POST /v1beta/models/:model:generateContent malformed JSON returns 400", async () => {
+  const handler = createProxyFetchHandler(createGeminiClient())
+  const request = new Request("http://127.0.0.1:4010/v1beta/models/gemini-2.0-flash:generateContent", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{ not json",
+  })
+
+  const response = await handler(request)
+
+  assert.equal(response.status, 400)
+})
+
+test("POST /v1beta/models/:model:streamGenerateContent returns NDJSON stream", async () => {
+  const events = [
+    {
+      type: "message.part.updated",
+      properties: {
+        part: { sessionID: "sess-123", type: "text" },
+        delta: "Gem",
+      },
+    },
+    {
+      type: "message.part.updated",
+      properties: {
+        part: { sessionID: "sess-123", type: "text" },
+        delta: "ini",
+      },
+    },
+    { type: "session.idle", properties: { sessionID: "sess-123" } },
+  ]
+
+  // Use streaming client but swap provider to google
+  const streamingClient = createStreamingClient(events)
+  streamingClient.config = {
+    providers: async () => ({
+      data: {
+        providers: [
+          { id: "google", models: { "gemini-2.0-flash": { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash" } } },
+        ],
+      },
+    }),
+  }
+
+  const handler = createProxyFetchHandler(streamingClient)
+  const request = new Request(
+    "http://127.0.0.1:4010/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: "Stream this." }] }],
+      }),
+    },
+  )
+
+  const response = await handler(request)
+
+  assert.equal(response.status, 200)
+  assert.ok(response.headers.get("content-type")?.includes("application/json"))
+
+  const text = await response.text()
+  // Should contain NDJSON lines with candidates
+  assert.ok(text.includes("candidates"))
+  assert.ok(text.includes("Gem"))
+  assert.ok(text.includes("ini"))
 })

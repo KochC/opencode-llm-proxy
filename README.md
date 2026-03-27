@@ -1,8 +1,12 @@
 # opencode-llm-proxy
 
-An [OpenCode](https://opencode.ai) plugin that starts a local OpenAI-compatible HTTP server backed by your OpenCode providers.
+An [OpenCode](https://opencode.ai) plugin that starts a local HTTP server backed by your OpenCode providers, with support for multiple LLM API formats:
 
-Any tool or application that speaks the OpenAI Chat Completions or Responses API can use it — including LangChain, custom scripts, local frontends, etc.
+- **OpenAI** Chat Completions (`POST /v1/chat/completions`) and Responses (`POST /v1/responses`)
+- **Anthropic** Messages API (`POST /v1/messages`)
+- **Google Gemini** API (`POST /v1beta/models/:model:generateContent`)
+
+Any tool or SDK that targets one of these APIs can point at the proxy without code changes.
 
 ## Quickstart
 
@@ -92,7 +96,7 @@ curl http://127.0.0.1:4010/v1/models
 
 Returns all models from all providers configured in your OpenCode setup (e.g. `github-copilot/claude-sonnet-4.6`, `ollama/qwen3.5:9b`, etc.).
 
-### Chat completions
+### OpenAI Chat Completions
 
 ```bash
 curl http://127.0.0.1:4010/v1/chat/completions \
@@ -105,7 +109,7 @@ curl http://127.0.0.1:4010/v1/chat/completions \
   }'
 ```
 
-Use the fully-qualified `provider/model` ID from `GET /v1/models`.
+Use the fully-qualified `provider/model` ID from `GET /v1/models`. Supports `"stream": true` for SSE streaming.
 
 ### OpenAI Responses API
 
@@ -116,6 +120,69 @@ curl http://127.0.0.1:4010/v1/responses \
     "model": "github-copilot/claude-sonnet-4.6",
     "input": [{"role": "user", "content": "Hello"}]
   }'
+```
+
+Supports `"stream": true` for SSE streaming.
+
+### Anthropic Messages API
+
+Point the Anthropic SDK (or any client) at this proxy:
+
+```bash
+curl http://127.0.0.1:4010/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "anthropic/claude-3-5-sonnet",
+    "max_tokens": 1024,
+    "system": "You are a helpful assistant.",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+Supports `"stream": true` for SSE streaming with standard Anthropic streaming events (`message_start`, `content_block_delta`, `message_stop`, etc.).
+
+To point the official Anthropic SDK at this proxy:
+
+```js
+import Anthropic from "@anthropic-ai/sdk"
+
+const client = new Anthropic({
+  baseURL: "http://127.0.0.1:4010",
+  apiKey: "unused", // or your OPENCODE_LLM_PROXY_TOKEN
+})
+```
+
+### Google Gemini API
+
+```bash
+# Non-streaming
+curl http://127.0.0.1:4010/v1beta/models/google/gemini-2.0-flash:generateContent \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [{"role": "user", "parts": [{"text": "Hello!"}]}]
+  }'
+
+# Streaming (newline-delimited JSON)
+curl http://127.0.0.1:4010/v1beta/models/google/gemini-2.0-flash:streamGenerateContent \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [{"role": "user", "parts": [{"text": "Hello!"}]}]
+  }'
+```
+
+The model name in the URL path is resolved the same way as other endpoints (use `provider/model` or a bare model ID if unambiguous).
+
+To point the Google Generative AI SDK at this proxy, set the `baseUrl` option to `http://127.0.0.1:4010`.
+
+## Selecting a provider
+
+All endpoints accept an optional `x-opencode-provider` header to force a specific provider when the model ID is ambiguous:
+
+```bash
+curl http://127.0.0.1:4010/v1/chat/completions \
+  -H "x-opencode-provider: anthropic" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "claude-3-5-sonnet", "messages": [...]}'
 ```
 
 ## Configuration
@@ -149,15 +216,14 @@ curl http://<your-ip>:4010/v1/models \
 
 ## How it works
 
-The plugin hooks into OpenCode at startup and spawns a Bun HTTP server. Incoming OpenAI-format requests are translated into OpenCode SDK calls (`client.session.create` + `client.session.prompt`), routed through whichever provider/model is requested, and the response is returned in OpenAI format.
+The plugin hooks into OpenCode at startup and spawns a Bun HTTP server. Incoming requests (in OpenAI, Anthropic, or Gemini format) are translated into OpenCode SDK calls (`client.session.create` + `client.session.prompt`), routed through whichever provider/model is requested, and the response is returned in the matching API format.
 
 Each request creates a temporary OpenCode session, so prompts and responses appear in the OpenCode session list.
 
 ## Limitations
 
-- Streaming (`"stream": true`) is not yet implemented — requests will return a 400 error.
 - Tool/function calling is not forwarded; all built-in OpenCode tools are disabled for proxy sessions.
-- The proxy only handles `POST /v1/chat/completions` and `POST /v1/responses`. Other OpenAI endpoints are not implemented.
+- Only text content is handled; image and file inputs are ignored.
 
 ## License
 
