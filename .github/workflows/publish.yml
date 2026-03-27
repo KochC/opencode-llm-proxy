@@ -1,18 +1,22 @@
 name: Publish
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  workflow_run:
+    workflows: ["Release Please"]
+    types:
+      - completed
 
 jobs:
   test:
     name: Test before publish
     runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -33,23 +37,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Check release was created
+        id: check
+        run: |
+          TAG=$(git tag --points-at HEAD | grep '^v' | head -1)
+          if [ -z "$TAG" ]; then
+            echo "No release tag on this commit, skipping publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Setup Node.js
+        if: steps.check.outputs.skip == 'false'
         uses: actions/setup-node@v6
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Verify tag matches package version
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          PKG="$(node -p "require('./package.json').version")"
-          if [ "$TAG" != "$PKG" ]; then
-            echo "Tag version ($TAG) does not match package.json version ($PKG)"
-            exit 1
-          fi
-
       - name: Publish
+        if: steps.check.outputs.skip == 'false'
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
