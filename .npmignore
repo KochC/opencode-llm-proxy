@@ -3,4 +3,6 @@ index.test.js
 .release-please-manifest.json
 release-please-config.json
 CHANGELOG.md
+eslint.config.js
+node_modules/
 

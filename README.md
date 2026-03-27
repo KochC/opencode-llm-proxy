@@ -1,12 +1,62 @@
-# opencode-openai-proxy
+# opencode-llm-proxy
 
 An [OpenCode](https://opencode.ai) plugin that starts a local OpenAI-compatible HTTP server backed by your OpenCode providers.
 
-Any tool or application that speaks the OpenAI Chat Completions or Responses API can use it — including the Agile-V Studio platform, LangChain, custom scripts, etc.
+Any tool or application that speaks the OpenAI Chat Completions or Responses API can use it — including LangChain, custom scripts, local frontends, etc.
+
+## Quickstart
+
+```bash
+# 1. Install the npm package
+npm install opencode-llm-proxy
+
+# 2. Register the plugin in your opencode.json
+#    (or use one of the manual install methods below)
+```
+
+Add to `opencode.json`:
+
+```json
+{
+  "plugin": ["opencode-llm-proxy"]
+}
+```
+
+Then start OpenCode — the proxy starts automatically:
+
+```bash
+opencode
+# Proxy is now listening on http://127.0.0.1:4010
+```
+
+Send a request:
+
+```bash
+curl http://127.0.0.1:4010/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "github-copilot/claude-sonnet-4.6",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
 
 ## Install
 
-### As a global OpenCode plugin (recommended)
+### As an npm plugin (recommended)
+
+```bash
+npm install opencode-llm-proxy
+```
+
+Add to `opencode.json`:
+
+```json
+{
+  "plugin": ["opencode-llm-proxy"]
+}
+```
+
+### As a global OpenCode plugin
 
 Copy `index.js` to your global plugin directory:
 
@@ -22,16 +72,6 @@ Copy `index.js` to your project's plugin directory:
 
 ```bash
 cp index.js .opencode/plugins/openai-proxy.js
-```
-
-### As an npm plugin
-
-Add it to your `opencode.json`:
-
-```json
-{
-  "plugin": ["opencode-openai-proxy"]
-}
 ```
 
 ## Usage
@@ -80,14 +120,16 @@ curl http://127.0.0.1:4010/v1/responses \
 
 ## Configuration
 
-| Environment variable | Default | Description |
-|---|---|---|
-| `OPENCODE_LLM_PROXY_HOST` | `127.0.0.1` | Bind host. Set to `0.0.0.0` to expose on LAN. |
-| `OPENCODE_LLM_PROXY_PORT` | `4010` | Bind port. |
-| `OPENCODE_LLM_PROXY_TOKEN` | _(none)_ | Optional bearer token. If set, all requests must include `Authorization: Bearer <token>`. |
-| `OPENCODE_LLM_PROXY_CORS_ORIGIN` | `*` | CORS `Access-Control-Allow-Origin` header value. Use a specific origin if browser clients send credentials. |
+All configuration is done through environment variables. No configuration file is needed.
 
-The proxy answers browser preflight requests and adds CORS headers on success and error responses for `/health`, `/v1/models`, `/v1/chat/completions`, and `/v1/responses`.
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `OPENCODE_LLM_PROXY_HOST` | string | `127.0.0.1` | Bind address. Set to `0.0.0.0` to expose on LAN. |
+| `OPENCODE_LLM_PROXY_PORT` | integer | `4010` | TCP port the proxy listens on. |
+| `OPENCODE_LLM_PROXY_TOKEN` | string | _(unset)_ | Optional bearer token. When set, every request must include `Authorization: Bearer <token>`. Unset means no authentication required. |
+| `OPENCODE_LLM_PROXY_CORS_ORIGIN` | string | `*` | Value of the `Access-Control-Allow-Origin` response header. Use a specific origin (e.g. `https://app.example.com`) when browser clients send credentials. |
+
+The proxy adds CORS headers to all responses and handles `OPTIONS` preflight requests automatically.
 
 ### LAN example
 
