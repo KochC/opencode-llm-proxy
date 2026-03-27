@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.1](https://github.com/KochC/opencode-llm-proxy/compare/v1.6.0...v1.6.1) (2026-03-27)
+
+
+### Bug Fixes
+
+* reflect request Origin in CORS allow-origin for specific origin config ([f8da40a](https://github.com/KochC/opencode-llm-proxy/commit/f8da40a9628fa74e76c2dec069aa1f24c4eb6341))
+
 ## [1.6.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.5.0...v1.6.0) (2026-03-27)
 
 
