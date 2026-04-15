@@ -14,6 +14,7 @@ import {
   resolveModel,
   normalizeAnthropicMessages,
   mapFinishReasonToAnthropic,
+  normalizeAnthropicSystem,
   normalizeGeminiContents,
   extractGeminiSystemInstruction,
   mapFinishReasonToGemini,
@@ -1386,6 +1387,114 @@ test("POST /v1/messages system string is included in prompt", async () => {
 
   await handler(request)
   assert.ok(capturedSystem?.includes("You are a pirate."))
+})
+
+test("POST /v1/messages system as content-block array is included in prompt", async () => {
+  let capturedSystem = null
+  const client = {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: {
+          providers: [{ id: "anthropic", models: { "claude-3-5-sonnet": { id: "claude-3-5-sonnet" } } }],
+        },
+      }),
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-ant-sys-arr" } }),
+      prompt: async ({ body }) => {
+        capturedSystem = body.system
+        return {
+          data: {
+            parts: [{ type: "text", text: "ok" }],
+            info: { tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, finish: "end_turn" },
+          },
+        }
+      },
+    },
+  }
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "anthropic/claude-3-5-sonnet",
+      system: [{ type: "text", text: "You are a pirate." }],
+      messages: [{ role: "user", content: "Hello." }],
+    }),
+  })
+
+  await handler(request)
+  assert.ok(capturedSystem?.includes("You are a pirate."))
+})
+
+test("POST /v1/messages system as multi-block array concatenates text", async () => {
+  let capturedSystem = null
+  const client = {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: {
+          providers: [{ id: "anthropic", models: { "claude-3-5-sonnet": { id: "claude-3-5-sonnet" } } }],
+        },
+      }),
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-ant-sys-multi" } }),
+      prompt: async ({ body }) => {
+        capturedSystem = body.system
+        return {
+          data: {
+            parts: [{ type: "text", text: "ok" }],
+            info: { tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }, finish: "end_turn" },
+          },
+        }
+      },
+    },
+  }
+
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "anthropic/claude-3-5-sonnet",
+      system: [
+        { type: "text", text: "Line one." },
+        { type: "text", text: "Line two." },
+      ],
+      messages: [{ role: "user", content: "Hello." }],
+    }),
+  })
+
+  await handler(request)
+  assert.ok(capturedSystem?.includes("Line one."))
+  assert.ok(capturedSystem?.includes("Line two."))
+})
+
+test("normalizeAnthropicSystem handles string, array, and edge cases", () => {
+  assert.equal(normalizeAnthropicSystem("hello"), "hello")
+  assert.equal(normalizeAnthropicSystem("  hi  "), "hi")
+  assert.equal(normalizeAnthropicSystem(""), null)
+  assert.equal(normalizeAnthropicSystem("   "), null)
+  assert.equal(normalizeAnthropicSystem([{ type: "text", text: "a" }]), "a")
+  assert.equal(
+    normalizeAnthropicSystem([
+      { type: "text", text: "a" },
+      { type: "text", text: "b" },
+    ]),
+    "a\n\nb",
+  )
+  assert.equal(normalizeAnthropicSystem([{ type: "image", source: {} }]), null)
+  assert.equal(normalizeAnthropicSystem([]), null)
+  assert.equal(normalizeAnthropicSystem([{ type: "text", text: "" }]), null)
+  assert.equal(normalizeAnthropicSystem(undefined), null)
+  assert.equal(normalizeAnthropicSystem(null), null)
+  assert.equal(normalizeAnthropicSystem(42), null)
+  assert.equal(normalizeAnthropicSystem([null, { type: "text", text: "x" }]), "x")
 })
 
 test("POST /v1/messages missing model returns Anthropic error format", async () => {
