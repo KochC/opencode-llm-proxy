@@ -79,6 +79,21 @@ function createStreamingClient(chunks) {
   }
 }
 
+function parseSseStream(text) {
+  // Parses SSE `event: <name>\ndata: <json>\n\n` chunks into an ordered array.
+  // Local to this test file; not exported.
+  return text
+    .split("\n\n")
+    .filter((block) => block.trim())
+    .map((block) => {
+      const eventLine = block.match(/^event: (.+)$/m)
+      const dataLine = block.match(/^data: (.+)$/m)
+      if (!eventLine || !dataLine) return null
+      return { event: eventLine[1], data: JSON.parse(dataLine[1]) }
+    })
+    .filter(Boolean)
+}
+
 test("OPTIONS preflight returns CORS headers", async () => {
   const handler = createProxyFetchHandler(createClient())
   const request = new Request("http://127.0.0.1:4010/v1/models", {
@@ -1105,6 +1120,68 @@ test("POST /v1/responses stream: true returns SSE lifecycle events", async () =>
   assert.ok(text.includes("The answer"))
   assert.ok(text.includes(" is 42."))
   assert.ok(text.includes("response.completed"))
+})
+
+test("POST /v1/responses stream: true emits content_part.done with accumulated text per OpenAI spec", async () => {
+  const events = [
+    {
+      type: "message.part.updated",
+      properties: {
+        part: { sessionID: "sess-123", type: "text" },
+        delta: "The answer",
+      },
+    },
+    {
+      type: "message.part.updated",
+      properties: {
+        part: { sessionID: "sess-123", type: "text" },
+        delta: " is 42.",
+      },
+    },
+    { type: "session.idle", properties: { sessionID: "sess-123" } },
+  ]
+
+  const handler = createProxyFetchHandler(createStreamingClient(events))
+  const request = new Request("http://127.0.0.1:4010/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      input: "What is 6 times 7?",
+    }),
+  })
+
+  const response = await handler(request)
+  const text = await response.text()
+  const parsed = parseSseStream(text)
+  const names = parsed.map((e) => e.event)
+
+  // Discriminator 1 (gap #3): output_text.done.text must be the accumulated content
+  const outputTextDone = parsed.find((e) => e.event === "response.output_text.done")
+  assert.ok(outputTextDone, "response.output_text.done event must be present")
+  assert.equal(outputTextDone.data.text, "The answer is 42.")
+
+  // Discriminator 2 (gap #2): content_part.done must be present with populated part.text
+  const contentPartDone = parsed.find((e) => e.event === "response.content_part.done")
+  assert.ok(contentPartDone, "response.content_part.done event must be present")
+  assert.equal(contentPartDone.data.part.type, "output_text")
+  assert.equal(contentPartDone.data.part.text, "The answer is 42.")
+  assert.deepEqual(contentPartDone.data.part.annotations, [])
+
+  // Ordering: output_text.done -> content_part.done -> output_item.done
+  const idxOutputTextDone = names.indexOf("response.output_text.done")
+  const idxContentPartDone = names.indexOf("response.content_part.done")
+  const idxOutputItemDone = names.indexOf("response.output_item.done")
+  assert.ok(idxOutputTextDone >= 0, "output_text.done must be in the stream")
+  assert.ok(
+    idxContentPartDone > idxOutputTextDone,
+    "content_part.done must follow output_text.done",
+  )
+  assert.ok(
+    idxOutputItemDone > idxContentPartDone,
+    "output_item.done must follow content_part.done",
+  )
 })
 
 test("POST /v1/responses stream: true with session.error emits response.failed", async () => {

@@ -907,6 +907,9 @@ export function createProxyFetchHandler(client) {
           )
 
           let partIndex = 0
+          // Accumulate delta tokens so we can populate `text` on output_text.done and content_part.done per the
+          // OpenAI Responses API SSE spec (https://platform.openai.com/docs/api-reference/responses-streaming).
+          let accumulatedText = ""
           const runPromise = executePromptStreaming(
             client,
             model,
@@ -925,6 +928,7 @@ export function createProxyFetchHandler(client) {
                 )
                 partIndex++
               }
+              accumulatedText += delta
               queue.enqueue(
                 sseEvent("response.output_text.delta", {
                   type: "response.output_text.delta",
@@ -943,9 +947,22 @@ export function createProxyFetchHandler(client) {
                   item_id: itemID,
                   output_index: 0,
                   content_index: 0,
-                  text: "",
+                  text: accumulatedText,
                 }),
               )
+              if (partIndex > 0) {
+                // Only emit content_part.done if content_part.added was emitted (i.e. at least one delta arrived).
+                // Keeps the content-part lifecycle symmetric per the OpenAI Responses API spec.
+                queue.enqueue(
+                  sseEvent("response.content_part.done", {
+                    type: "response.content_part.done",
+                    item_id: itemID,
+                    output_index: 0,
+                    content_index: 0,
+                    part: { type: "output_text", text: accumulatedText, annotations: [] },
+                  }),
+                )
+              }
               queue.enqueue(
                 sseEvent("response.output_item.done", {
                   type: "response.output_item.done",
