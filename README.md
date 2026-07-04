@@ -316,7 +316,7 @@ OpenAI Chat Completions. Required fields: `model`, `messages`. Optional: `stream
 OpenAI Responses API. Required fields: `model`, `input`. Optional: `instructions`, `stream`, `max_output_tokens`.
 
 ### POST /v1/messages
-Anthropic Messages API. Required fields: `model`, `messages`. Optional: `system`, `max_tokens`, `stream`.
+Anthropic Messages API. Required fields: `model`, `messages`. Optional: `system` (string or array of `{type: "text", text: string}` content blocks), `max_tokens`, `stream`.
 
 Errors are returned in Anthropic format: `{ "type": "error", "error": { "type": "...", "message": "..." } }`.
 

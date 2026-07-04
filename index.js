@@ -592,6 +592,22 @@ export function normalizeAnthropicMessages(messages) {
     .filter((message) => message.content.length > 0)
 }
 
+export function normalizeAnthropicSystem(system) {
+  if (typeof system === "string") {
+    const trimmed = system.trim()
+    return trimmed || null
+  }
+  if (Array.isArray(system)) {
+    const text = system
+      .filter((block) => block && block.type === "text" && typeof block.text === "string")
+      .map((block) => block.text.trim())
+      .filter(Boolean)
+      .join("\n\n")
+    return text || null
+  }
+  return null
+}
+
 export function mapFinishReasonToAnthropic(finish) {
   if (!finish) return "end_turn"
   if (finish.includes("length")) return "max_tokens"
@@ -1040,11 +1056,13 @@ export function createProxyFetchHandler(client) {
         return anthropicBadRequest("No text content was found in the supplied messages.", 400, request)
       }
 
-      // Prepend Anthropic top-level system string as a system message so buildSystemPrompt picks it up.
-      const allMessages =
-        typeof body.system === "string" && body.system.trim()
-          ? [{ role: "system", content: body.system.trim() }, ...messages]
-          : messages
+      // Prepend Anthropic top-level `system` (string or array-of-content-blocks,
+      // per the Messages API spec) as a system message so buildSystemPrompt
+      // picks it up.
+      const systemText = normalizeAnthropicSystem(body.system)
+      const allMessages = systemText
+        ? [{ role: "system", content: systemText }, ...messages]
+        : messages
 
       const system = buildSystemPrompt(allMessages, {
         temperature: body.temperature,
