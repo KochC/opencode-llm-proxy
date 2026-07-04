@@ -5,12 +5,12 @@
 [![CI](https://github.com/KochC/opencode-llm-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/KochC/opencode-llm-proxy/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**One local endpoint. Every model you have access to. Any API format.**
+**One local endpoint. Every model you have access to. Any API format. Tool calling included.**
 
 opencode-llm-proxy is an [OpenCode](https://opencode.ai) plugin that starts a local HTTP server on `http://127.0.0.1:4010`. It translates between the API format your tool speaks and whichever LLM provider OpenCode has configured — so you never reconfigure the same models twice.
 
 ```
-Your tool (OpenAI / Anthropic / Gemini SDK)
+Your tool (OpenAI / Anthropic / Gemini SDK, coding agent, etc.)
          │
          ▼  http://127.0.0.1:4010
   opencode-llm-proxy
@@ -19,7 +19,7 @@ Your tool (OpenAI / Anthropic / Gemini SDK)
   GitHub Copilot · Anthropic · Gemini · Ollama · OpenRouter · Bedrock · …
 ```
 
-**Supported API formats — all with streaming:**
+**Supported API formats — all with streaming and [tool/function calling](#tool-calling):**
 
 | Format | Endpoint |
 |---|---|
@@ -27,6 +27,24 @@ Your tool (OpenAI / Anthropic / Gemini SDK)
 | OpenAI Responses API | `POST /v1/responses` |
 | Anthropic Messages API | `POST /v1/messages` |
 | Google Gemini | `POST /v1beta/models/:model:generateContent` |
+
+**✨ Tool calling works with all four formats** — point a coding agent (Claude Code, Cursor, Continue, Cline, your own agent loop, ...) at the proxy and its `tools`/`tool_choice` calls are translated through to whatever model OpenCode has configured, with a real `tool_calls` / `tool_use` / `functionCall` response handed back. See [Tool calling](#tool-calling).
+
+---
+
+## Contents
+
+- [Why](#why)
+- [Quickstart](#quickstart)
+- [Install](#install)
+- [Configuration](#configuration)
+- [Tool calling](#tool-calling)
+- [Using with SDKs and tools](#using-with-sdks-and-tools)
+- [Finding model IDs](#finding-model-ids)
+- [API reference](#api-reference)
+- [How it works](#how-it-works)
+- [Limitations](#limitations)
+- [License](#license)
 
 ---
 
@@ -41,6 +59,7 @@ Most LLM tools speak exactly one API dialect. OpenCode already manages connectio
 - You want to **swap models without code changes**. Your app talks to the proxy; you change the model in OpenCode config.
 - You want to **share your models on a LAN**. Expose the proxy on `0.0.0.0` and give teammates the URL.
 - You use the **Anthropic SDK** but want to route through GitHub Copilot or Bedrock. No code change in the SDK — just point it at the proxy.
+- You're building or running a **coding agent** that needs real tool/function calling (read files, run shell commands, etc.) against whatever model OpenCode has configured. See [Tool calling](#tool-calling).
 
 ---
 
@@ -110,6 +129,8 @@ curl -o .opencode/plugins/llm-proxy.js \
   https://raw.githubusercontent.com/KochC/opencode-llm-proxy/main/index.js
 ```
 
+> Copying just `index.js` works for everything except [tool calling](#tool-calling), which also needs `mcp-tool-bridge.js` alongside it. Use the npm plugin install method if you want tool calling.
+
 ---
 
 ## Configuration
@@ -120,12 +141,74 @@ curl -o .opencode/plugins/llm-proxy.js \
 | `OPENCODE_LLM_PROXY_PORT` | `4010` | TCP port. |
 | `OPENCODE_LLM_PROXY_TOKEN` | _(unset)_ | Bearer token required on every request. Unset = no auth. |
 | `OPENCODE_LLM_PROXY_CORS_ORIGIN` | `*` | `Access-Control-Allow-Origin` value for browser clients. |
+| `OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE` | `8` | Max concurrent in-flight requests using [tool calling](#tool-calling). |
 
 ```bash
 OPENCODE_LLM_PROXY_HOST=0.0.0.0 \
 OPENCODE_LLM_PROXY_TOKEN=my-secret \
 opencode
 ```
+
+---
+
+## Tool calling
+
+The proxy supports real tool/function calling on **all four API formats** — OpenAI function tools (`tools` on `/v1/chat/completions` and `/v1/responses`), Anthropic tools (`tools` on `/v1/messages`), and Gemini function declarations (`tools` on `:generateContent`/`:streamGenerateContent`). This is what lets coding agents and other tool-using clients work through the proxy, not just plain chat.
+
+```bash
+curl http://127.0.0.1:4010/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "github-copilot/claude-sonnet-4.6",
+    "messages": [{"role": "user", "content": "What is the weather in NYC?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": { "city": { "type": "string" } },
+          "required": ["city"]
+        }
+      }
+    }]
+  }'
+```
+
+```json
+{
+  "choices": [{
+    "finish_reason": "tool_calls",
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_...",
+        "type": "function",
+        "function": { "name": "get_weather", "arguments": "{\"city\":\"NYC\"}" }
+      }]
+    }
+  }]
+}
+```
+
+Send the tool's result back on your next request (`role: "tool"` / `tool_result` / `functionResponse`, per your API's convention) alongside the full conversation history, same as any other multi-turn request — the proxy is stateless between calls either way.
+
+### How tool calling works under the hood
+
+OpenCode's own agent loop always executes tools itself, server-side, so there's no native concept of a "client-executed" tool call to hand off to. To bridge that gap, when a request includes `tools`:
+
+1. The proxy dynamically registers a small local [MCP](https://opencode.ai/docs/mcp-servers/) server whose tool list is exactly your declared tool schemas (see `mcp-tool-bridge.js`).
+2. Only those tools are enabled for that one prompt call — every built-in OpenCode tool stays disabled, same as always.
+3. As soon as the model proposes calling one of your tools, the proxy immediately aborts the OpenCode session (before the bridge's no-op handler is ever consulted) and translates the captured call name + arguments into your API's tool-call shape — `tool_calls` (OpenAI), `tool_use` (Anthropic), or a `functionCall` part (Gemini) — instead of a text answer.
+
+### Notes and current limitations
+
+- One tool call per turn — parallel/multiple simultaneous tool calls aren't supported.
+- `tool_choice: "none"` (OpenAI/Gemini `mode: "NONE"`/Anthropic `type: "none"`) disables tool calling for that request; forcing a specific named tool is supported.
+- Bridge servers are reused from a small fixed-size pool (`px_tools_0`, `px_tools_1`, ...) rather than registered fresh per request, since OpenCode's server API has no endpoint to deregister an MCP server once added. Configure the pool size with `OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE` (default `8`) if you expect more than 8 concurrent in-flight tool-calling requests.
+- The bridge process is spawned with `node`, so `node` must be on `PATH` wherever OpenCode is running.
 
 ---
 
@@ -310,18 +393,18 @@ x-opencode-provider: anthropic
 Returns all models from all configured providers in OpenAI list format.
 
 ### POST /v1/chat/completions
-OpenAI Chat Completions. Required fields: `model`, `messages`. Optional: `stream`, `temperature`, `max_tokens`.
+OpenAI Chat Completions. Required fields: `model`, `messages`. Optional: `stream`, `temperature`, `max_tokens`, `tools`, `tool_choice`.
 
 ### POST /v1/responses
-OpenAI Responses API. Required fields: `model`, `input`. Optional: `instructions`, `stream`, `max_output_tokens`.
+OpenAI Responses API. Required fields: `model`, `input`. Optional: `instructions`, `stream`, `max_output_tokens`, `tools`, `tool_choice`.
 
 ### POST /v1/messages
-Anthropic Messages API. Required fields: `model`, `messages`. Optional: `system` (string or array of `{type: "text", text: string}` content blocks), `max_tokens`, `stream`.
+Anthropic Messages API. Required fields: `model`, `messages`. Optional: `system` (string or array of `{type: "text", text: string}` content blocks), `max_tokens`, `stream`, `tools`, `tool_choice`.
 
 Errors are returned in Anthropic format: `{ "type": "error", "error": { "type": "...", "message": "..." } }`.
 
 ### POST /v1beta/models/:model:generateContent
-Google Gemini non-streaming. Model name in URL path. Required field: `contents`. Optional: `systemInstruction`, `generationConfig`.
+Google Gemini non-streaming. Model name in URL path. Required field: `contents`. Optional: `systemInstruction`, `generationConfig`, `tools`, `toolConfig`.
 
 ### POST /v1beta/models/:model:streamGenerateContent
 Same as above, returns newline-delimited JSON stream.
@@ -345,9 +428,9 @@ Streaming uses OpenCode's `client.event.subscribe()` SSE stream. Text deltas are
 ## Limitations
 
 - Text only — image, audio, and file inputs are ignored
-- No tool/function calling — all OpenCode tools are disabled for proxy sessions
 - No cross-request session state — send full conversation history on every request
 - Temperature and max tokens are advisory (passed as system prompt hints)
+- Tool calling supports one call per turn — see [Tool calling](#tool-calling) above
 
 ---
 

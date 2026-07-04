@@ -1,7 +1,7 @@
 {
   "name": "opencode-llm-proxy",
   "version": "1.6.1",
-  "description": "Local AI gateway for OpenCode — use any model via OpenAI, Anthropic, or Gemini API format",
+  "description": "Local AI gateway for OpenCode with tool/function calling — use any model via OpenAI, Anthropic, or Gemini API format",
   "main": "index.js",
   "type": "module",
   "engines": {
@@ -32,7 +32,15 @@
     "ai-gateway",
     "model-router",
     "openrouter",
-    "bedrock"
+    "bedrock",
+    "tool-calling",
+    "function-calling",
+    "tools",
+    "mcp",
+    "model-context-protocol",
+    "coding-agent",
+    "ai-agent",
+    "agentic"
   ],
   "author": "KochC",
   "license": "MIT",

@@ -1,4 +1,7 @@
+import { fileURLToPath } from "node:url"
+
 const STATE_KEY = "__opencodeOpenAIProxyState"
+const BRIDGE_SCRIPT_PATH = fileURLToPath(new URL("./mcp-tool-bridge.js", import.meta.url))
 
 function getState() {
   if (!globalThis[STATE_KEY]) {
@@ -114,11 +117,34 @@ export function toTextContent(content) {
 }
 
 export function normalizeMessages(messages) {
+  const toolNameByCallId = new Map()
+
   return messages
-    .map((message) => ({
-      role: message.role,
-      content: toTextContent(message.content).trim(),
-    }))
+    .map((message) => {
+      if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+        const baseText = toTextContent(message.content).trim()
+        const callsText = message.tool_calls
+          .map((call) => {
+            const name = call.function?.name ?? call.name ?? "unknown_tool"
+            const args = call.function?.arguments ?? ""
+            if (call.id) toolNameByCallId.set(call.id, name)
+            return `[Called tool ${name} with arguments ${args}]`
+          })
+          .join("\n")
+        return { role: message.role, content: [baseText, callsText].filter(Boolean).join("\n\n") }
+      }
+
+      if (message.role === "tool") {
+        const name = toolNameByCallId.get(message.tool_call_id) ?? "tool"
+        const resultText = toTextContent(message.content).trim()
+        return { role: "tool", content: `[Result from tool ${name}]: ${resultText}` }
+      }
+
+      return {
+        role: message.role,
+        content: toTextContent(message.content).trim(),
+      }
+    })
     .filter((message) => message.content.length > 0)
 }
 
@@ -129,8 +155,22 @@ export function normalizeResponseInput(input) {
 
   if (!Array.isArray(input)) return []
 
+  const toolNameByCallId = new Map()
+
   return input
     .map((item) => {
+      if (item?.type === "function_call") {
+        const name = item.name ?? "unknown_tool"
+        if (item.call_id) toolNameByCallId.set(item.call_id, name)
+        return { role: "assistant", content: `[Called tool ${name} with arguments ${item.arguments ?? ""}]` }
+      }
+
+      if (item?.type === "function_call_output") {
+        const name = toolNameByCallId.get(item.call_id) ?? "tool"
+        const output = typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "")
+        return { role: "tool", content: `[Result from tool ${name}]: ${output}` }
+      }
+
       const role = item.role ?? item.type ?? "user"
       if (typeof item.content === "string") {
         return { role, content: item.content.trim() }
@@ -227,7 +267,28 @@ export function extractAssistantText(parts) {
     .trim()
 }
 
-async function executePrompt(client, request, model, messages, system) {
+async function executePrompt(client, request, model, messages, system, callerTools = []) {
+  if (Array.isArray(callerTools) && callerTools.length > 0) {
+    // Tool-aware path: must watch the event stream (via runAgentTurn) rather than
+    // block on session.prompt, so we can intercept a proposed tool call instead of
+    // letting OpenCode's agent loop run to a final text answer.
+    const result = await runAgentTurn(client, model, messages, system, callerTools, () => {})
+    return {
+      content: result.content,
+      toolCall: result.toolCall,
+      request,
+      sessionID: result.sessionID,
+      completion: {
+        data: {
+          info: {
+            finish: result.finish,
+            tokens: result.tokens,
+          },
+        },
+      },
+    }
+  }
+
   const tools = await getDisabledTools(client)
   const session = await client.session.create({
     body: {
@@ -263,77 +324,48 @@ async function executePrompt(client, request, model, messages, system) {
 
   return {
     content,
+    toolCall: null,
     completion,
     request,
     sessionID: session.data.id,
   }
 }
 
-async function executePromptStreaming(client, model, messages, system, onChunk) {
-  const tools = await getDisabledTools(client)
-  const session = await client.session.create({
-    body: { title: `Proxy: ${model.id}` },
-  })
-  const sessionID = session.data.id
-  const prompt = buildPrompt(messages)
-
-  // Subscribe to the event stream before sending the prompt so we don't miss events.
-  const { stream } = await client.event.subscribe()
-
-  await client.session.promptAsync({
-    path: { id: sessionID },
-    body: {
-      model: { providerID: model.providerID, modelID: model.modelID },
-      system,
-      tools,
-      parts: [{ type: "text", text: prompt }],
-    },
-  })
-
-  let errorMessage = null
-
-  for await (const event of stream) {
-    if (event.type === "message.part.updated") {
-      const part = event.properties?.part
-      const delta = event.properties?.delta
-      if (
-        part?.sessionID === sessionID &&
-        part?.type === "text" &&
-        typeof delta === "string" &&
-        delta.length > 0
-      ) {
-        onChunk(delta)
-      }
-    } else if (event.type === "session.error") {
-      if (!event.properties?.sessionID || event.properties.sessionID === sessionID) {
-        errorMessage = event.properties?.error?.message ?? "Model call failed."
-      }
-    } else if (event.type === "session.idle") {
-      if (event.properties?.sessionID === sessionID) {
-        break
-      }
-    }
-  }
-
-  if (errorMessage) {
-    throw new Error(errorMessage)
-  }
-
-  // Fetch final message to get token usage.
-  const messages_ = await client.session.messages({ path: { id: sessionID } })
-  const assistantMsg = (messages_.data ?? [])
-    .filter((m) => m.role === "assistant")
-    .at(-1)
-
+async function executePromptStreaming(client, model, messages, system, onChunk, callerTools = []) {
+  const result = await runAgentTurn(client, model, messages, system, callerTools, onChunk)
   return {
-    sessionID,
-    tokens: assistantMsg?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    finish: assistantMsg?.finish,
+    sessionID: result.sessionID,
+    tokens: result.tokens,
+    finish: result.finish,
+    toolCall: result.toolCall,
   }
 }
 
 function createChatCompletionResponse(result, model) {
   const now = Math.floor(Date.now() / 1000)
+  const tokensIn = result.completion.data.info?.tokens?.input ?? 0
+  const tokensOut = result.completion.data.info?.tokens?.output ?? 0
+
+  const message = result.toolCall
+    ? {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: result.toolCall.id,
+            type: "function",
+            function: {
+              name: result.toolCall.name,
+              arguments: JSON.stringify(result.toolCall.arguments ?? {}),
+            },
+          },
+        ],
+      }
+    : {
+        role: "assistant",
+        content: result.content,
+      }
+
   return {
     id: `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`,
     object: "chat.completion",
@@ -342,19 +374,14 @@ function createChatCompletionResponse(result, model) {
     choices: [
       {
         index: 0,
-        finish_reason: mapFinishReason(result.completion.data.info?.finish),
-        message: {
-          role: "assistant",
-          content: result.content,
-        },
+        finish_reason: result.toolCall ? "tool_calls" : mapFinishReason(result.completion.data.info?.finish),
+        message,
       },
     ],
     usage: {
-      prompt_tokens: result.completion.data.info?.tokens?.input ?? 0,
-      completion_tokens: result.completion.data.info?.tokens?.output ?? 0,
-      total_tokens:
-        (result.completion.data.info?.tokens?.input ?? 0) +
-        (result.completion.data.info?.tokens?.output ?? 0),
+      prompt_tokens: tokensIn,
+      completion_tokens: tokensOut,
+      total_tokens: tokensIn + tokensOut,
     },
   }
 }
@@ -363,28 +390,41 @@ function createResponsesApiResponse(result, model) {
   const tokensIn = result.completion.data.info?.tokens?.input ?? 0
   const tokensOut = result.completion.data.info?.tokens?.output ?? 0
 
+  const output = result.toolCall
+    ? [
+        {
+          id: `fc_${crypto.randomUUID().replace(/-/g, "")}`,
+          type: "function_call",
+          call_id: result.toolCall.id,
+          name: result.toolCall.name,
+          arguments: JSON.stringify(result.toolCall.arguments ?? {}),
+          status: "completed",
+        },
+      ]
+    : [
+        {
+          id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: result.content,
+              annotations: [],
+            },
+          ],
+        },
+      ]
+
   return {
     id: `resp_${crypto.randomUUID().replace(/-/g, "")}`,
     object: "response",
     created_at: Math.floor(Date.now() / 1000),
     status: "completed",
     model: model.id,
-    output: [
-      {
-        id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
-        type: "message",
-        status: "completed",
-        role: "assistant",
-        content: [
-          {
-            type: "output_text",
-            text: result.content,
-            annotations: [],
-          },
-        ],
-      },
-    ],
-    output_text: result.content,
+    output,
+    output_text: result.toolCall ? "" : result.content,
     parallel_tool_calls: false,
     reasoning: {
       effort: result.request.reasoning?.effort ?? null,
@@ -438,6 +478,314 @@ async function getDisabledTools(client) {
   const ids = Array.isArray(result.data) ? result.data : []
   state.toolOffSwitch = Object.fromEntries(ids.map((id) => [id, false]))
   return state.toolOffSwitch
+}
+
+// ---------------------------------------------------------------------------
+// Tool calling support
+//
+// OpenCode's own agent loop always executes tools itself, server-side, and has
+// no concept of a "client-executed" tool call. To offer OpenAI/Anthropic/Gemini
+// style tool calling (propose a call, hand control back to the caller, resume
+// once they supply a result) we:
+//
+//   1. Dynamically register a tiny local MCP server ("bridge") whose tool list
+//      is exactly the caller's declared tool schemas (see mcp-tool-bridge.js).
+//   2. Enable only those tool IDs for this one prompt call.
+//   3. Watch OpenCode's event stream. As soon as the model proposes calling one
+//      of the bridge tools, the full call (name + arguments) is already present
+//      on the event (see ToolStatePending in OpenCode's SDK types) - we grab it
+//      and immediately abort the session before the bridge's harmless no-op
+//      tools/call handler would ever matter.
+//   4. Translate the captured call into the caller's expected tool-call shape.
+//
+// Bridge servers are reused from a small fixed-size pool of slot names (rather
+// than registered fresh per request) since OpenCode's server API exposes no way
+// to remove/deregister an MCP server once added.
+// ---------------------------------------------------------------------------
+
+function getToolBridgeState() {
+  const state = getState()
+  if (!state.toolBridge) {
+    const configured = Number.parseInt(process.env.OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE ?? "", 10)
+    const poolSize = Number.isFinite(configured) && configured > 0 ? configured : 8
+    state.toolBridge = {
+      freeSlots: Array.from({ length: poolSize }, (_, i) => `px_tools_${i}`),
+      waiters: [],
+    }
+  }
+  return state.toolBridge
+}
+
+async function acquireBridgeSlot() {
+  const bridgeState = getToolBridgeState()
+  if (bridgeState.freeSlots.length > 0) {
+    return bridgeState.freeSlots.shift()
+  }
+  return new Promise((resolve) => {
+    bridgeState.waiters.push(resolve)
+  })
+}
+
+function releaseBridgeSlot(slotName) {
+  const bridgeState = getToolBridgeState()
+  if (bridgeState.waiters.length > 0) {
+    const resolve = bridgeState.waiters.shift()
+    resolve(slotName)
+  } else {
+    bridgeState.freeSlots.push(slotName)
+  }
+}
+
+export function sanitizeToolName(name, seen = new Set()) {
+  let sanitized = String(name ?? "")
+    .replace(/[^a-zA-Z0-9_]/g, "_")
+    .slice(0, 60)
+  if (!sanitized) sanitized = "tool"
+  if (!/^[a-zA-Z_]/.test(sanitized)) sanitized = `t_${sanitized}`
+
+  let candidate = sanitized
+  let suffix = 2
+  while (seen.has(candidate)) {
+    candidate = `${sanitized}_${suffix}`
+    suffix++
+  }
+  seen.add(candidate)
+  return candidate
+}
+
+function normalizeParameters(parameters) {
+  if (parameters && typeof parameters === "object") return parameters
+  return { type: "object", properties: {} }
+}
+
+export function parseOpenAITools(body) {
+  const list = []
+  if (Array.isArray(body?.tools)) {
+    for (const entry of body.tools) {
+      if (!entry || entry.type !== "function") continue
+      // Chat Completions nests fields under `function`; the Responses API uses a flat shape.
+      const fn = entry.function ?? entry
+      if (typeof fn.name === "string" && fn.name) {
+        list.push({
+          name: fn.name,
+          description: typeof fn.description === "string" ? fn.description : "",
+          parameters: normalizeParameters(fn.parameters),
+        })
+      }
+    }
+  } else if (Array.isArray(body?.functions)) {
+    // Legacy (pre-2023-08) OpenAI `functions` field.
+    for (const fn of body.functions) {
+      if (fn && typeof fn.name === "string" && fn.name) {
+        list.push({
+          name: fn.name,
+          description: typeof fn.description === "string" ? fn.description : "",
+          parameters: normalizeParameters(fn.parameters),
+        })
+      }
+    }
+  }
+  return list
+}
+
+export function applyOpenAIToolChoice(tools, toolChoice) {
+  if (toolChoice === "none") return []
+  if (toolChoice && typeof toolChoice === "object") {
+    const name = toolChoice.function?.name ?? toolChoice.name
+    if (toolChoice.type === "function" && name) {
+      return tools.filter((tool) => tool.name === name)
+    }
+  }
+  return tools
+}
+
+export function parseAnthropicTools(body) {
+  const list = []
+  if (Array.isArray(body?.tools)) {
+    for (const tool of body.tools) {
+      if (tool && typeof tool.name === "string" && tool.name) {
+        list.push({
+          name: tool.name,
+          description: typeof tool.description === "string" ? tool.description : "",
+          parameters: normalizeParameters(tool.input_schema),
+        })
+      }
+    }
+  }
+  return list
+}
+
+export function applyAnthropicToolChoice(tools, toolChoice) {
+  if (toolChoice?.type === "none") return []
+  if (toolChoice?.type === "tool" && toolChoice.name) {
+    return tools.filter((tool) => tool.name === toolChoice.name)
+  }
+  return tools
+}
+
+export function parseGeminiTools(body) {
+  const list = []
+  if (Array.isArray(body?.tools)) {
+    for (const toolGroup of body.tools) {
+      const declarations = Array.isArray(toolGroup?.functionDeclarations) ? toolGroup.functionDeclarations : []
+      for (const decl of declarations) {
+        if (decl && typeof decl.name === "string" && decl.name) {
+          list.push({
+            name: decl.name,
+            description: typeof decl.description === "string" ? decl.description : "",
+            parameters: normalizeParameters(decl.parameters),
+          })
+        }
+      }
+    }
+  }
+  return list
+}
+
+export function applyGeminiToolChoice(tools, toolConfig) {
+  const mode = toolConfig?.functionCallingConfig?.mode
+  if (mode === "NONE") return []
+  const allowed = toolConfig?.functionCallingConfig?.allowedFunctionNames
+  if (Array.isArray(allowed) && allowed.length > 0) {
+    return tools.filter((tool) => allowed.includes(tool.name))
+  }
+  return tools
+}
+
+async function registerToolBridge(client, tools) {
+  const slotName = await acquireBridgeSlot()
+  const seen = new Set()
+  const nameMap = new Map() // full bridge tool ID ("<slot>_<sanitized>") -> original caller-facing name
+  const bridgeTools = tools.map((tool) => {
+    const sanitized = sanitizeToolName(tool.name, seen)
+    nameMap.set(`${slotName}_${sanitized}`, tool.name)
+    return { name: sanitized, description: tool.description, parameters: tool.parameters }
+  })
+
+  try {
+    // Force a fresh respawn so the bridge process picks up this request's tool schema.
+    await client.mcp.disconnect({ path: { name: slotName } })
+  } catch {
+    // Not previously connected; nothing to do.
+  }
+
+  await client.mcp.add({
+    body: {
+      name: slotName,
+      config: {
+        type: "local",
+        command: ["node", BRIDGE_SCRIPT_PATH],
+        environment: {
+          OPENCODE_LLM_PROXY_BRIDGE_TOOLS: JSON.stringify(bridgeTools),
+        },
+        timeout: 10000,
+      },
+    },
+  })
+
+  const toolIDs = bridgeTools.map((tool) => `${slotName}_${tool.name}`)
+  return { slotName, toolIDs, nameMap }
+}
+
+function releaseToolBridge(bridge) {
+  if (bridge) releaseBridgeSlot(bridge.slotName)
+}
+
+async function runAgentTurn(client, model, messages, system, callerTools, onChunk) {
+  const baseTools = await getDisabledTools(client)
+  let toolsMap = baseTools
+  let bridge = null
+
+  if (Array.isArray(callerTools) && callerTools.length > 0) {
+    bridge = await registerToolBridge(client, callerTools)
+    toolsMap = { ...baseTools }
+    for (const id of bridge.toolIDs) toolsMap[id] = true
+  }
+
+  const session = await client.session.create({ body: { title: `Proxy: ${model.id}` } })
+  const sessionID = session.data.id
+  const prompt = buildPrompt(messages)
+  const toolIDSet = bridge ? new Set(bridge.toolIDs) : null
+
+  // Subscribe to the event stream before sending the prompt so we don't miss events.
+  const { stream } = await client.event.subscribe()
+
+  await client.session.promptAsync({
+    path: { id: sessionID },
+    body: {
+      model: { providerID: model.providerID, modelID: model.modelID },
+      system,
+      tools: toolsMap,
+      parts: [{ type: "text", text: prompt }],
+    },
+  })
+
+  let errorMessage = null
+  let content = ""
+  let toolCall = null
+
+  try {
+    for await (const event of stream) {
+      if (event.type === "message.part.updated") {
+        const part = event.properties?.part
+        const delta = event.properties?.delta
+
+        if (
+          part?.sessionID === sessionID &&
+          part?.type === "text" &&
+          typeof delta === "string" &&
+          delta.length > 0
+        ) {
+          content += delta
+          onChunk?.(delta)
+        } else if (
+          toolIDSet &&
+          part?.sessionID === sessionID &&
+          part?.type === "tool" &&
+          toolIDSet.has(part.tool) &&
+          (part.state?.status === "pending" || part.state?.status === "running")
+        ) {
+          toolCall = {
+            id: part.callID,
+            name: bridge.nameMap.get(part.tool) ?? part.tool,
+            arguments: part.state.input ?? {},
+          }
+          try {
+            await client.session.abort({ path: { id: sessionID } })
+          } catch {
+            // Best effort - we're ending our own read loop regardless.
+          }
+          break
+        }
+      } else if (event.type === "session.error") {
+        if (!event.properties?.sessionID || event.properties.sessionID === sessionID) {
+          errorMessage = event.properties?.error?.message ?? "Model call failed."
+        }
+        break
+      } else if (event.type === "session.idle") {
+        if (event.properties?.sessionID === sessionID) {
+          break
+        }
+      }
+    }
+  } finally {
+    releaseToolBridge(bridge)
+  }
+
+  if (errorMessage && !toolCall) {
+    throw new Error(errorMessage)
+  }
+
+  const messagesResult = await client.session.messages({ path: { id: sessionID } })
+  const assistantMsg = (messagesResult.data ?? []).filter((m) => m.role === "assistant").at(-1)
+
+  return {
+    sessionID,
+    content,
+    toolCall,
+    tokens: assistantMsg?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    finish: toolCall ? "tool_calls" : assistantMsg?.finish,
+  }
 }
 
 async function listModels(client) {
@@ -575,6 +923,8 @@ function createModelResponse(models) {
 // ---------------------------------------------------------------------------
 
 export function normalizeAnthropicMessages(messages) {
+  const toolNameByUseId = new Map()
+
   return messages
     .map((message) => {
       let content = ""
@@ -582,8 +932,30 @@ export function normalizeAnthropicMessages(messages) {
         content = message.content.trim()
       } else if (Array.isArray(message.content)) {
         content = message.content
-          .filter((block) => block && block.type === "text" && typeof block.text === "string")
-          .map((block) => block.text.trim())
+          .map((block) => {
+            if (!block) return ""
+            if (block.type === "text" && typeof block.text === "string") {
+              return block.text.trim()
+            }
+            if (block.type === "tool_use") {
+              if (block.id) toolNameByUseId.set(block.id, block.name)
+              return `[Called tool ${block.name} with arguments ${JSON.stringify(block.input ?? {})}]`
+            }
+            if (block.type === "tool_result") {
+              const name = toolNameByUseId.get(block.tool_use_id) ?? "tool"
+              let resultText = ""
+              if (typeof block.content === "string") {
+                resultText = block.content
+              } else if (Array.isArray(block.content)) {
+                resultText = block.content
+                  .filter((inner) => inner && inner.type === "text" && typeof inner.text === "string")
+                  .map((inner) => inner.text)
+                  .join("\n\n")
+              }
+              return `[Result from tool ${name}]: ${resultText}`
+            }
+            return ""
+          })
           .filter(Boolean)
           .join("\n\n")
       }
@@ -618,13 +990,24 @@ export function mapFinishReasonToAnthropic(finish) {
 function createAnthropicResponse(result, model) {
   const tokensIn = result.completion.data.info?.tokens?.input ?? 0
   const tokensOut = result.completion.data.info?.tokens?.output ?? 0
+  const content = result.toolCall
+    ? [
+        {
+          type: "tool_use",
+          id: result.toolCall.id,
+          name: result.toolCall.name,
+          input: result.toolCall.arguments ?? {},
+        },
+      ]
+    : [{ type: "text", text: result.content }]
+
   return {
     id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
     type: "message",
     role: "assistant",
-    content: [{ type: "text", text: result.content }],
+    content,
     model: model.id,
-    stop_reason: mapFinishReasonToAnthropic(result.completion.data.info?.finish),
+    stop_reason: result.toolCall ? "tool_use" : mapFinishReasonToAnthropic(result.completion.data.info?.finish),
     stop_sequence: null,
     usage: { input_tokens: tokensIn, output_tokens: tokensOut },
   }
@@ -659,7 +1042,17 @@ export function normalizeGeminiContents(contents) {
       const role = item.role === "model" ? "assistant" : (item.role ?? "user")
       const content = Array.isArray(item.parts)
         ? item.parts
-            .map((part) => (typeof part?.text === "string" ? part.text.trim() : ""))
+            .map((part) => {
+              if (!part) return ""
+              if (typeof part.text === "string") return part.text.trim()
+              if (part.functionCall) {
+                return `[Called tool ${part.functionCall.name} with arguments ${JSON.stringify(part.functionCall.args ?? {})}]`
+              }
+              if (part.functionResponse) {
+                return `[Result from tool ${part.functionResponse.name}]: ${JSON.stringify(part.functionResponse.response ?? {})}`
+              }
+              return ""
+            })
             .filter(Boolean)
             .join("\n\n")
         : ""
@@ -687,11 +1080,15 @@ export function mapFinishReasonToGemini(finish) {
   return "STOP"
 }
 
-function createGeminiResponse(content, finish, tokens) {
+function createGeminiResponse(content, finish, tokens, toolCall) {
+  const parts = toolCall
+    ? [{ functionCall: { name: toolCall.name, args: toolCall.arguments ?? {} } }]
+    : [{ text: content }]
+
   return {
     candidates: [
       {
-        content: { role: "model", parts: [{ text: content }] },
+        content: { role: "model", parts },
         finishReason: mapFinishReasonToGemini(finish),
         index: 0,
       },
@@ -773,6 +1170,7 @@ export function createProxyFetchHandler(client) {
       }
 
       const system = buildSystemPrompt(messages, body)
+      const callerTools = applyOpenAIToolChoice(parseOpenAITools(body), body.tool_choice)
 
       if (body.stream) {
         const completionID = `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`
@@ -796,14 +1194,51 @@ export function createProxyFetchHandler(client) {
               })
               queue.enqueue(`data: ${chunk}\n\n`)
             },
+            callerTools,
           )
             .then((streamResult) => {
+              if (streamResult.toolCall) {
+                const toolCallChunk = JSON.stringify({
+                  id: completionID,
+                  object: "chat.completion.chunk",
+                  created: now,
+                  model: model.id,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {
+                        role: "assistant",
+                        tool_calls: [
+                          {
+                            index: 0,
+                            id: streamResult.toolCall.id,
+                            type: "function",
+                            function: {
+                              name: streamResult.toolCall.name,
+                              arguments: JSON.stringify(streamResult.toolCall.arguments ?? {}),
+                            },
+                          },
+                        ],
+                      },
+                      finish_reason: null,
+                    },
+                  ],
+                })
+                queue.enqueue(`data: ${toolCallChunk}\n\n`)
+              }
+
               const finalChunk = JSON.stringify({
                 id: completionID,
                 object: "chat.completion.chunk",
                 created: now,
                 model: model.id,
-                choices: [{ index: 0, delta: {}, finish_reason: mapFinishReason(streamResult.finish) }],
+                choices: [
+                  {
+                    index: 0,
+                    delta: {},
+                    finish_reason: streamResult.toolCall ? "tool_calls" : mapFinishReason(streamResult.finish),
+                  },
+                ],
                 usage: {
                   prompt_tokens: streamResult.tokens.input,
                   completion_tokens: streamResult.tokens.output,
@@ -836,7 +1271,7 @@ export function createProxyFetchHandler(client) {
       }
 
       try {
-        const result = await executePrompt(client, body, model, messages, system)
+        const result = await executePrompt(client, body, model, messages, system, callerTools)
         return json(createChatCompletionResponse(result, model), 200, {}, request)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -875,6 +1310,7 @@ export function createProxyFetchHandler(client) {
         max_tokens: body.max_output_tokens,
         max_completion_tokens: body.max_output_tokens,
       })
+      const callerTools = applyOpenAIToolChoice(parseOpenAITools(body), body.tool_choice)
 
       let model
       try {
@@ -955,8 +1391,76 @@ export function createProxyFetchHandler(client) {
                 }),
               )
             },
+            callerTools,
           )
             .then((streamResult) => {
+              if (streamResult.toolCall) {
+                const args = JSON.stringify(streamResult.toolCall.arguments ?? {})
+                const callItemID = `fc_${crypto.randomUUID().replace(/-/g, "")}`
+                queue.enqueue(
+                  sseEvent("response.output_item.added", {
+                    type: "response.output_item.added",
+                    output_index: 0,
+                    item: {
+                      id: callItemID,
+                      type: "function_call",
+                      status: "in_progress",
+                      call_id: streamResult.toolCall.id,
+                      name: streamResult.toolCall.name,
+                      arguments: "",
+                    },
+                  }),
+                )
+                queue.enqueue(
+                  sseEvent("response.function_call_arguments.delta", {
+                    type: "response.function_call_arguments.delta",
+                    item_id: callItemID,
+                    output_index: 0,
+                    delta: args,
+                  }),
+                )
+                queue.enqueue(
+                  sseEvent("response.function_call_arguments.done", {
+                    type: "response.function_call_arguments.done",
+                    item_id: callItemID,
+                    output_index: 0,
+                    arguments: args,
+                  }),
+                )
+                queue.enqueue(
+                  sseEvent("response.output_item.done", {
+                    type: "response.output_item.done",
+                    output_index: 0,
+                    item: {
+                      id: callItemID,
+                      type: "function_call",
+                      status: "completed",
+                      call_id: streamResult.toolCall.id,
+                      name: streamResult.toolCall.name,
+                      arguments: args,
+                    },
+                  }),
+                )
+                queue.enqueue(
+                  sseEvent("response.completed", {
+                    type: "response.completed",
+                    response: {
+                      id: responseID,
+                      object: "response",
+                      created_at: now,
+                      status: "completed",
+                      model: model.id,
+                      usage: {
+                        input_tokens: streamResult.tokens.input,
+                        output_tokens: streamResult.tokens.output,
+                        total_tokens: streamResult.tokens.input + streamResult.tokens.output,
+                      },
+                    },
+                  }),
+                )
+                return
+              }
+
               queue.enqueue(
                 sseEvent("response.output_text.done", {
                   type: "response.output_text.done",
@@ -1036,7 +1540,7 @@ export function createProxyFetchHandler(client) {
       }
 
       try {
-        const result = await executePrompt(client, body, model, messages, system)
+        const result = await executePrompt(client, body, model, messages, system, callerTools)
         return json(createResponsesApiResponse(result, model), 200, {}, request)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -1085,6 +1589,7 @@ export function createProxyFetchHandler(client) {
         temperature: body.temperature,
         max_tokens: body.max_tokens,
       })
+      const callerTools = applyAnthropicToolChoice(parseAnthropicTools(body), body.tool_choice)
 
       let model
       try {
@@ -1118,26 +1623,64 @@ export function createProxyFetchHandler(client) {
               usage: { input_tokens: 0, output_tokens: 0 },
             },
           }))
-          queue.enqueue(sseEvent("content_block_start", {
-            type: "content_block_start",
-            index: 0,
-            content_block: { type: "text", text: "" },
-          }))
 
+          let textBlockStarted = false
           const runPromise = executePromptStreaming(
             client,
             model,
             messages,
             system,
             (delta) => {
+              if (!textBlockStarted) {
+                queue.enqueue(sseEvent("content_block_start", {
+                  type: "content_block_start",
+                  index: 0,
+                  content_block: { type: "text", text: "" },
+                }))
+                textBlockStarted = true
+              }
               queue.enqueue(sseEvent("content_block_delta", {
                 type: "content_block_delta",
                 index: 0,
                 delta: { type: "text_delta", text: delta },
               }))
             },
+            callerTools,
           )
             .then((streamResult) => {
+              if (streamResult.toolCall) {
+                if (textBlockStarted) {
+                  queue.enqueue(sseEvent("content_block_stop", { type: "content_block_stop", index: 0 }))
+                }
+                const blockIndex = textBlockStarted ? 1 : 0
+                const argsJson = JSON.stringify(streamResult.toolCall.arguments ?? {})
+                queue.enqueue(sseEvent("content_block_start", {
+                  type: "content_block_start",
+                  index: blockIndex,
+                  content_block: { type: "tool_use", id: streamResult.toolCall.id, name: streamResult.toolCall.name, input: {} },
+                }))
+                queue.enqueue(sseEvent("content_block_delta", {
+                  type: "content_block_delta",
+                  index: blockIndex,
+                  delta: { type: "input_json_delta", partial_json: argsJson },
+                }))
+                queue.enqueue(sseEvent("content_block_stop", { type: "content_block_stop", index: blockIndex }))
+                queue.enqueue(sseEvent("message_delta", {
+                  type: "message_delta",
+                  delta: { stop_reason: "tool_use", stop_sequence: null },
+                  usage: { output_tokens: streamResult.tokens.output },
+                }))
+                queue.enqueue(sseEvent("message_stop", { type: "message_stop" }))
+                return
+              }
+
+              if (!textBlockStarted) {
+                queue.enqueue(sseEvent("content_block_start", {
+                  type: "content_block_start",
+                  index: 0,
+                  content_block: { type: "text", text: "" },
+                }))
+              }
               queue.enqueue(sseEvent("content_block_stop", { type: "content_block_stop", index: 0 }))
               queue.enqueue(sseEvent("message_delta", {
                 type: "message_delta",
@@ -1166,7 +1709,7 @@ export function createProxyFetchHandler(client) {
       }
 
       try {
-        const result = await executePrompt(client, body, model, messages, system)
+        const result = await executePrompt(client, body, model, messages, system, callerTools)
         return json(createAnthropicResponse(result, model), 200, {}, request)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -1211,6 +1754,7 @@ export function createProxyFetchHandler(client) {
         temperature: body.generationConfig?.temperature,
         max_tokens: body.generationConfig?.maxOutputTokens,
       })
+      const callerTools = applyGeminiToolChoice(parseGeminiTools(body), body.toolConfig)
 
       let model
       try {
@@ -1235,10 +1779,13 @@ export function createProxyFetchHandler(client) {
               const chunk = JSON.stringify(createGeminiResponse(delta, null, null))
               queue.enqueue(chunk + "\n")
             },
+            callerTools,
           )
             .then((streamResult) => {
               const finalChunk = JSON.stringify(
-                createGeminiResponse("", streamResult.finish, streamResult.tokens),
+                streamResult.toolCall
+                  ? createGeminiResponse("", streamResult.finish, streamResult.tokens, streamResult.toolCall)
+                  : createGeminiResponse("", streamResult.finish, streamResult.tokens),
               )
               queue.enqueue(finalChunk + "\n")
             })
@@ -1283,10 +1830,10 @@ export function createProxyFetchHandler(client) {
       }
 
       try {
-        const result = await executePrompt(client, body, model, messages, system)
+        const result = await executePrompt(client, body, model, messages, system, callerTools)
         const finish = result.completion.data.info?.finish
         const tokens = result.completion.data.info?.tokens
-        return json(createGeminiResponse(result.content, finish, tokens), 200, {}, request)
+        return json(createGeminiResponse(result.content, finish, tokens, result.toolCall), 200, {}, request)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(client, "error", "Gemini proxy call failed", { error: message, requestedModel: geminiModelName })

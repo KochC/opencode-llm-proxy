@@ -18,6 +18,13 @@ import {
   normalizeGeminiContents,
   extractGeminiSystemInstruction,
   mapFinishReasonToGemini,
+  sanitizeToolName,
+  parseOpenAITools,
+  applyOpenAIToolChoice,
+  parseAnthropicTools,
+  applyAnthropicToolChoice,
+  parseGeminiTools,
+  applyGeminiToolChoice,
 } from "./index.js"
 
 // ---------------------------------------------------------------------------
@@ -1871,4 +1878,440 @@ test("POST /v1beta/models/:model:streamGenerateContent returns NDJSON stream", a
   assert.ok(text.includes("candidates"))
   assert.ok(text.includes("Gem"))
   assert.ok(text.includes("ini"))
+})
+
+// ---------------------------------------------------------------------------
+// Unit: tool parsing / tool_choice helpers
+// ---------------------------------------------------------------------------
+
+test("sanitizeToolName replaces invalid characters and de-duplicates", () => {
+  assert.equal(sanitizeToolName("get_weather"), "get_weather")
+  assert.equal(sanitizeToolName("get-weather.v2"), "get_weather_v2")
+  assert.equal(sanitizeToolName("123start"), "t_123start")
+  assert.equal(sanitizeToolName(""), "tool")
+
+  const seen = new Set()
+  assert.equal(sanitizeToolName("dup", seen), "dup")
+  assert.equal(sanitizeToolName("dup", seen), "dup_2")
+  assert.equal(sanitizeToolName("dup", seen), "dup_3")
+})
+
+test("parseOpenAITools extracts function tools (Chat Completions nested shape)", () => {
+  const tools = parseOpenAITools({
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "get_weather",
+          description: "Get the weather",
+          parameters: { type: "object", properties: { city: { type: "string" } } },
+        },
+      },
+      { type: "function", function: { name: "no_params" } },
+      { type: "not_function", function: { name: "ignored" } },
+    ],
+  })
+
+  assert.equal(tools.length, 2)
+  assert.equal(tools[0].name, "get_weather")
+  assert.equal(tools[0].description, "Get the weather")
+  assert.deepEqual(tools[0].parameters, { type: "object", properties: { city: { type: "string" } } })
+  assert.equal(tools[1].name, "no_params")
+  assert.deepEqual(tools[1].parameters, { type: "object", properties: {} })
+})
+
+test("parseOpenAITools extracts function tools (Responses API flat shape)", () => {
+  const tools = parseOpenAITools({
+    tools: [
+      { type: "function", name: "get_weather", description: "Get weather", parameters: { type: "object" } },
+    ],
+  })
+
+  assert.equal(tools.length, 1)
+  assert.equal(tools[0].name, "get_weather")
+})
+
+test("parseOpenAITools supports legacy 'functions' field", () => {
+  const tools = parseOpenAITools({ functions: [{ name: "legacy_fn", description: "d" }] })
+  assert.equal(tools.length, 1)
+  assert.equal(tools[0].name, "legacy_fn")
+})
+
+test("parseOpenAITools returns empty array when no tools present", () => {
+  assert.deepEqual(parseOpenAITools({}), [])
+})
+
+test("applyOpenAIToolChoice filters to a single named function, or none, or unchanged", () => {
+  const tools = [{ name: "a", description: "", parameters: {} }, { name: "b", description: "", parameters: {} }]
+  assert.deepEqual(applyOpenAIToolChoice(tools, "none"), [])
+  assert.deepEqual(applyOpenAIToolChoice(tools, "auto"), tools)
+  assert.deepEqual(
+    applyOpenAIToolChoice(tools, { type: "function", function: { name: "b" } }).map((t) => t.name),
+    ["b"],
+  )
+  assert.deepEqual(applyOpenAIToolChoice(tools, { type: "function", name: "a" }).map((t) => t.name), ["a"])
+})
+
+test("parseAnthropicTools extracts tools with input_schema", () => {
+  const tools = parseAnthropicTools({
+    tools: [{ name: "get_weather", description: "d", input_schema: { type: "object" } }],
+  })
+  assert.equal(tools.length, 1)
+  assert.equal(tools[0].name, "get_weather")
+  assert.deepEqual(tools[0].parameters, { type: "object" })
+})
+
+test("applyAnthropicToolChoice supports none and named tool", () => {
+  const tools = [{ name: "a" }, { name: "b" }]
+  assert.deepEqual(applyAnthropicToolChoice(tools, { type: "none" }), [])
+  assert.deepEqual(applyAnthropicToolChoice(tools, { type: "tool", name: "a" }).map((t) => t.name), ["a"])
+  assert.deepEqual(applyAnthropicToolChoice(tools, { type: "auto" }), tools)
+})
+
+test("parseGeminiTools flattens functionDeclarations across tool groups", () => {
+  const tools = parseGeminiTools({
+    tools: [
+      { functionDeclarations: [{ name: "get_weather", description: "d", parameters: { type: "object" } }] },
+      { functionDeclarations: [{ name: "get_time" }] },
+    ],
+  })
+  assert.equal(tools.length, 2)
+  assert.equal(tools[0].name, "get_weather")
+  assert.equal(tools[1].name, "get_time")
+})
+
+test("applyGeminiToolChoice supports NONE mode and allowedFunctionNames", () => {
+  const tools = [{ name: "a" }, { name: "b" }]
+  assert.deepEqual(applyGeminiToolChoice(tools, { functionCallingConfig: { mode: "NONE" } }), [])
+  assert.deepEqual(
+    applyGeminiToolChoice(tools, { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["b"] } }).map(
+      (t) => t.name,
+    ),
+    ["b"],
+  )
+  assert.deepEqual(applyGeminiToolChoice(tools, undefined), tools)
+})
+
+// ---------------------------------------------------------------------------
+// Unit: tool-call round-tripping in conversation history normalizers
+// ---------------------------------------------------------------------------
+
+test("normalizeMessages renders prior OpenAI tool_calls and tool results as text", () => {
+  const messages = normalizeMessages([
+    { role: "user", content: "What's the weather in NYC?" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"NYC"}' } }],
+    },
+    { role: "tool", tool_call_id: "call_1", content: "Sunny, 72F" },
+  ])
+
+  assert.equal(messages.length, 3)
+  assert.ok(messages[1].content.includes("get_weather"))
+  assert.ok(messages[1].content.includes('{"city":"NYC"}'))
+  assert.ok(messages[2].content.includes("get_weather"))
+  assert.ok(messages[2].content.includes("Sunny, 72F"))
+})
+
+test("normalizeAnthropicMessages renders prior tool_use and tool_result blocks as text", () => {
+  const messages = normalizeAnthropicMessages([
+    { role: "user", content: "What's the weather in NYC?" },
+    {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "toolu_1", name: "get_weather", input: { city: "NYC" } }],
+    },
+    {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "Sunny, 72F" }],
+    },
+  ])
+
+  assert.equal(messages.length, 3)
+  assert.ok(messages[1].content.includes("get_weather"))
+  assert.ok(messages[1].content.includes("NYC"))
+  assert.ok(messages[2].content.includes("get_weather"))
+  assert.ok(messages[2].content.includes("Sunny, 72F"))
+})
+
+test("normalizeGeminiContents renders prior functionCall and functionResponse parts as text", () => {
+  const messages = normalizeGeminiContents([
+    { role: "user", parts: [{ text: "What's the weather in NYC?" }] },
+    { role: "model", parts: [{ functionCall: { name: "get_weather", args: { city: "NYC" } } }] },
+    { role: "user", parts: [{ functionResponse: { name: "get_weather", response: { temp: "72F" } } }] },
+  ])
+
+  assert.equal(messages.length, 3)
+  assert.ok(messages[1].content.includes("get_weather"))
+  assert.ok(messages[2].content.includes("get_weather"))
+  assert.ok(messages[2].content.includes("72F"))
+})
+
+test("normalizeResponseInput renders prior function_call and function_call_output items as text", () => {
+  const messages = normalizeResponseInput([
+    { role: "user", content: "What's the weather in NYC?" },
+    { type: "function_call", call_id: "call_1", name: "get_weather", arguments: '{"city":"NYC"}' },
+    { type: "function_call_output", call_id: "call_1", output: "Sunny, 72F" },
+  ])
+
+  assert.equal(messages.length, 3)
+  assert.ok(messages[1].content.includes("get_weather"))
+  assert.ok(messages[2].content.includes("get_weather"))
+  assert.ok(messages[2].content.includes("Sunny, 72F"))
+})
+
+// ---------------------------------------------------------------------------
+// Integration: end-to-end tool calling via the dynamic MCP bridge
+// ---------------------------------------------------------------------------
+
+function createToolCallClient({ toolName, toolArgs, callID = "call_1", finish = "tool_calls", providers } = {}) {
+  let capturedSlotName = null
+
+  return {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: {
+          providers: providers ?? [{ id: "openai", models: { "gpt-4o": { id: "gpt-4o", name: "GPT-4o" } } }],
+        },
+      }),
+    },
+    mcp: {
+      disconnect: async () => {
+        throw new Error("not connected")
+      },
+      add: async ({ body }) => {
+        capturedSlotName = body.name
+        assert.equal(body.config.type, "local")
+        assert.ok(Array.isArray(body.config.command))
+        return { data: {} }
+      },
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-tool-1" } }),
+      promptAsync: async () => {},
+      abort: async () => ({ data: true }),
+      messages: async () => ({
+        data: [
+          {
+            role: "assistant",
+            tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+            finish,
+          },
+        ],
+      }),
+    },
+    event: {
+      subscribe: async () => ({
+        stream: (async function* () {
+          yield {
+            type: "message.part.updated",
+            properties: {
+              part: {
+                sessionID: "sess-tool-1",
+                type: "tool",
+                tool: `${capturedSlotName}_${toolName}`,
+                callID,
+                state: { status: "pending", input: toolArgs },
+              },
+            },
+          }
+        })(),
+      }),
+    },
+  }
+}
+
+test("POST /v1/chat/completions returns tool_calls when the model calls a caller-supplied tool", async () => {
+  const client = createToolCallClient({ toolName: "get_weather", toolArgs: { city: "NYC" } })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "What's the weather in NYC?" }],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "get_weather",
+            description: "Get the weather",
+            parameters: { type: "object", properties: { city: { type: "string" } } },
+          },
+        },
+      ],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.choices[0].finish_reason, "tool_calls")
+  assert.equal(body.choices[0].message.content, null)
+  assert.equal(body.choices[0].message.tool_calls[0].function.name, "get_weather")
+  assert.deepEqual(JSON.parse(body.choices[0].message.tool_calls[0].function.arguments), { city: "NYC" })
+  assert.equal(body.choices[0].message.tool_calls[0].id, "call_1")
+})
+
+test("POST /v1/chat/completions stream: true emits tool_calls delta and finish_reason", async () => {
+  const client = createToolCallClient({ toolName: "get_weather", toolArgs: { city: "NYC" } })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "What's the weather in NYC?" }],
+      tools: [{ type: "function", function: { name: "get_weather" } }],
+    }),
+  })
+
+  const response = await handler(request)
+  const text = await response.text()
+
+  assert.ok(text.includes('"tool_calls"'))
+  assert.ok(text.includes("get_weather"))
+  assert.ok(text.includes('"finish_reason":"tool_calls"'))
+})
+
+test("POST /v1/messages returns tool_use content block when the model calls a tool", async () => {
+  const client = createToolCallClient({ toolName: "get_weather", toolArgs: { city: "NYC" }, callID: "toolu_1" })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "What's the weather in NYC?" }],
+      tools: [{ name: "get_weather", description: "Get weather", input_schema: { type: "object" } }],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.stop_reason, "tool_use")
+  assert.equal(body.content[0].type, "tool_use")
+  assert.equal(body.content[0].name, "get_weather")
+  assert.equal(body.content[0].id, "toolu_1")
+  assert.deepEqual(body.content[0].input, { city: "NYC" })
+})
+
+test("POST /v1/messages stream: true emits a tool_use content block", async () => {
+  const client = createToolCallClient({ toolName: "get_weather", toolArgs: { city: "NYC" }, callID: "toolu_1" })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "What's the weather in NYC?" }],
+      tools: [{ name: "get_weather" }],
+    }),
+  })
+
+  const response = await handler(request)
+  const text = await response.text()
+
+  assert.ok(text.includes("tool_use"))
+  assert.ok(text.includes("get_weather"))
+  assert.ok(text.includes('"stop_reason":"tool_use"'))
+})
+
+test("POST /v1beta/models/:model:generateContent returns a functionCall part", async () => {
+  const client = createToolCallClient({
+    toolName: "get_weather",
+    toolArgs: { city: "NYC" },
+    providers: [{ id: "google", models: { "gemini-2.0-flash": { id: "gemini-2.0-flash" } } }],
+  })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1beta/models/gemini-2.0-flash:generateContent", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: "What's the weather in NYC?" }] }],
+      tools: [{ functionDeclarations: [{ name: "get_weather", description: "Get weather" }] }],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.ok(body.candidates[0].content.parts[0].functionCall)
+  assert.equal(body.candidates[0].content.parts[0].functionCall.name, "get_weather")
+  assert.deepEqual(body.candidates[0].content.parts[0].functionCall.args, { city: "NYC" })
+})
+
+test("POST /v1/responses returns a function_call output item", async () => {
+  const client = createToolCallClient({ toolName: "get_weather", toolArgs: { city: "NYC" } })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      input: "What's the weather in NYC?",
+      tools: [{ type: "function", name: "get_weather", description: "Get weather" }],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.output[0].type, "function_call")
+  assert.equal(body.output[0].name, "get_weather")
+  assert.deepEqual(JSON.parse(body.output[0].arguments), { city: "NYC" })
+  assert.equal(body.output_text, "")
+})
+
+test("POST /v1/responses stream: true emits function_call SSE events", async () => {
+  const client = createToolCallClient({ toolName: "get_weather", toolArgs: { city: "NYC" } })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      input: "What's the weather in NYC?",
+      tools: [{ type: "function", name: "get_weather" }],
+    }),
+  })
+
+  const response = await handler(request)
+  const text = await response.text()
+
+  assert.ok(text.includes("response.function_call_arguments.done"))
+  assert.ok(text.includes("get_weather"))
+  assert.ok(text.includes('"type":"function_call"'))
+})
+
+test("tool_choice: none disables tool calling even when tools are supplied", async () => {
+  const events = [{ type: "session.idle", properties: { sessionID: "sess-123" } }]
+  const client = createStreamingClient(events)
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ type: "function", function: { name: "get_weather" } }],
+      tool_choice: "none",
+    }),
+  })
+
+  const response = await handler(request)
+  assert.equal(response.status, 200)
+  // No mcp/tool bridge client methods were exercised because callerTools resolved to [].
+  assert.equal(client.mcp, undefined)
 })
