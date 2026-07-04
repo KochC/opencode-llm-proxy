@@ -120,6 +120,7 @@ curl -o .opencode/plugins/llm-proxy.js \
 | `OPENCODE_LLM_PROXY_PORT` | `4010` | TCP port. |
 | `OPENCODE_LLM_PROXY_TOKEN` | _(unset)_ | Bearer token required on every request. Unset = no auth. |
 | `OPENCODE_LLM_PROXY_CORS_ORIGIN` | `*` | `Access-Control-Allow-Origin` value for browser clients. |
+| `OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE` | `8` | Max concurrent in-flight requests using [tool calling](#tool-calling). |
 
 ```bash
 OPENCODE_LLM_PROXY_HOST=0.0.0.0 \
@@ -310,18 +311,18 @@ x-opencode-provider: anthropic
 Returns all models from all configured providers in OpenAI list format.
 
 ### POST /v1/chat/completions
-OpenAI Chat Completions. Required fields: `model`, `messages`. Optional: `stream`, `temperature`, `max_tokens`.
+OpenAI Chat Completions. Required fields: `model`, `messages`. Optional: `stream`, `temperature`, `max_tokens`, `tools`, `tool_choice`.
 
 ### POST /v1/responses
-OpenAI Responses API. Required fields: `model`, `input`. Optional: `instructions`, `stream`, `max_output_tokens`.
+OpenAI Responses API. Required fields: `model`, `input`. Optional: `instructions`, `stream`, `max_output_tokens`, `tools`, `tool_choice`.
 
 ### POST /v1/messages
-Anthropic Messages API. Required fields: `model`, `messages`. Optional: `system` (string or array of `{type: "text", text: string}` content blocks), `max_tokens`, `stream`.
+Anthropic Messages API. Required fields: `model`, `messages`. Optional: `system` (string or array of `{type: "text", text: string}` content blocks), `max_tokens`, `stream`, `tools`, `tool_choice`.
 
 Errors are returned in Anthropic format: `{ "type": "error", "error": { "type": "...", "message": "..." } }`.
 
 ### POST /v1beta/models/:model:generateContent
-Google Gemini non-streaming. Model name in URL path. Required field: `contents`. Optional: `systemInstruction`, `generationConfig`.
+Google Gemini non-streaming. Model name in URL path. Required field: `contents`. Optional: `systemInstruction`, `generationConfig`, `tools`, `toolConfig`.
 
 ### POST /v1beta/models/:model:streamGenerateContent
 Same as above, returns newline-delimited JSON stream.
@@ -342,12 +343,32 @@ Streaming uses OpenCode's `client.event.subscribe()` SSE stream. Text deltas are
 
 ---
 
+## Tool calling
+
+The proxy supports OpenAI-style function tools (`tools` on `/v1/chat/completions` and `/v1/responses`), Anthropic tools (`tools` on `/v1/messages`), and Gemini function declarations (`tools` on `:generateContent`/`:streamGenerateContent`).
+
+OpenCode's own agent loop always executes tools itself, server-side, so there's no native concept of a "client-executed" tool call to hand off to. To bridge that gap, when a request includes `tools`:
+
+1. The proxy dynamically registers a small local [MCP](https://opencode.ai/docs/mcp-servers/) server whose tool list is exactly your declared tool schemas (see `mcp-tool-bridge.js`).
+2. Only those tools are enabled for that one prompt call — every built-in OpenCode tool stays disabled, same as always.
+3. As soon as the model proposes calling one of your tools, the proxy immediately aborts the OpenCode session (before the bridge's no-op handler is ever consulted) and translates the captured call name + arguments into your API's tool-call shape — `tool_calls` (OpenAI), `tool_use` (Anthropic), or a `functionCall` part (Gemini) — instead of a text answer.
+4. Send the tool's result back on your next request (`role: "tool"` / `tool_result` / `functionResponse`, per your API's convention) alongside the full conversation history, same as any other multi-turn request — the proxy is stateless between calls either way.
+
+Notes and current limitations:
+
+- One tool call per turn — parallel/multiple simultaneous tool calls aren't supported.
+- `tool_choice: "none"` (OpenAI/Gemini `mode: "NONE"`/Anthropic `type: "none"`) disables tool calling for that request; forcing a specific named tool is supported.
+- Bridge servers are reused from a small fixed-size pool (`px_tools_0`, `px_tools_1`, ...) rather than registered fresh per request, since OpenCode's server API has no endpoint to deregister an MCP server once added. Configure the pool size with `OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE` (default `8`) if you expect more than 8 concurrent in-flight tool-calling requests.
+- The bridge process is spawned with `node`, so `node` must be on `PATH` wherever OpenCode is running.
+
+---
+
 ## Limitations
 
 - Text only — image, audio, and file inputs are ignored
-- No tool/function calling — all OpenCode tools are disabled for proxy sessions
 - No cross-request session state — send full conversation history on every request
 - Temperature and max tokens are advisory (passed as system prompt hints)
+- Tool calling supports one call per turn — see [Tool calling](#tool-calling) above
 
 ---
 
