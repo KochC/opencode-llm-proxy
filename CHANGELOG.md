@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.7.1](https://github.com/KochC/opencode-llm-proxy/compare/v1.7.0...v1.7.1) (2026-07-05)
+
+
+### Bug Fixes
+
+* address Copilot review follow-ups from [#56](https://github.com/KochC/opencode-llm-proxy/issues/56); docs: add n8n integration guide ([55a38e0](https://github.com/KochC/opencode-llm-proxy/commit/55a38e0489fa468c021533c454df907b18f74d4a))
+* address Copilot review follow-ups from [#56](https://github.com/KochC/opencode-llm-proxy/issues/56); docs: add n8n integration guide ([3f1bec4](https://github.com/KochC/opencode-llm-proxy/commit/3f1bec4b0a30bfb60d2f0a37e23d088d3163cb66))
+* disable stale bridge tool IDs from other pool slots ([ca3e552](https://github.com/KochC/opencode-llm-proxy/commit/ca3e552aa1b64def62ccd0c84cd31a61a8f3a3f9))
+* disable stale bridge tool IDs from other pool slots ([a5ba31c](https://github.com/KochC/opencode-llm-proxy/commit/a5ba31cb3a796e80a98bee963c23afcf1b21e214))
+* disable stale bridge tool IDs from other pool slots (closes [#55](https://github.com/KochC/opencode-llm-proxy/issues/55)) ([5d419cd](https://github.com/KochC/opencode-llm-proxy/commit/5d419cdd552f62cf5f1d2151f0719dc5643408a5))
+* message.part.delta streaming, .info shape for tokens/finish, parts fallback for empty content ([1ce569b](https://github.com/KochC/opencode-llm-proxy/commit/1ce569bc738ca2699fe7829bb767746d179e1e75))
+* read message.part.delta for streaming, .info shape for tokens/finish, parts fallback for content ([522663c](https://github.com/KochC/opencode-llm-proxy/commit/522663cebc1b0f6e36885511ee0bea1656bff667))
+
 ## [1.7.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.6.1...v1.7.0) (2026-07-04)
 
 
