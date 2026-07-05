@@ -144,6 +144,7 @@ curl -o .opencode/plugins/llm-proxy.js \
 | `OPENCODE_LLM_PROXY_TOKEN` | _(unset)_ | Bearer token required on every request. Unset = no auth. |
 | `OPENCODE_LLM_PROXY_CORS_ORIGIN` | `*` | `Access-Control-Allow-Origin` value for browser clients. |
 | `OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE` | `8` | Max concurrent in-flight requests using [tool calling](#tool-calling). |
+| `OPENCODE_LLM_PROXY_IDLE_TIMEOUT` | `255` | Bun.serve idle timeout in seconds. Bun's default (10s) is too short for most LLM completions and will truncate slower responses mid-stream; 255 is Bun's maximum for this option. |
 
 ```bash
 OPENCODE_LLM_PROXY_HOST=0.0.0.0 \
