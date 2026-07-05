@@ -511,6 +511,13 @@ function getToolBridgeState() {
     state.toolBridge = {
       freeSlots: Array.from({ length: poolSize }, (_, i) => `px_tools_${i}`),
       waiters: [],
+      // Every bridge tool ID ever registered across the pool's lifetime, from any
+      // slot. Needed because OpenCode has no endpoint to deregister an MCP server,
+      // so a slot reused for a later request stays connected under its old tool
+      // schema until it's next reused - see buildToolsMap() below for why this
+      // must be tracked and explicitly disabled per-turn, not just left out of the
+      // map.
+      knownToolIDs: new Set(),
     }
   }
   return state.toolBridge
@@ -652,7 +659,7 @@ export function applyGeminiToolChoice(tools, toolConfig) {
   return tools
 }
 
-async function registerToolBridge(client, tools) {
+export async function registerToolBridge(client, tools) {
   const slotName = await acquireBridgeSlot()
   const seen = new Set()
   const nameMap = new Map() // full bridge tool ID ("<slot>_<sanitized>") -> original caller-facing name
@@ -684,11 +691,35 @@ async function registerToolBridge(client, tools) {
   })
 
   const toolIDs = bridgeTools.map((tool) => `${slotName}_${tool.name}`)
+  const bridgeState = getToolBridgeState()
+  for (const id of toolIDs) bridgeState.knownToolIDs.add(id)
   return { slotName, toolIDs, nameMap }
 }
 
 function releaseToolBridge(bridge) {
   if (bridge) releaseBridgeSlot(bridge.slotName)
+}
+
+// Builds the per-turn `tools` map sent to OpenCode: the caller's bridge tools enabled,
+// every OpenCode built-in disabled (as before), and - critically - every bridge tool ID
+// ever registered by *any* pool slot explicitly disabled too, then re-enabling only this
+// turn's own IDs.
+//
+// Why this is necessary: OpenCode's server API has no endpoint to deregister an MCP
+// server, so a bridge slot reused for a later request/turn stays connected under its
+// previous tool schema until it's next reused. getDisabledTools() also only snapshots
+// OpenCode's built-in tool IDs once, before any bridge tools exist, so it can never know
+// to disable them either. Without this explicit disable step, a stale, still-connected
+// tool from a previously-used slot remains implicitly enabled and can get called by the
+// model instead of (or alongside) this turn's own tool - the model has no way to tell
+// them apart since both are live MCP tools as far as OpenCode is concerned.
+export function buildToolsMap(baseTools, bridge) {
+  const toolsMap = { ...baseTools }
+  if (!bridge) return toolsMap
+  const bridgeState = getToolBridgeState()
+  for (const id of bridgeState.knownToolIDs) toolsMap[id] = false
+  for (const id of bridge.toolIDs) toolsMap[id] = true
+  return toolsMap
 }
 
 async function runAgentTurn(client, model, messages, system, callerTools, onChunk) {
@@ -698,8 +729,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
 
   if (Array.isArray(callerTools) && callerTools.length > 0) {
     bridge = await registerToolBridge(client, callerTools)
-    toolsMap = { ...baseTools }
-    for (const id of bridge.toolIDs) toolsMap[id] = true
+    toolsMap = buildToolsMap(baseTools, bridge)
   }
 
   const session = await client.session.create({ body: { title: `Proxy: ${model.id}` } })

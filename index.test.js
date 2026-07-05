@@ -25,6 +25,8 @@ import {
   applyAnthropicToolChoice,
   parseGeminiTools,
   applyGeminiToolChoice,
+  registerToolBridge,
+  buildToolsMap,
 } from "./index.js"
 
 // ---------------------------------------------------------------------------
@@ -2222,6 +2224,76 @@ test("POST /v1/messages stream: true emits a tool_use content block", async () =
   assert.ok(text.includes("tool_use"))
   assert.ok(text.includes("get_weather"))
   assert.ok(text.includes('"stop_reason":"tool_use"'))
+})
+
+// Regression test for: a bridge slot reused by an earlier turn stays connected under its
+// old tool schema (OpenCode has no MCP deregistration endpoint), and getDisabledTools()
+// only snapshots OpenCode's built-in tool IDs once, before any bridge tools ever exist -
+// so neither mechanism disables a stale, previously-registered bridge tool ID on its own.
+// Without explicitly disabling every previously-seen bridge tool ID per turn, a stale tool
+// from an earlier turn's slot remains implicitly enabled and can be called by the model
+// instead of (or alongside) the current turn's own tool.
+describe("buildToolsMap / registerToolBridge slot isolation", () => {
+  function createMcpMockClient() {
+    const addCalls = []
+    return {
+      client: {
+        mcp: {
+          disconnect: async () => {
+            throw new Error("not connected")
+          },
+          add: async ({ body }) => {
+            addCalls.push(body)
+            return { data: {} }
+          },
+        },
+      },
+      addCalls,
+    }
+  }
+
+  it("disables a previously-registered bridge tool ID from a different pool slot", async () => {
+    const { client } = createMcpMockClient()
+
+    const firstTurnTools = [{ name: "weather_a", description: "", parameters: { type: "object", properties: {} } }]
+    const secondTurnTools = [{ name: "weather_b", description: "", parameters: { type: "object", properties: {} } }]
+
+    // Simulate turn 1: registers a bridge slot and (per the real bug) never gets
+    // explicitly disabled afterwards, since OpenCode can't deregister an MCP server.
+    const bridge1 = await registerToolBridge(client, firstTurnTools)
+    assert.equal(bridge1.toolIDs.length, 1)
+
+    // Simulate turn 2 reusing a *different* slot (mirrors the pool cycling to the next
+    // free slot for a new in-flight request) with its own, different tool.
+    const bridge2 = await registerToolBridge(client, secondTurnTools)
+    assert.equal(bridge2.toolIDs.length, 1)
+    assert.notEqual(
+      bridge1.toolIDs[0],
+      bridge2.toolIDs[0],
+      "test setup assumption: the two turns must land on different bridge tool IDs",
+    )
+
+    const baseTools = { bash: false, read: false, edit: false }
+    const toolsMap = buildToolsMap(baseTools, bridge2)
+
+    // Turn 2's own tool must be enabled.
+    assert.equal(toolsMap[bridge2.toolIDs[0]], true)
+    // Turn 1's stale, still-connected tool must be *explicitly* disabled - not merely
+    // absent from the map, since an absent key left a live MCP tool implicitly enabled
+    // (the actual bug: the model could call it instead of turn 2's own tool).
+    assert.equal(toolsMap[bridge1.toolIDs[0]], false)
+    // OpenCode's built-ins must be untouched.
+    assert.equal(toolsMap.bash, false)
+    assert.equal(toolsMap.read, false)
+    assert.equal(toolsMap.edit, false)
+  })
+
+  it("returns a plain copy of baseTools when there is no bridge for this turn", () => {
+    const baseTools = { bash: false, read: false }
+    const toolsMap = buildToolsMap(baseTools, null)
+    assert.deepEqual(toolsMap, baseTools)
+    assert.notEqual(toolsMap, baseTools, "must be a copy, not the same object")
+  })
 })
 
 test("POST /v1beta/models/:model:generateContent returns a functionCall part", async () => {
