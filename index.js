@@ -776,19 +776,26 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
 
   try {
     for await (const event of stream) {
-      if (event.type === "message.part.updated") {
+      if (event.type === "message.part.delta") {
+        // Real incremental token deltas arrive here, as flat properties (sessionID,
+        // partID, field, delta) - NOT nested under event.properties.part like
+        // message.part.updated below. This is the actual live-streaming source; the
+        // fallback via session.messages() after the loop covers turns where OpenCode
+        // doesn't emit these (see below).
+        const props = event.properties
+        if (
+          props?.sessionID === sessionID &&
+          props?.field === "text" &&
+          typeof props.delta === "string" &&
+          props.delta.length > 0
+        ) {
+          content += props.delta
+          onChunk?.(props.delta)
+        }
+      } else if (event.type === "message.part.updated") {
         const part = event.properties?.part
-        const delta = event.properties?.delta
 
         if (
-          part?.sessionID === sessionID &&
-          part?.type === "text" &&
-          typeof delta === "string" &&
-          delta.length > 0
-        ) {
-          content += delta
-          onChunk?.(delta)
-        } else if (
           toolIDSet &&
           part?.sessionID === sessionID &&
           part?.type === "tool" &&
@@ -826,15 +833,26 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     throw new Error(errorMessage)
   }
 
+  // Each list item is { info: Message, parts: Part[] } - matching the shape
+  // client.session.prompt() (the non-tool-calling path) already returns directly.
   const messagesResult = await client.session.messages({ path: { id: sessionID } })
-  const assistantMsg = (messagesResult.data ?? []).filter((m) => m.role === "assistant").at(-1)
+  const assistantEntry = (messagesResult.data ?? []).filter((m) => m.info?.role === "assistant").at(-1)
+  const assistantInfo = assistantEntry?.info
+
+  // Fallback for turns where message.part.delta never fired (observed for some
+  // multi-step turns, e.g. continuing a conversation with prior tool calls/results in
+  // history): use the authoritative final text from the fetched message's parts
+  // instead of leaving content empty.
+  if (!content && !toolCall) {
+    content = extractAssistantText(assistantEntry?.parts ?? [])
+  }
 
   return {
     sessionID,
     content,
     toolCall,
-    tokens: assistantMsg?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    finish: toolCall ? "tool_calls" : assistantMsg?.finish,
+    tokens: assistantInfo?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    finish: toolCall ? "tool_calls" : assistantInfo?.finish,
   }
 }
 

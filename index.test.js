@@ -78,9 +78,12 @@ function createStreamingClient(chunks) {
       messages: async () => ({
         data: [
           {
-            role: "assistant",
-            tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
-            finish: "end_turn",
+            info: {
+              role: "assistant",
+              tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+              finish: "end_turn",
+            },
+            parts: [],
           },
         ],
       }),
@@ -337,16 +340,18 @@ test("missing messages field returns 400", async () => {
 test("stream: true returns SSE response", async () => {
   const events = [
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: "Hello",
       },
     },
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: " world",
       },
     },
@@ -1094,16 +1099,18 @@ test("POST /v1/responses instructions field is incorporated", async () => {
 test("POST /v1/responses stream: true returns SSE lifecycle events", async () => {
   const events = [
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: "The answer",
       },
     },
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: " is 42.",
       },
     },
@@ -1137,16 +1144,18 @@ test("POST /v1/responses stream: true returns SSE lifecycle events", async () =>
 test("POST /v1/responses stream: true emits content_part.done with accumulated text per OpenAI spec", async () => {
   const events = [
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: "The answer",
       },
     },
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: " is 42.",
       },
     },
@@ -1635,16 +1644,18 @@ test("POST /v1/messages malformed JSON returns 400", async () => {
 test("POST /v1/messages stream: true returns Anthropic SSE events", async () => {
   const events = [
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: "Hello",
       },
     },
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: " world",
       },
     },
@@ -1832,16 +1843,18 @@ test("POST /v1beta/models/:model:generateContent malformed JSON returns 400", as
 test("POST /v1beta/models/:model:streamGenerateContent returns NDJSON stream", async () => {
   const events = [
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: "Gem",
       },
     },
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: "ini",
       },
     },
@@ -2099,9 +2112,12 @@ function createToolCallClient({ toolName, toolArgs, callID = "call_1", finish = 
       messages: async () => ({
         data: [
           {
-            role: "assistant",
-            tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
-            finish,
+            info: {
+              role: "assistant",
+              tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+              finish,
+            },
+            parts: [],
           },
         ],
       }),
@@ -2226,6 +2242,126 @@ test("POST /v1/messages stream: true emits a tool_use content block", async () =
   assert.ok(text.includes("tool_use"))
   assert.ok(text.includes("get_weather"))
   assert.ok(text.includes('"stop_reason":"tool_use"'))
+})
+
+// Regression test for: OpenCode delivers real incremental streaming text via
+// message.part.delta events (flat properties: sessionID, partID, field, delta) - a
+// completely separate event type from message.part.updated, which only carries status/
+// snapshot updates (used here for tool-call detection). For some turns (observed with a
+// multi-message conversation history, e.g. continuing after a prior tool call/result),
+// OpenCode never emits message.part.delta at all for the final reply - only
+// message.part.updated snapshots - so relying on message.part.delta alone would silently
+// produce empty content. The fallback: after the loop, fetch the session's messages
+// (client.session.messages()) and extract the final text from the assistant message's
+// parts array directly, exactly as the non-tool-calling path already does via
+// extractAssistantText().
+//
+// Each list item from client.session.messages() is `{ info: Message, parts: Part[] }` -
+// info.role/info.tokens/info.finish, NOT flat role/tokens/finish directly on the item.
+function createToolAwareTextClient({ events, assistantParts, tokens, finish }) {
+  return {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: { providers: [{ id: "openai", models: { "gpt-4o": { id: "gpt-4o", name: "GPT-4o" } } }] },
+      }),
+    },
+    mcp: {
+      disconnect: async () => {
+        throw new Error("not connected")
+      },
+      add: async () => ({ data: {} }),
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-text-1" } }),
+      promptAsync: async () => {},
+      abort: async () => ({ data: true }),
+      messages: async () => ({
+        data: [
+          {
+            info: { role: "assistant", tokens, finish },
+            parts: assistantParts,
+          },
+        ],
+      }),
+    },
+    event: {
+      subscribe: async () => ({
+        stream: (async function* () {
+          for (const event of events) yield event
+        })(),
+      }),
+    },
+  }
+}
+
+test("POST /v1/chat/completions falls back to the final message's parts when message.part.delta never fires", async () => {
+  const client = createToolAwareTextClient({
+    events: [{ type: "session.idle", properties: { sessionID: "sess-text-1" } }],
+    assistantParts: [{ type: "step-start" }, { type: "text", text: "Agentic AI startups raise record funding" }],
+    tokens: { input: 42, output: 7, reasoning: 0, cache: { read: 0, write: 0 } },
+    finish: "stop",
+  })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      messages: [
+        { role: "user", content: "Search the web then summarize." },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "call_1", type: "function", function: { name: "search", arguments: "{}" } }],
+        },
+        { role: "tool", tool_call_id: "call_1", content: "some search result" },
+      ],
+      tools: [{ type: "function", function: { name: "search" } }],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.choices[0].message.content, "Agentic AI startups raise record funding")
+  assert.equal(body.choices[0].finish_reason, "stop")
+  // Also locks in the .info.tokens fix - these were always read as undefined (silently
+  // falling back to all-zero usage) before, since the flat .tokens field this code used
+  // to read doesn't exist on the real API's { info, parts } shape.
+  assert.equal(body.usage.prompt_tokens, 42)
+  assert.equal(body.usage.completion_tokens, 7)
+})
+
+test("POST /v1/chat/completions accumulates content from message.part.delta events", async () => {
+  const client = createToolAwareTextClient({
+    events: [
+      { type: "message.part.delta", properties: { sessionID: "sess-text-1", field: "text", delta: "Hello" } },
+      { type: "message.part.delta", properties: { sessionID: "sess-text-1", field: "text", delta: " world" } },
+      { type: "session.idle", properties: { sessionID: "sess-text-1" } },
+    ],
+    assistantParts: [{ type: "text", text: "Hello world" }],
+    tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+    finish: "stop",
+  })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Say hello world." }],
+      tools: [{ type: "function", function: { name: "search" } }],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.choices[0].message.content, "Hello world")
 })
 
 // Regression test for: a bridge slot reused by an earlier turn stays connected under its
