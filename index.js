@@ -1518,6 +1518,21 @@ export function createProxyFetchHandler(client) {
                       created_at: now,
                       status: "completed",
                       model: model.id,
+                      // The OpenAI Responses API always includes the final `output` array on
+                      // response.completed (mirroring the one sent empty on response.created).
+                      // Clients (e.g. langchainjs-openai) read `response.output` here to build
+                      // the final aggregated message/tool-call - omitting it causes them to
+                      // crash doing `response.output.map(...)` on undefined.
+                      output: [
+                        {
+                          id: callItemID,
+                          type: "function_call",
+                          status: "completed",
+                          call_id: streamResult.toolCall.id,
+                          name: streamResult.toolCall.name,
+                          arguments: args,
+                        },
+                      ],
                       usage: {
                         input_tokens: streamResult.tokens.input,
                         output_tokens: streamResult.tokens.output,
@@ -1555,7 +1570,13 @@ export function createProxyFetchHandler(client) {
                 sseEvent("response.output_item.done", {
                   type: "response.output_item.done",
                   output_index: 0,
-                  item: { id: itemID, type: "message", status: "completed", role: "assistant" },
+                  item: {
+                    id: itemID,
+                    type: "message",
+                    status: "completed",
+                    role: "assistant",
+                    content: [{ type: "output_text", text: accumulatedText, annotations: [] }],
+                  },
                 }),
               )
               queue.enqueue(
@@ -1567,6 +1588,16 @@ export function createProxyFetchHandler(client) {
                     created_at: now,
                     status: "completed",
                     model: model.id,
+                    // See the tool-call branch above for why `output` must be present here.
+                    output: [
+                      {
+                        id: itemID,
+                        type: "message",
+                        status: "completed",
+                        role: "assistant",
+                        content: [{ type: "output_text", text: accumulatedText, annotations: [] }],
+                      },
+                    ],
                     usage: {
                       input_tokens: streamResult.tokens.input,
                       output_tokens: streamResult.tokens.output,
@@ -1923,12 +1954,24 @@ export const OpenAIProxyPlugin = async ({ client }) => {
 
   const hostname = process.env.OPENCODE_LLM_PROXY_HOST ?? "127.0.0.1"
   const port = Number.parseInt(process.env.OPENCODE_LLM_PROXY_PORT ?? "4010", 10)
+  // Bun's default idleTimeout is 10s, which is far too short for LLM completions -
+  // even simple ones routinely take longer, and long or tool-calling turns can take
+  // well over a minute. Without raising this, Bun aborts the in-flight request mid-
+  // stream ("[Bun.serve]: request timed out after 10 seconds"), silently truncating
+  // the SSE response before response.completed / [DONE] is ever sent. Callers can
+  // still override it (e.g. to something shorter) via OPENCODE_LLM_PROXY_IDLE_TIMEOUT.
+  // 255 is Bun's current maximum for this option (it's stored as a uint8 internally).
+  const idleTimeout = Math.min(
+    255,
+    Math.max(10, Number.parseInt(process.env.OPENCODE_LLM_PROXY_IDLE_TIMEOUT ?? "255", 10) || 255),
+  )
 
   let server
   try {
     server = Bun.serve({
       hostname,
       port,
+      idleTimeout,
       fetch: createProxyFetchHandler(client),
     })
   } catch (error) {
@@ -1946,6 +1989,7 @@ export const OpenAIProxyPlugin = async ({ client }) => {
   await safeLog(client, "info", "OpenAI proxy server started", {
     hostname,
     port,
+    idleTimeout,
     protected: Boolean(process.env.OPENCODE_LLM_PROXY_TOKEN),
   })
 

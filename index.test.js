@@ -1,4 +1,4 @@
-import test, { describe, it, after } from "node:test"
+import test, { describe, it, after, afterEach } from "node:test"
 import assert from "node:assert/strict"
 import { setTimeout as delay } from "node:timers/promises"
 
@@ -29,6 +29,7 @@ import {
   registerToolBridge,
   releaseToolBridge,
   buildToolsMap,
+  OpenAIProxyPlugin,
 } from "./index.js"
 
 // ---------------------------------------------------------------------------
@@ -1203,6 +1204,57 @@ test("POST /v1/responses stream: true emits content_part.done with accumulated t
     idxOutputItemDone > idxContentPartDone,
     "output_item.done must follow content_part.done",
   )
+})
+
+test("POST /v1/responses stream: true includes response.output on response.completed (text turn)", async () => {
+  // Regression test: response.completed previously omitted `output` entirely (only
+  // response.created carried an empty `output: []`). Client SDKs that read
+  // `response.output` to build the final message (e.g. langchainjs-openai) crash
+  // doing `response.output.map(...)` on undefined when that field is missing.
+  const events = [
+    {
+      type: "message.part.delta",
+      properties: { sessionID: "sess-123", field: "text", delta: "The answer" },
+    },
+    {
+      type: "message.part.delta",
+      properties: { sessionID: "sess-123", field: "text", delta: " is 42." },
+    },
+    { type: "session.idle", properties: { sessionID: "sess-123" } },
+  ]
+
+  const handler = createProxyFetchHandler(createStreamingClient(events))
+  const request = new Request("http://127.0.0.1:4010/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      input: "What is 6 times 7?",
+    }),
+  })
+
+  const response = await handler(request)
+  const parsed = parseSseStream(await response.text())
+
+  const completed = parsed.find((e) => e.event === "response.completed")
+  assert.ok(completed, "response.completed event must be present")
+  assert.ok(Array.isArray(completed.data.response.output), "response.output must be an array")
+  assert.equal(completed.data.response.output.length, 1)
+
+  const [outputItem] = completed.data.response.output
+  assert.equal(outputItem.type, "message")
+  assert.equal(outputItem.status, "completed")
+  assert.equal(outputItem.role, "assistant")
+  assert.ok(Array.isArray(outputItem.content), "output item content must be an array")
+  assert.equal(outputItem.content[0].type, "output_text")
+  assert.equal(outputItem.content[0].text, "The answer is 42.")
+
+  // response.output_item.done should also carry the final content, not just a bare item.
+  const outputItemDone = parsed.find((e) => e.event === "response.output_item.done")
+  assert.ok(outputItemDone, "response.output_item.done event must be present")
+  assert.ok(Array.isArray(outputItemDone.data.item.content))
+  assert.equal(outputItemDone.data.item.content[0].text, "The answer is 42.")
 })
 
 test("POST /v1/responses stream: true with session.error emits response.failed", async () => {
@@ -2564,6 +2616,37 @@ test("POST /v1/responses stream: true emits function_call SSE events", async () 
   assert.ok(text.includes('"type":"function_call"'))
 })
 
+test("POST /v1/responses stream: true includes response.output on response.completed (tool call turn)", async () => {
+  // Regression test: same gap as the text-turn case above, but for the tool-calling
+  // branch of the /v1/responses streaming handler.
+  const client = createToolCallClient({ toolName: "get_weather", toolArgs: { city: "NYC" } })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      input: "What's the weather in NYC?",
+      tools: [{ type: "function", name: "get_weather" }],
+    }),
+  })
+
+  const response = await handler(request)
+  const parsed = parseSseStream(await response.text())
+
+  const completed = parsed.find((e) => e.event === "response.completed")
+  assert.ok(completed, "response.completed event must be present")
+  assert.ok(Array.isArray(completed.data.response.output), "response.output must be an array")
+  assert.equal(completed.data.response.output.length, 1)
+
+  const [outputItem] = completed.data.response.output
+  assert.equal(outputItem.type, "function_call")
+  assert.equal(outputItem.status, "completed")
+  assert.equal(outputItem.name, "get_weather")
+  assert.deepEqual(JSON.parse(outputItem.arguments), { city: "NYC" })
+})
+
 test("tool_choice: none disables tool calling even when tools are supplied", async () => {
   const events = [{ type: "session.idle", properties: { sessionID: "sess-123" } }]
   const client = createStreamingClient(events)
@@ -2584,4 +2667,81 @@ test("tool_choice: none disables tool calling even when tools are supplied", asy
   assert.equal(response.status, 200)
   // No mcp/tool bridge client methods were exercised because callerTools resolved to [].
   assert.equal(client.mcp, undefined)
+})
+
+// ---------------------------------------------------------------------------
+// OpenAIProxyPlugin: Bun.serve idleTimeout
+// ---------------------------------------------------------------------------
+//
+// Bun's default idleTimeout is 10s, which is too short for many LLM completions -
+// Bun previously aborted the in-flight request mid-stream ("[Bun.serve]: request
+// timed out after 10 seconds"), truncating the SSE response before it ever reached
+// response.completed / [DONE]. These tests stub Bun.serve to assert the plugin
+// always raises it well above that default.
+
+describe("OpenAIProxyPlugin idleTimeout", () => {
+  const originalBun = globalThis.Bun
+
+  function stubBunServe() {
+    let capturedOptions
+    globalThis.Bun = {
+      serve: (options) => {
+        capturedOptions = options
+        return { stop: () => {} }
+      },
+    }
+    return () => capturedOptions
+  }
+
+  function resetPluginState() {
+    // OpenAIProxyPlugin no-ops after its first successful call in a process
+    // (see getState().started in index.js) - reset that between tests so each
+    // one actually exercises Bun.serve again.
+    delete globalThis.__opencodeOpenAIProxyState
+  }
+
+  afterEach(() => {
+    globalThis.Bun = originalBun
+    delete process.env.OPENCODE_LLM_PROXY_IDLE_TIMEOUT
+    resetPluginState()
+  })
+
+  it("defaults to 255 seconds (Bun's max) when unset", async () => {
+    const getCaptured = stubBunServe()
+    resetPluginState()
+
+    await OpenAIProxyPlugin({ client: createClient() })
+
+    assert.equal(getCaptured().idleTimeout, 255)
+  })
+
+  it("honors OPENCODE_LLM_PROXY_IDLE_TIMEOUT when set to a valid value", async () => {
+    const getCaptured = stubBunServe()
+    resetPluginState()
+    process.env.OPENCODE_LLM_PROXY_IDLE_TIMEOUT = "60"
+
+    await OpenAIProxyPlugin({ client: createClient() })
+
+    assert.equal(getCaptured().idleTimeout, 60)
+  })
+
+  it("clamps values above Bun's 255s maximum", async () => {
+    const getCaptured = stubBunServe()
+    resetPluginState()
+    process.env.OPENCODE_LLM_PROXY_IDLE_TIMEOUT = "999"
+
+    await OpenAIProxyPlugin({ client: createClient() })
+
+    assert.equal(getCaptured().idleTimeout, 255)
+  })
+
+  it("falls back to 255 for invalid (non-numeric) values", async () => {
+    const getCaptured = stubBunServe()
+    resetPluginState()
+    process.env.OPENCODE_LLM_PROXY_IDLE_TIMEOUT = "not-a-number"
+
+    await OpenAIProxyPlugin({ client: createClient() })
+
+    assert.equal(getCaptured().idleTimeout, 255)
+  })
 })
