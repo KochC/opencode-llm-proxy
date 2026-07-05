@@ -1,5 +1,6 @@
-import test, { describe, it } from "node:test"
+import test, { describe, it, after } from "node:test"
 import assert from "node:assert/strict"
+import { setTimeout as delay } from "node:timers/promises"
 
 import {
   createProxyFetchHandler,
@@ -25,6 +26,9 @@ import {
   applyAnthropicToolChoice,
   parseGeminiTools,
   applyGeminiToolChoice,
+  registerToolBridge,
+  releaseToolBridge,
+  buildToolsMap,
 } from "./index.js"
 
 // ---------------------------------------------------------------------------
@@ -74,9 +78,12 @@ function createStreamingClient(chunks) {
       messages: async () => ({
         data: [
           {
-            role: "assistant",
-            tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
-            finish: "end_turn",
+            info: {
+              role: "assistant",
+              tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+              finish: "end_turn",
+            },
+            parts: [],
           },
         ],
       }),
@@ -333,16 +340,18 @@ test("missing messages field returns 400", async () => {
 test("stream: true returns SSE response", async () => {
   const events = [
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: "Hello",
       },
     },
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: " world",
       },
     },
@@ -1090,16 +1099,18 @@ test("POST /v1/responses instructions field is incorporated", async () => {
 test("POST /v1/responses stream: true returns SSE lifecycle events", async () => {
   const events = [
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: "The answer",
       },
     },
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: " is 42.",
       },
     },
@@ -1133,16 +1144,18 @@ test("POST /v1/responses stream: true returns SSE lifecycle events", async () =>
 test("POST /v1/responses stream: true emits content_part.done with accumulated text per OpenAI spec", async () => {
   const events = [
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: "The answer",
       },
     },
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: " is 42.",
       },
     },
@@ -1631,16 +1644,18 @@ test("POST /v1/messages malformed JSON returns 400", async () => {
 test("POST /v1/messages stream: true returns Anthropic SSE events", async () => {
   const events = [
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: "Hello",
       },
     },
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: " world",
       },
     },
@@ -1828,16 +1843,18 @@ test("POST /v1beta/models/:model:generateContent malformed JSON returns 400", as
 test("POST /v1beta/models/:model:streamGenerateContent returns NDJSON stream", async () => {
   const events = [
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: "Gem",
       },
     },
     {
-      type: "message.part.updated",
+      type: "message.part.delta",
       properties: {
-        part: { sessionID: "sess-123", type: "text" },
+        sessionID: "sess-123",
+        field: "text",
         delta: "ini",
       },
     },
@@ -2095,9 +2112,12 @@ function createToolCallClient({ toolName, toolArgs, callID = "call_1", finish = 
       messages: async () => ({
         data: [
           {
-            role: "assistant",
-            tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
-            finish,
+            info: {
+              role: "assistant",
+              tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+              finish,
+            },
+            parts: [],
           },
         ],
       }),
@@ -2222,6 +2242,256 @@ test("POST /v1/messages stream: true emits a tool_use content block", async () =
   assert.ok(text.includes("tool_use"))
   assert.ok(text.includes("get_weather"))
   assert.ok(text.includes('"stop_reason":"tool_use"'))
+})
+
+// Regression test for: OpenCode delivers real incremental streaming text via
+// message.part.delta events (flat properties: sessionID, partID, field, delta) - a
+// completely separate event type from message.part.updated, which only carries status/
+// snapshot updates (used here for tool-call detection). For some turns (observed with a
+// multi-message conversation history, e.g. continuing after a prior tool call/result),
+// OpenCode never emits message.part.delta at all for the final reply - only
+// message.part.updated snapshots - so relying on message.part.delta alone would silently
+// produce empty content. The fallback: after the loop, fetch the session's messages
+// (client.session.messages()) and extract the final text from the assistant message's
+// parts array directly, exactly as the non-tool-calling path already does via
+// extractAssistantText().
+//
+// Each list item from client.session.messages() is `{ info: Message, parts: Part[] }` -
+// info.role/info.tokens/info.finish, NOT flat role/tokens/finish directly on the item.
+function createToolAwareTextClient({ events, assistantParts, tokens, finish }) {
+  return {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: { providers: [{ id: "openai", models: { "gpt-4o": { id: "gpt-4o", name: "GPT-4o" } } }] },
+      }),
+    },
+    mcp: {
+      disconnect: async () => {
+        throw new Error("not connected")
+      },
+      add: async () => ({ data: {} }),
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-text-1" } }),
+      promptAsync: async () => {},
+      abort: async () => ({ data: true }),
+      messages: async () => ({
+        data: [
+          {
+            info: { role: "assistant", tokens, finish },
+            parts: assistantParts,
+          },
+        ],
+      }),
+    },
+    event: {
+      subscribe: async () => ({
+        stream: (async function* () {
+          for (const event of events) yield event
+        })(),
+      }),
+    },
+  }
+}
+
+test("POST /v1/chat/completions falls back to the final message's parts when message.part.delta never fires", async () => {
+  const client = createToolAwareTextClient({
+    events: [{ type: "session.idle", properties: { sessionID: "sess-text-1" } }],
+    assistantParts: [{ type: "step-start" }, { type: "text", text: "Agentic AI startups raise record funding" }],
+    tokens: { input: 42, output: 7, reasoning: 0, cache: { read: 0, write: 0 } },
+    finish: "stop",
+  })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      messages: [
+        { role: "user", content: "Search the web then summarize." },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "call_1", type: "function", function: { name: "search", arguments: "{}" } }],
+        },
+        { role: "tool", tool_call_id: "call_1", content: "some search result" },
+      ],
+      tools: [{ type: "function", function: { name: "search" } }],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.choices[0].message.content, "Agentic AI startups raise record funding")
+  assert.equal(body.choices[0].finish_reason, "stop")
+  // Also locks in the .info.tokens fix - these were always read as undefined (silently
+  // falling back to all-zero usage) before, since the flat .tokens field this code used
+  // to read doesn't exist on the real API's { info, parts } shape.
+  assert.equal(body.usage.prompt_tokens, 42)
+  assert.equal(body.usage.completion_tokens, 7)
+})
+
+test("POST /v1/chat/completions accumulates content from message.part.delta events", async () => {
+  const client = createToolAwareTextClient({
+    events: [
+      { type: "message.part.delta", properties: { sessionID: "sess-text-1", field: "text", delta: "Hello" } },
+      { type: "message.part.delta", properties: { sessionID: "sess-text-1", field: "text", delta: " world" } },
+      { type: "session.idle", properties: { sessionID: "sess-text-1" } },
+    ],
+    assistantParts: [{ type: "text", text: "Hello world" }],
+    tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+    finish: "stop",
+  })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "Say hello world." }],
+      tools: [{ type: "function", function: { name: "search" } }],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.choices[0].message.content, "Hello world")
+})
+
+// Regression test for: a bridge slot reused by an earlier turn stays connected under its
+// old tool schema (OpenCode has no MCP deregistration endpoint), and getDisabledTools()
+// only snapshots OpenCode's built-in tool IDs once, before any bridge tools ever exist -
+// so neither mechanism disables a stale, previously-registered bridge tool ID on its own.
+// Without explicitly disabling every previously-seen bridge tool ID per turn, a stale tool
+// from an earlier turn's slot remains implicitly enabled and can be called by the model
+// instead of (or alongside) the current turn's own tool.
+describe("buildToolsMap / registerToolBridge slot isolation", () => {
+  function createMcpMockClient() {
+    const addCalls = []
+    return {
+      client: {
+        mcp: {
+          disconnect: async () => {
+            throw new Error("not connected")
+          },
+          add: async ({ body }) => {
+            addCalls.push(body)
+            return { data: {} }
+          },
+        },
+      },
+      addCalls,
+    }
+  }
+
+  it("disables a previously-registered bridge tool ID from a different pool slot", async () => {
+    const { client } = createMcpMockClient()
+
+    const firstTurnTools = [{ name: "weather_a", description: "", parameters: { type: "object", properties: {} } }]
+    const secondTurnTools = [{ name: "weather_b", description: "", parameters: { type: "object", properties: {} } }]
+
+    // Simulate turn 1: registers a bridge slot and (per the real bug) never gets
+    // explicitly disabled afterwards, since OpenCode can't deregister an MCP server.
+    const bridge1 = await registerToolBridge(client, firstTurnTools)
+    assert.equal(bridge1.toolIDs.length, 1)
+
+    // Simulate turn 2 reusing a *different* slot (mirrors the pool cycling to the next
+    // free slot for a new in-flight request) with its own, different tool.
+    const bridge2 = await registerToolBridge(client, secondTurnTools)
+    assert.equal(bridge2.toolIDs.length, 1)
+    assert.notEqual(
+      bridge1.toolIDs[0],
+      bridge2.toolIDs[0],
+      "test setup assumption: the two turns must land on different bridge tool IDs",
+    )
+
+    // Release both acquired slots back to the shared pool once we're done with them -
+    // otherwise, since the pool is a fixed-size global resource shared across the whole
+    // test process, leaking slots here could exhaust it and make later
+    // acquireBridgeSlot() calls (in other tests, or a re-run) hang forever waiting for
+    // a free slot.
+    after(() => {
+      releaseToolBridge(bridge1)
+      releaseToolBridge(bridge2)
+    })
+
+    const baseTools = { bash: false, read: false, edit: false }
+    const toolsMap = buildToolsMap(baseTools, bridge2)
+
+    // Turn 2's own tool must be enabled.
+    assert.equal(toolsMap[bridge2.toolIDs[0]], true)
+    // Turn 1's stale, still-connected tool must be *explicitly* disabled - not merely
+    // absent from the map, since an absent key left a live MCP tool implicitly enabled
+    // (the actual bug: the model could call it instead of turn 2's own tool).
+    assert.equal(toolsMap[bridge1.toolIDs[0]], false)
+    // OpenCode's built-ins must be untouched.
+    assert.equal(toolsMap.bash, false)
+    assert.equal(toolsMap.read, false)
+    assert.equal(toolsMap.edit, false)
+  })
+
+  it("returns a plain copy of baseTools when there is no bridge for this turn", () => {
+    const baseTools = { bash: false, read: false }
+    const toolsMap = buildToolsMap(baseTools, null)
+    assert.deepEqual(toolsMap, baseTools)
+    assert.notEqual(toolsMap, baseTools, "must be a copy, not the same object")
+  })
+
+  // Regression test for: if registerToolBridge() throws after acquireBridgeSlot() has
+  // already handed out a slot (e.g. client.mcp.add() fails to spawn/register the
+  // bridge process), the slot must still be released back to the pool. Otherwise the
+  // caller never gets a bridge object back to release via the normal
+  // releaseToolBridge()-in-a-finally path in runAgentTurn() - the slot would be lost
+  // forever, and enough repeated failures would eventually exhaust the whole pool and
+  // hang every future tool-calling request in acquireBridgeSlot().
+  it("releases the acquired slot back to the pool when registration fails after acquiring it", async () => {
+    let shouldFail = true
+    const client = {
+      mcp: {
+        disconnect: async () => {
+          throw new Error("not connected")
+        },
+        add: async () => {
+          if (shouldFail) throw new Error("simulated client.mcp.add failure")
+          return { data: {} }
+        },
+      },
+    }
+    const tools = [{ name: "flaky_tool", description: "", parameters: { type: "object", properties: {} } }]
+
+    // We can't directly inspect the pool's internals from here, but repeating the same
+    // failure many times in a row (comfortably more than the pool size, so this would
+    // exhaust it if any single one leaked its slot) and then confirming one more
+    // registration still succeeds - rather than hanging forever waiting for a free
+    // slot in acquireBridgeSlot() - only holds if every failure released its slot.
+    // Wrap the whole sequence in a timeout race so a regression fails this test
+    // clearly and quickly instead of hanging the suite: node:test has no default
+    // per-test timeout, and a leaked-slot regression would hang acquireBridgeSlot()
+    // forever with nothing else to catch it.
+    const timeout = delay(2000).then(() => {
+      throw new Error("timed out - one or more slots were leaked, not released")
+    })
+
+    const bridge = await Promise.race([
+      (async () => {
+        for (let i = 0; i < 20; i++) {
+          await assert.rejects(() => registerToolBridge(client, tools), /simulated client\.mcp\.add failure/)
+        }
+        shouldFail = false
+        return registerToolBridge(client, tools)
+      })(),
+      timeout,
+    ])
+
+    assert.ok(bridge.slotName)
+    after(() => releaseToolBridge(bridge))
+  })
 })
 
 test("POST /v1beta/models/:model:generateContent returns a functionCall part", async () => {

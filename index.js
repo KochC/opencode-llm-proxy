@@ -511,6 +511,19 @@ function getToolBridgeState() {
     state.toolBridge = {
       freeSlots: Array.from({ length: poolSize }, (_, i) => `px_tools_${i}`),
       waiters: [],
+      // Maps slot name -> the bridge tool IDs currently assigned to that slot (from
+      // whichever turn most recently registered it). Needed because OpenCode has no
+      // endpoint to deregister an MCP server, so a slot reused for a later request
+      // stays connected under its old tool schema until it's next reused - see
+      // buildToolsMap() below for why this must be tracked and explicitly disabled
+      // per-turn, not just left out of the map.
+      //
+      // Keyed by slot (not an ever-growing set of every tool ID ever seen): each
+      // slot's entry is *replaced*, not accumulated, every time that slot is
+      // reused, so this stays bounded by the pool size regardless of how many
+      // requests/unique tool schemas a long-lived process handles over its
+      // lifetime.
+      slotToolIDs: new Map(),
     }
   }
   return state.toolBridge
@@ -652,43 +665,81 @@ export function applyGeminiToolChoice(tools, toolConfig) {
   return tools
 }
 
-async function registerToolBridge(client, tools) {
+export async function registerToolBridge(client, tools) {
   const slotName = await acquireBridgeSlot()
-  const seen = new Set()
-  const nameMap = new Map() // full bridge tool ID ("<slot>_<sanitized>") -> original caller-facing name
-  const bridgeTools = tools.map((tool) => {
-    const sanitized = sanitizeToolName(tool.name, seen)
-    nameMap.set(`${slotName}_${sanitized}`, tool.name)
-    return { name: sanitized, description: tool.description, parameters: tool.parameters }
-  })
-
   try {
-    // Force a fresh respawn so the bridge process picks up this request's tool schema.
-    await client.mcp.disconnect({ path: { name: slotName } })
-  } catch {
-    // Not previously connected; nothing to do.
-  }
+    const seen = new Set()
+    const nameMap = new Map() // full bridge tool ID ("<slot>_<sanitized>") -> original caller-facing name
+    const bridgeTools = tools.map((tool) => {
+      const sanitized = sanitizeToolName(tool.name, seen)
+      nameMap.set(`${slotName}_${sanitized}`, tool.name)
+      return { name: sanitized, description: tool.description, parameters: tool.parameters }
+    })
 
-  await client.mcp.add({
-    body: {
-      name: slotName,
-      config: {
-        type: "local",
-        command: ["node", BRIDGE_SCRIPT_PATH],
-        environment: {
-          OPENCODE_LLM_PROXY_BRIDGE_TOOLS: JSON.stringify(bridgeTools),
+    try {
+      // Force a fresh respawn so the bridge process picks up this request's tool schema.
+      await client.mcp.disconnect({ path: { name: slotName } })
+    } catch {
+      // Not previously connected; nothing to do.
+    }
+
+    await client.mcp.add({
+      body: {
+        name: slotName,
+        config: {
+          type: "local",
+          command: ["node", BRIDGE_SCRIPT_PATH],
+          environment: {
+            OPENCODE_LLM_PROXY_BRIDGE_TOOLS: JSON.stringify(bridgeTools),
+          },
+          timeout: 10000,
         },
-        timeout: 10000,
       },
-    },
-  })
+    })
 
-  const toolIDs = bridgeTools.map((tool) => `${slotName}_${tool.name}`)
-  return { slotName, toolIDs, nameMap }
+    const toolIDs = bridgeTools.map((tool) => `${slotName}_${tool.name}`)
+    const bridgeState = getToolBridgeState()
+    bridgeState.slotToolIDs.set(slotName, toolIDs)
+    return { slotName, toolIDs, nameMap }
+  } catch (error) {
+    // If anything above fails after we've already acquired the slot (most likely
+    // client.mcp.add() failing to spawn/register the bridge process), the caller
+    // never gets a bridge object back to release via releaseToolBridge() in its
+    // normal finally block - runAgentTurn() only knows about `bridge` once this
+    // function successfully returns. Without this, the slot would be lost from the
+    // pool forever, and repeated failures would eventually exhaust it and hang all
+    // future tool-calling requests in acquireBridgeSlot().
+    releaseBridgeSlot(slotName)
+    throw error
+  }
 }
 
-function releaseToolBridge(bridge) {
+export function releaseToolBridge(bridge) {
   if (bridge) releaseBridgeSlot(bridge.slotName)
+}
+
+// Builds the per-turn `tools` map sent to OpenCode: the caller's bridge tools enabled,
+// every OpenCode built-in disabled (as before), and - critically - every bridge tool ID
+// ever registered by *any* pool slot explicitly disabled too, then re-enabling only this
+// turn's own IDs.
+//
+// Why this is necessary: OpenCode's server API has no endpoint to deregister an MCP
+// server, so a bridge slot reused for a later request/turn stays connected under its
+// previous tool schema until it's next reused. getDisabledTools() also only snapshots
+// OpenCode's built-in tool IDs once, before any bridge tools exist, so it can never know
+// to disable them either. Without this explicit disable step, a stale, still-connected
+// tool from a previously-used slot remains implicitly enabled and can get called by the
+// model instead of (or alongside) this turn's own tool - the model has no way to tell
+// them apart since both are live MCP tools as far as OpenCode is concerned.
+export function buildToolsMap(baseTools, bridge) {
+  const toolsMap = { ...baseTools }
+  if (!bridge) return toolsMap
+  const bridgeState = getToolBridgeState()
+  for (const ids of bridgeState.slotToolIDs.values()) {
+    for (const id of ids) toolsMap[id] = false
+  }
+  for (const id of bridge.toolIDs) toolsMap[id] = true
+  return toolsMap
 }
 
 async function runAgentTurn(client, model, messages, system, callerTools, onChunk) {
@@ -698,8 +749,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
 
   if (Array.isArray(callerTools) && callerTools.length > 0) {
     bridge = await registerToolBridge(client, callerTools)
-    toolsMap = { ...baseTools }
-    for (const id of bridge.toolIDs) toolsMap[id] = true
+    toolsMap = buildToolsMap(baseTools, bridge)
   }
 
   const session = await client.session.create({ body: { title: `Proxy: ${model.id}` } })
@@ -726,19 +776,26 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
 
   try {
     for await (const event of stream) {
-      if (event.type === "message.part.updated") {
+      if (event.type === "message.part.delta") {
+        // Real incremental token deltas arrive here, as flat properties (sessionID,
+        // partID, field, delta) - NOT nested under event.properties.part like
+        // message.part.updated below. This is the actual live-streaming source; the
+        // fallback via session.messages() after the loop covers turns where OpenCode
+        // doesn't emit these (see below).
+        const props = event.properties
+        if (
+          props?.sessionID === sessionID &&
+          props?.field === "text" &&
+          typeof props.delta === "string" &&
+          props.delta.length > 0
+        ) {
+          content += props.delta
+          onChunk?.(props.delta)
+        }
+      } else if (event.type === "message.part.updated") {
         const part = event.properties?.part
-        const delta = event.properties?.delta
 
         if (
-          part?.sessionID === sessionID &&
-          part?.type === "text" &&
-          typeof delta === "string" &&
-          delta.length > 0
-        ) {
-          content += delta
-          onChunk?.(delta)
-        } else if (
           toolIDSet &&
           part?.sessionID === sessionID &&
           part?.type === "tool" &&
@@ -776,15 +833,26 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     throw new Error(errorMessage)
   }
 
+  // Each list item is { info: Message, parts: Part[] } - matching the shape
+  // client.session.prompt() (the non-tool-calling path) already returns directly.
   const messagesResult = await client.session.messages({ path: { id: sessionID } })
-  const assistantMsg = (messagesResult.data ?? []).filter((m) => m.role === "assistant").at(-1)
+  const assistantEntry = (messagesResult.data ?? []).filter((m) => m.info?.role === "assistant").at(-1)
+  const assistantInfo = assistantEntry?.info
+
+  // Fallback for turns where message.part.delta never fired (observed for some
+  // multi-step turns, e.g. continuing a conversation with prior tool calls/results in
+  // history): use the authoritative final text from the fetched message's parts
+  // instead of leaving content empty.
+  if (!content && !toolCall) {
+    content = extractAssistantText(assistantEntry?.parts ?? [])
+  }
 
   return {
     sessionID,
     content,
     toolCall,
-    tokens: assistantMsg?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    finish: toolCall ? "tool_calls" : assistantMsg?.finish,
+    tokens: assistantInfo?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    finish: toolCall ? "tool_calls" : assistantInfo?.finish,
   }
 }
 
