@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.7.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.6.1...v1.7.0) (2026-07-04)
+
+
+### Features
+
+* add tool/function calling support ([#52](https://github.com/KochC/opencode-llm-proxy/issues/52)) ([d01cf20](https://github.com/KochC/opencode-llm-proxy/commit/d01cf203c4d307c995283b24be752680398d02c8))
+
+
+### Bug Fixes
+
+* accept Anthropic system field as content-block array ([#47](https://github.com/KochC/opencode-llm-proxy/issues/47)) ([2eb182f](https://github.com/KochC/opencode-llm-proxy/commit/2eb182f9114d006ededd4a8d2556cb4f1917ef70)), closes [#46](https://github.com/KochC/opencode-llm-proxy/issues/46)
+* Anthropic system content-block arrays, Responses API SSE spec compliance ([0811e1e](https://github.com/KochC/opencode-llm-proxy/commit/0811e1ea74d5e97552f5419561030924a9fd825a))
+* emit content_part.done and populate output_text.done.text per Responses API spec ([#49](https://github.com/KochC/opencode-llm-proxy/issues/49)) ([b7402ca](https://github.com/KochC/opencode-llm-proxy/commit/b7402cabf22720087158e52d217c64978775ae6b)), closes [#48](https://github.com/KochC/opencode-llm-proxy/issues/48)
+
 ## [1.6.1](https://github.com/KochC/opencode-llm-proxy/compare/v1.6.0...v1.6.1) (2026-03-27)
 
 
