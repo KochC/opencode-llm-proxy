@@ -40,6 +40,7 @@ Your tool (OpenAI / Anthropic / Gemini SDK, coding agent, etc.)
 - [Configuration](#configuration)
 - [Tool calling](#tool-calling)
 - [Using with SDKs and tools](#using-with-sdks-and-tools)
+  - [n8n](#n8n)
 - [Finding model IDs](#finding-model-ids)
 - [API reference](#api-reference)
 - [How it works](#how-it-works)
@@ -60,6 +61,7 @@ Most LLM tools speak exactly one API dialect. OpenCode already manages connectio
 - You want to **share your models on a LAN**. Expose the proxy on `0.0.0.0` and give teammates the URL.
 - You use the **Anthropic SDK** but want to route through GitHub Copilot or Bedrock. No code change in the SDK — just point it at the proxy.
 - You're building or running a **coding agent** that needs real tool/function calling (read files, run shell commands, etc.) against whatever model OpenCode has configured. See [Tool calling](#tool-calling).
+- You run **n8n** (self-hosted or in Docker, possibly on a different machine on your LAN) and want its AI nodes to use whatever models OpenCode already has authenticated access to — GitHub Copilot, Anthropic, Bedrock, local Ollama models, etc. — without giving n8n its own separate API keys. Point n8n's native OpenAI/Anthropic credentials at the proxy. See [n8n](#n8n).
 
 ---
 
@@ -316,6 +318,24 @@ print(response.content)
 4. Save — all your OpenCode models appear in the model picker
 
 > Running Open WebUI in Docker? Use `http://host.docker.internal:4010/v1` and set `OPENCODE_LLM_PROXY_HOST=0.0.0.0`.
+
+### n8n
+
+The proxy lets [n8n](https://n8n.io)'s native AI nodes use whatever models OpenCode already has authenticated access to — GitHub Copilot, Anthropic, Bedrock, local Ollama models, etc. — without configuring separate API keys in n8n at all. This works with n8n's regular LangChain-based Chat Model nodes, **including real tool/function calling** (e.g. an "AI Agent" node with a Tool attached) since [Tool calling](#tool-calling) support was added.
+
+1. In OpenCode, expose the proxy on your LAN instead of just localhost, and set a bearer token since it'll be network-reachable:
+   ```bash
+   OPENCODE_LLM_PROXY_HOST=0.0.0.0 \
+   OPENCODE_LLM_PROXY_TOKEN=some-long-random-token \
+   opencode
+   ```
+2. In n8n, create a credential:
+   - **OpenAI**: Base URL `http://<opencode-host-ip>:4010/v1`, API Key = your token
+   - **Anthropic**: Base URL `http://<opencode-host-ip>:4010` (no `/v1` — the node adds `/v1/messages` itself), API Key = your token
+3. Add an **OpenAI Chat Model** (or **Anthropic Chat Model**) node using that credential. The model dropdown calls `GET /v1/models` on the proxy, so it auto-populates with every model OpenCode has connected (`github-copilot/claude-sonnet-5`, `anthropic/claude-3-5-sonnet`, `ollama/qwen2.5-coder`, ...) — pick one directly, no manual typing needed.
+4. Wire it into a **Basic LLM Chain** node for simple prompt/response use, or an **AI Agent** node (with Tools attached, e.g. an HTTP Request Tool) for agentic tool-using workflows.
+
+> n8n running in Docker on a **different machine** on your LAN (a common setup)? Use that machine's actual LAN IP for `<opencode-host-ip>` — not `localhost`/`host.docker.internal`, which only resolve to the OpenCode host if Docker is running on that same machine. Make sure your firewall allows incoming connections to the `opencode` binary (macOS's Application Firewall in particular will silently drop connections from an app it hasn't been told to allow, even with the port open).
 
 ### Chatbox
 

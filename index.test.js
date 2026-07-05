@@ -1,5 +1,6 @@
-import test, { describe, it } from "node:test"
+import test, { describe, it, after } from "node:test"
 import assert from "node:assert/strict"
+import { setTimeout as delay } from "node:timers/promises"
 
 import {
   createProxyFetchHandler,
@@ -26,6 +27,7 @@ import {
   parseGeminiTools,
   applyGeminiToolChoice,
   registerToolBridge,
+  releaseToolBridge,
   buildToolsMap,
 } from "./index.js"
 
@@ -2273,6 +2275,16 @@ describe("buildToolsMap / registerToolBridge slot isolation", () => {
       "test setup assumption: the two turns must land on different bridge tool IDs",
     )
 
+    // Release both acquired slots back to the shared pool once we're done with them -
+    // otherwise, since the pool is a fixed-size global resource shared across the whole
+    // test process, leaking slots here could exhaust it and make later
+    // acquireBridgeSlot() calls (in other tests, or a re-run) hang forever waiting for
+    // a free slot.
+    after(() => {
+      releaseToolBridge(bridge1)
+      releaseToolBridge(bridge2)
+    })
+
     const baseTools = { bash: false, read: false, edit: false }
     const toolsMap = buildToolsMap(baseTools, bridge2)
 
@@ -2293,6 +2305,56 @@ describe("buildToolsMap / registerToolBridge slot isolation", () => {
     const toolsMap = buildToolsMap(baseTools, null)
     assert.deepEqual(toolsMap, baseTools)
     assert.notEqual(toolsMap, baseTools, "must be a copy, not the same object")
+  })
+
+  // Regression test for: if registerToolBridge() throws after acquireBridgeSlot() has
+  // already handed out a slot (e.g. client.mcp.add() fails to spawn/register the
+  // bridge process), the slot must still be released back to the pool. Otherwise the
+  // caller never gets a bridge object back to release via the normal
+  // releaseToolBridge()-in-a-finally path in runAgentTurn() - the slot would be lost
+  // forever, and enough repeated failures would eventually exhaust the whole pool and
+  // hang every future tool-calling request in acquireBridgeSlot().
+  it("releases the acquired slot back to the pool when registration fails after acquiring it", async () => {
+    let shouldFail = true
+    const client = {
+      mcp: {
+        disconnect: async () => {
+          throw new Error("not connected")
+        },
+        add: async () => {
+          if (shouldFail) throw new Error("simulated client.mcp.add failure")
+          return { data: {} }
+        },
+      },
+    }
+    const tools = [{ name: "flaky_tool", description: "", parameters: { type: "object", properties: {} } }]
+
+    // We can't directly inspect the pool's internals from here, but repeating the same
+    // failure many times in a row (comfortably more than the pool size, so this would
+    // exhaust it if any single one leaked its slot) and then confirming one more
+    // registration still succeeds - rather than hanging forever waiting for a free
+    // slot in acquireBridgeSlot() - only holds if every failure released its slot.
+    // Wrap the whole sequence in a timeout race so a regression fails this test
+    // clearly and quickly instead of hanging the suite: node:test has no default
+    // per-test timeout, and a leaked-slot regression would hang acquireBridgeSlot()
+    // forever with nothing else to catch it.
+    const timeout = delay(2000).then(() => {
+      throw new Error("timed out - one or more slots were leaked, not released")
+    })
+
+    const bridge = await Promise.race([
+      (async () => {
+        for (let i = 0; i < 20; i++) {
+          await assert.rejects(() => registerToolBridge(client, tools), /simulated client\.mcp\.add failure/)
+        }
+        shouldFail = false
+        return registerToolBridge(client, tools)
+      })(),
+      timeout,
+    ])
+
+    assert.ok(bridge.slotName)
+    after(() => releaseToolBridge(bridge))
   })
 })
 

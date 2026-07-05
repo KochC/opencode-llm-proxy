@@ -511,13 +511,19 @@ function getToolBridgeState() {
     state.toolBridge = {
       freeSlots: Array.from({ length: poolSize }, (_, i) => `px_tools_${i}`),
       waiters: [],
-      // Every bridge tool ID ever registered across the pool's lifetime, from any
-      // slot. Needed because OpenCode has no endpoint to deregister an MCP server,
-      // so a slot reused for a later request stays connected under its old tool
-      // schema until it's next reused - see buildToolsMap() below for why this
-      // must be tracked and explicitly disabled per-turn, not just left out of the
-      // map.
-      knownToolIDs: new Set(),
+      // Maps slot name -> the bridge tool IDs currently assigned to that slot (from
+      // whichever turn most recently registered it). Needed because OpenCode has no
+      // endpoint to deregister an MCP server, so a slot reused for a later request
+      // stays connected under its old tool schema until it's next reused - see
+      // buildToolsMap() below for why this must be tracked and explicitly disabled
+      // per-turn, not just left out of the map.
+      //
+      // Keyed by slot (not an ever-growing set of every tool ID ever seen): each
+      // slot's entry is *replaced*, not accumulated, every time that slot is
+      // reused, so this stays bounded by the pool size regardless of how many
+      // requests/unique tool schemas a long-lived process handles over its
+      // lifetime.
+      slotToolIDs: new Map(),
     }
   }
   return state.toolBridge
@@ -661,42 +667,54 @@ export function applyGeminiToolChoice(tools, toolConfig) {
 
 export async function registerToolBridge(client, tools) {
   const slotName = await acquireBridgeSlot()
-  const seen = new Set()
-  const nameMap = new Map() // full bridge tool ID ("<slot>_<sanitized>") -> original caller-facing name
-  const bridgeTools = tools.map((tool) => {
-    const sanitized = sanitizeToolName(tool.name, seen)
-    nameMap.set(`${slotName}_${sanitized}`, tool.name)
-    return { name: sanitized, description: tool.description, parameters: tool.parameters }
-  })
-
   try {
-    // Force a fresh respawn so the bridge process picks up this request's tool schema.
-    await client.mcp.disconnect({ path: { name: slotName } })
-  } catch {
-    // Not previously connected; nothing to do.
-  }
+    const seen = new Set()
+    const nameMap = new Map() // full bridge tool ID ("<slot>_<sanitized>") -> original caller-facing name
+    const bridgeTools = tools.map((tool) => {
+      const sanitized = sanitizeToolName(tool.name, seen)
+      nameMap.set(`${slotName}_${sanitized}`, tool.name)
+      return { name: sanitized, description: tool.description, parameters: tool.parameters }
+    })
 
-  await client.mcp.add({
-    body: {
-      name: slotName,
-      config: {
-        type: "local",
-        command: ["node", BRIDGE_SCRIPT_PATH],
-        environment: {
-          OPENCODE_LLM_PROXY_BRIDGE_TOOLS: JSON.stringify(bridgeTools),
+    try {
+      // Force a fresh respawn so the bridge process picks up this request's tool schema.
+      await client.mcp.disconnect({ path: { name: slotName } })
+    } catch {
+      // Not previously connected; nothing to do.
+    }
+
+    await client.mcp.add({
+      body: {
+        name: slotName,
+        config: {
+          type: "local",
+          command: ["node", BRIDGE_SCRIPT_PATH],
+          environment: {
+            OPENCODE_LLM_PROXY_BRIDGE_TOOLS: JSON.stringify(bridgeTools),
+          },
+          timeout: 10000,
         },
-        timeout: 10000,
       },
-    },
-  })
+    })
 
-  const toolIDs = bridgeTools.map((tool) => `${slotName}_${tool.name}`)
-  const bridgeState = getToolBridgeState()
-  for (const id of toolIDs) bridgeState.knownToolIDs.add(id)
-  return { slotName, toolIDs, nameMap }
+    const toolIDs = bridgeTools.map((tool) => `${slotName}_${tool.name}`)
+    const bridgeState = getToolBridgeState()
+    bridgeState.slotToolIDs.set(slotName, toolIDs)
+    return { slotName, toolIDs, nameMap }
+  } catch (error) {
+    // If anything above fails after we've already acquired the slot (most likely
+    // client.mcp.add() failing to spawn/register the bridge process), the caller
+    // never gets a bridge object back to release via releaseToolBridge() in its
+    // normal finally block - runAgentTurn() only knows about `bridge` once this
+    // function successfully returns. Without this, the slot would be lost from the
+    // pool forever, and repeated failures would eventually exhaust it and hang all
+    // future tool-calling requests in acquireBridgeSlot().
+    releaseBridgeSlot(slotName)
+    throw error
+  }
 }
 
-function releaseToolBridge(bridge) {
+export function releaseToolBridge(bridge) {
   if (bridge) releaseBridgeSlot(bridge.slotName)
 }
 
@@ -717,7 +735,9 @@ export function buildToolsMap(baseTools, bridge) {
   const toolsMap = { ...baseTools }
   if (!bridge) return toolsMap
   const bridgeState = getToolBridgeState()
-  for (const id of bridgeState.knownToolIDs) toolsMap[id] = false
+  for (const ids of bridgeState.slotToolIDs.values()) {
+    for (const id of ids) toolsMap[id] = false
+  }
   for (const id of bridge.toolIDs) toolsMap[id] = true
   return toolsMap
 }
