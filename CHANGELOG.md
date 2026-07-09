@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.7.1...v1.8.0) (2026-07-09)
+
+
+### Features
+
+* parallel tool calls across OpenAI, Anthropic, and Gemini APIs ([#62](https://github.com/KochC/opencode-llm-proxy/issues/62)) ([8dfdb25](https://github.com/KochC/opencode-llm-proxy/commit/8dfdb254134d146d095933fa5675e6d0e24ac09d))
+
 ## [1.7.1](https://github.com/KochC/opencode-llm-proxy/compare/v1.7.0...v1.7.1) (2026-07-05)
 
 
