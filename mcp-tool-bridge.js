@@ -11,64 +11,59 @@
 // Protocol: JSON-RPC 2.0 messages, newline-delimited, over stdin/stdout.
 // stdout MUST only ever contain JSON-RPC messages - all diagnostics go to stderr.
 
-const toolsJson = process.env.OPENCODE_LLM_PROXY_BRIDGE_TOOLS ?? "[]"
-
-let tools = []
-try {
-  const parsed = JSON.parse(toolsJson)
-  if (Array.isArray(parsed)) tools = parsed
-} catch (error) {
-  process.stderr.write(`opencode-llm-proxy bridge: failed to parse tool schemas: ${error}\n`)
+// Parses the JSON tool schemas supplied via env. Always returns an array; on any
+// parse error it returns [] and (optionally) reports the failure via onError.
+export function parseTools(toolsJson, onError) {
+  try {
+    const parsed = JSON.parse(toolsJson ?? "[]")
+    if (Array.isArray(parsed)) return parsed
+  } catch (error) {
+    onError?.(error)
+  }
+  return []
 }
 
-function send(message) {
-  process.stdout.write(JSON.stringify(message) + "\n")
+function result(id, value) {
+  if (id === undefined || id === null) return null
+  return { jsonrpc: "2.0", id, result: value }
 }
 
-function respondResult(id, result) {
-  if (id === undefined || id === null) return
-  send({ jsonrpc: "2.0", id, result })
+function error(id, code, message) {
+  if (id === undefined || id === null) return null
+  return { jsonrpc: "2.0", id, error: { code, message } }
 }
 
-function respondError(id, code, message) {
-  if (id === undefined || id === null) return
-  send({ jsonrpc: "2.0", id, error: { code, message } })
-}
-
-function handleMessage(message) {
-  const { id, method, params } = message
+// Pure JSON-RPC dispatcher. Given a parsed request message and the tool schemas,
+// returns the response object to send, or null when no response is expected
+// (notifications, or requests without an id).
+export function dispatch(message, tools = []) {
+  const { id, method, params } = message ?? {}
 
   switch (method) {
-    case "initialize": {
-      respondResult(id, {
+    case "initialize":
+      return result(id, {
         protocolVersion: params?.protocolVersion ?? "2024-11-05",
         capabilities: { tools: {} },
         serverInfo: { name: "opencode-llm-proxy-bridge", version: "1.0.0" },
       })
-      return
-    }
     case "notifications/initialized":
       // Notification, no response expected.
-      return
-    case "ping": {
-      respondResult(id, {})
-      return
-    }
-    case "tools/list": {
-      respondResult(id, {
+      return null
+    case "ping":
+      return result(id, {})
+    case "tools/list":
+      return result(id, {
         tools: tools.map((tool) => ({
           name: tool.name,
           description: tool.description ?? "",
           inputSchema: tool.parameters ?? { type: "object", properties: {} },
         })),
       })
-      return
-    }
-    case "tools/call": {
+    case "tools/call":
       // Never actually reached in practice: the proxy aborts the OpenCode session as
       // soon as it observes the tool-call part on the event stream, before this
       // response would be consumed. Returned only as a safety net.
-      respondResult(id, {
+      return result(id, {
         content: [
           {
             type: "text",
@@ -76,32 +71,52 @@ function handleMessage(message) {
           },
         ],
       })
-      return
-    }
-    default: {
-      respondError(id, -32601, `Method not found: ${method}`)
-    }
+    default:
+      return error(id, -32601, `Method not found: ${method}`)
   }
 }
 
-let buffer = ""
-process.stdin.setEncoding("utf8")
-process.stdin.on("data", (chunk) => {
-  buffer += chunk
-  let newlineIndex
-  while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
-    const line = buffer.slice(0, newlineIndex).trim()
-    buffer = buffer.slice(newlineIndex + 1)
-    if (!line) continue
-    try {
-      const message = JSON.parse(line)
-      handleMessage(message)
-    } catch (error) {
-      process.stderr.write(`opencode-llm-proxy bridge: failed to parse message: ${error}\n`)
-    }
-  }
-})
+// Wires the pure dispatcher up to newline-delimited JSON-RPC streams. Streams are
+// injectable (defaulting to the process stdio) so the parsing loop can be unit
+// tested without spawning a child process. Only invoked when this module is run as
+// a script (see the guard below), so importing it for tests has no side effects.
+export function runStdioServer(tools, options = {}) {
+  const input = options.input ?? process.stdin
+  const output = options.output ?? process.stdout
+  const errorOutput = options.errorOutput ?? process.stderr
+  const onEnd = options.onEnd ?? (() => process.exit(0))
 
-process.stdin.on("end", () => {
-  process.exit(0)
-})
+  function send(message) {
+    output.write(JSON.stringify(message) + "\n")
+  }
+
+  let buffer = ""
+  input.setEncoding("utf8")
+  input.on("data", (chunk) => {
+    buffer += chunk
+    let newlineIndex
+    while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+      const line = buffer.slice(0, newlineIndex).trim()
+      buffer = buffer.slice(newlineIndex + 1)
+      if (!line) continue
+      try {
+        const message = JSON.parse(line)
+        const response = dispatch(message, tools)
+        if (response) send(response)
+      } catch (err) {
+        errorOutput.write(`opencode-llm-proxy bridge: failed to parse message: ${err}\n`)
+      }
+    }
+  })
+
+  input.on("end", onEnd)
+}
+
+// Only start the stdio server when executed directly (`node mcp-tool-bridge.js`),
+// not when imported by tests.
+if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+  const tools = parseTools(process.env.OPENCODE_LLM_PROXY_BRIDGE_TOOLS, (err) =>
+    process.stderr.write(`opencode-llm-proxy bridge: failed to parse tool schemas: ${err}\n`),
+  )
+  runStdioServer(tools)
+}
