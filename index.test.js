@@ -1,6 +1,7 @@
-import test, { describe, it, after } from "node:test"
+import test, { describe, it, after, beforeEach } from "node:test"
 import assert from "node:assert/strict"
 import { setTimeout as delay } from "node:timers/promises"
+import { PassThrough } from "node:stream"
 
 import {
   createProxyFetchHandler,
@@ -29,7 +30,18 @@ import {
   registerToolBridge,
   releaseToolBridge,
   buildToolsMap,
+  OpenAIProxyPlugin,
 } from "./index.js"
+
+import { dispatch, parseTools, runStdioServer } from "./mcp-tool-bridge.js"
+
+// Keep the suite hermetic: environment variables leaking in from the developer's
+// shell or CI (e.g. OPENCODE_LLM_PROXY_TOKEN) must not change test outcomes.
+// Tests that need these set do so explicitly inside the test body.
+beforeEach(() => {
+  delete process.env.OPENCODE_LLM_PROXY_TOKEN
+  delete process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN
+})
 
 // ---------------------------------------------------------------------------
 // Integration: createProxyFetchHandler
@@ -2125,17 +2137,24 @@ function createToolCallClient({ toolName, toolArgs, callID = "call_1", finish = 
     event: {
       subscribe: async () => ({
         stream: (async function* () {
+          const tool = `${capturedSlotName}_${toolName}`
+          // Real OpenCode lifecycle: input is empty on "pending" and only populated on
+          // "running"; the tool-calling step ends with a step-finish for the same message.
           yield {
             type: "message.part.updated",
             properties: {
-              part: {
-                sessionID: "sess-tool-1",
-                type: "tool",
-                tool: `${capturedSlotName}_${toolName}`,
-                callID,
-                state: { status: "pending", input: toolArgs },
-              },
+              part: { sessionID: "sess-tool-1", messageID: "msg-1", type: "tool", tool, callID, state: { status: "pending", input: {} } },
             },
+          }
+          yield {
+            type: "message.part.updated",
+            properties: {
+              part: { sessionID: "sess-tool-1", messageID: "msg-1", type: "tool", tool, callID, state: { status: "running", input: toolArgs } },
+            },
+          }
+          yield {
+            type: "message.part.updated",
+            properties: { part: { sessionID: "sess-tool-1", messageID: "msg-1", type: "step-finish" } },
           }
         })(),
       }),
@@ -2584,4 +2603,598 @@ test("tool_choice: none disables tool calling even when tools are supplied", asy
   assert.equal(response.status, 200)
   // No mcp/tool bridge client methods were exercised because callerTools resolved to [].
   assert.equal(client.mcp, undefined)
+})
+
+test("POST /v1beta/models/:model:streamGenerateContent emits a functionCall in the final chunk", async () => {
+  const client = createToolCallClient({
+    toolName: "get_weather",
+    toolArgs: { city: "NYC" },
+    providers: [{ id: "google", models: { "gemini-2.0-flash": { id: "gemini-2.0-flash" } } }],
+  })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1beta/models/gemini-2.0-flash:streamGenerateContent", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: "What's the weather in NYC?" }] }],
+      tools: [{ functionDeclarations: [{ name: "get_weather", description: "Get weather" }] }],
+    }),
+  })
+
+  const response = await handler(request)
+  const text = await response.text()
+  const chunks = text
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+  const functionCall = chunks.at(-1).candidates[0].content.parts[0].functionCall
+
+  assert.ok(functionCall)
+  assert.equal(functionCall.name, "get_weather")
+  assert.deepEqual(functionCall.args, { city: "NYC" })
+})
+
+// ---------------------------------------------------------------------------
+// Integration: parallel tool calling (a single assistant turn requesting multiple
+// tools at once). The completed assistant message is the authoritative source of the
+// full set - it carries every tool part before the first goes pending - so the mock
+// returns them all from session.messages() while the event stream only surfaces the
+// first (which is what triggers the abort in runAgentTurn).
+// ---------------------------------------------------------------------------
+
+function createParallelToolCallClient({ tools, finish = "tool_calls", providers } = {}) {
+  let capturedSlotName = null
+  const toolPart = (tool, status, input) => ({
+    sessionID: "sess-par-1",
+    messageID: "msg-par-1",
+    type: "tool",
+    tool: `${capturedSlotName}_${tool.name}`,
+    callID: tool.callID,
+    state: { status, input },
+  })
+
+  return {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: {
+          providers: providers ?? [{ id: "openai", models: { "gpt-4o": { id: "gpt-4o", name: "GPT-4o" } } }],
+        },
+      }),
+    },
+    mcp: {
+      disconnect: async () => {
+        throw new Error("not connected")
+      },
+      add: async ({ body }) => {
+        capturedSlotName = body.name
+        return { data: {} }
+      },
+    },
+    session: {
+      create: async () => ({ data: { id: "sess-par-1" } }),
+      promptAsync: async () => {},
+      abort: async () => ({ data: true }),
+      messages: async () => ({
+        data: [
+          {
+            info: {
+              role: "assistant",
+              tokens: { input: 7, output: 3, reasoning: 0, cache: { read: 0, write: 0 } },
+              finish,
+            },
+            parts: [{ type: "step-start" }, { type: "text", text: "" }, { type: "step-finish" }],
+          },
+        ],
+      }),
+    },
+    event: {
+      subscribe: async () => ({
+        stream: (async function* () {
+          // Real OpenCode emits parallel tool calls sequentially within one assistant
+          // message: each goes pending (empty input) then running (populated), and the
+          // step ends with a single step-finish. All belong to the same messageID.
+          for (const tool of tools) {
+            yield { type: "message.part.updated", properties: { part: toolPart(tool, "pending", {}) } }
+            yield { type: "message.part.updated", properties: { part: toolPart(tool, "running", tool.args) } }
+          }
+          yield {
+            type: "message.part.updated",
+            properties: { part: { sessionID: "sess-par-1", messageID: "msg-par-1", type: "step-finish" } },
+          }
+        })(),
+      }),
+    },
+  }
+}
+
+const PARALLEL_TOOLS = [
+  { name: "get_weather", args: { city: "NYC" }, callID: "call_1" },
+  { name: "get_time", args: { tz: "EST" }, callID: "call_2" },
+]
+
+test("POST /v1/chat/completions returns multiple tool_calls for parallel tool use", async () => {
+  const client = createParallelToolCallClient({ tools: PARALLEL_TOOLS })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "weather and time?" }],
+      tools: [
+        { type: "function", function: { name: "get_weather" } },
+        { type: "function", function: { name: "get_time" } },
+      ],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.choices[0].finish_reason, "tool_calls")
+  const calls = body.choices[0].message.tool_calls
+  assert.equal(calls.length, 2)
+  assert.deepEqual(
+    calls.map((c) => c.function.name),
+    ["get_weather", "get_time"],
+  )
+  assert.deepEqual(
+    calls.map((c) => c.id),
+    ["call_1", "call_2"],
+  )
+  assert.deepEqual(JSON.parse(calls[1].function.arguments), { tz: "EST" })
+})
+
+test("POST /v1/chat/completions stream emits parallel tool_calls with distinct indexes", async () => {
+  const client = createParallelToolCallClient({ tools: PARALLEL_TOOLS })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "weather and time?" }],
+      tools: [
+        { type: "function", function: { name: "get_weather" } },
+        { type: "function", function: { name: "get_time" } },
+      ],
+    }),
+  })
+
+  const response = await handler(request)
+  const text = await response.text()
+  const toolChunk = text
+    .split("\n\n")
+    .map((block) => block.replace(/^data: /, ""))
+    .filter((line) => line && line !== "[DONE]")
+    .map((line) => JSON.parse(line))
+    .find((chunk) => chunk.choices?.[0]?.delta?.tool_calls)
+
+  assert.ok(toolChunk, "expected a chunk carrying tool_calls")
+  const calls = toolChunk.choices[0].delta.tool_calls
+  assert.equal(calls.length, 2)
+  assert.deepEqual(
+    calls.map((c) => c.index),
+    [0, 1],
+  )
+  assert.deepEqual(
+    calls.map((c) => c.function.name),
+    ["get_weather", "get_time"],
+  )
+  assert.ok(text.includes('"finish_reason":"tool_calls"'))
+})
+
+test("POST /v1/responses returns multiple function_call output items for parallel tool use", async () => {
+  const client = createParallelToolCallClient({ tools: PARALLEL_TOOLS })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      input: "weather and time?",
+      tools: [
+        { type: "function", name: "get_weather" },
+        { type: "function", name: "get_time" },
+      ],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.output.length, 2)
+  assert.deepEqual(
+    body.output.map((item) => item.type),
+    ["function_call", "function_call"],
+  )
+  assert.deepEqual(
+    body.output.map((item) => item.name),
+    ["get_weather", "get_time"],
+  )
+  assert.deepEqual(
+    body.output.map((item) => item.call_id),
+    ["call_1", "call_2"],
+  )
+  assert.equal(body.parallel_tool_calls, true)
+})
+
+test("POST /v1/responses stream emits parallel function_call items with distinct output_index", async () => {
+  const client = createParallelToolCallClient({ tools: PARALLEL_TOOLS })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      input: "weather and time?",
+      tools: [
+        { type: "function", name: "get_weather" },
+        { type: "function", name: "get_time" },
+      ],
+    }),
+  })
+
+  const response = await handler(request)
+  const text = await response.text()
+  const doneEvents = parseSseStream(text).filter((e) => e.event === "response.output_item.done")
+
+  assert.equal(doneEvents.length, 2)
+  assert.deepEqual(
+    doneEvents.map((e) => e.data.output_index),
+    [1, 2],
+  )
+  assert.deepEqual(
+    doneEvents.map((e) => e.data.item.name),
+    ["get_weather", "get_time"],
+  )
+})
+
+test("POST /v1/messages returns multiple tool_use blocks for parallel tool use", async () => {
+  const client = createParallelToolCallClient({ tools: PARALLEL_TOOLS })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      max_tokens: 100,
+      messages: [{ role: "user", content: "weather and time?" }],
+      tools: [
+        { name: "get_weather", input_schema: { type: "object" } },
+        { name: "get_time", input_schema: { type: "object" } },
+      ],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.stop_reason, "tool_use")
+  assert.equal(body.content.length, 2)
+  assert.deepEqual(
+    body.content.map((block) => block.type),
+    ["tool_use", "tool_use"],
+  )
+  assert.deepEqual(
+    body.content.map((block) => block.name),
+    ["get_weather", "get_time"],
+  )
+  assert.deepEqual(body.content[1].input, { tz: "EST" })
+})
+
+test("POST /v1/messages stream emits parallel tool_use blocks with distinct indexes", async () => {
+  const client = createParallelToolCallClient({ tools: PARALLEL_TOOLS })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      max_tokens: 100,
+      stream: true,
+      messages: [{ role: "user", content: "weather and time?" }],
+      tools: [
+        { name: "get_weather", input_schema: { type: "object" } },
+        { name: "get_time", input_schema: { type: "object" } },
+      ],
+    }),
+  })
+
+  const response = await handler(request)
+  const text = await response.text()
+  const starts = parseSseStream(text).filter(
+    (e) => e.event === "content_block_start" && e.data.content_block?.type === "tool_use",
+  )
+
+  assert.equal(starts.length, 2)
+  assert.deepEqual(
+    starts.map((e) => e.data.index),
+    [0, 1],
+  )
+  assert.deepEqual(
+    starts.map((e) => e.data.content_block.name),
+    ["get_weather", "get_time"],
+  )
+})
+
+test("POST /v1beta/models/:model:generateContent returns multiple functionCall parts for parallel tool use", async () => {
+  const client = createParallelToolCallClient({
+    tools: PARALLEL_TOOLS,
+    providers: [{ id: "google", models: { "gemini-2.0-flash": { id: "gemini-2.0-flash" } } }],
+  })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1beta/models/gemini-2.0-flash:generateContent", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: "weather and time?" }] }],
+      tools: [
+        {
+          functionDeclarations: [
+            { name: "get_weather", description: "Get weather" },
+            { name: "get_time", description: "Get time" },
+          ],
+        },
+      ],
+    }),
+  })
+
+  const response = await handler(request)
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  const parts = body.candidates[0].content.parts
+  assert.equal(parts.length, 2)
+  assert.deepEqual(
+    parts.map((part) => part.functionCall.name),
+    ["get_weather", "get_time"],
+  )
+  assert.deepEqual(parts[1].functionCall.args, { tz: "EST" })
+})
+
+
+
+describe("mcp-tool-bridge parseTools", () => {
+  it("parses a valid JSON array", () => {
+    const tools = parseTools('[{"name":"a"},{"name":"b"}]')
+    assert.deepEqual(tools, [{ name: "a" }, { name: "b" }])
+  })
+
+  it("defaults to an empty array when input is undefined", () => {
+    assert.deepEqual(parseTools(undefined), [])
+  })
+
+  it("returns an empty array and reports the error on malformed JSON", () => {
+    let reported
+    const tools = parseTools("{not json", (err) => {
+      reported = err
+    })
+    assert.deepEqual(tools, [])
+    assert.ok(reported instanceof Error)
+  })
+
+  it("returns an empty array when JSON is valid but not an array", () => {
+    assert.deepEqual(parseTools('{"name":"a"}'), [])
+  })
+})
+
+describe("mcp-tool-bridge dispatch", () => {
+  it("responds to initialize with server info and the requested protocol version", () => {
+    const response = dispatch({ id: 1, method: "initialize", params: { protocolVersion: "2025-01-01" } })
+    assert.equal(response.jsonrpc, "2.0")
+    assert.equal(response.id, 1)
+    assert.equal(response.result.protocolVersion, "2025-01-01")
+    assert.deepEqual(response.result.capabilities, { tools: {} })
+    assert.equal(response.result.serverInfo.name, "opencode-llm-proxy-bridge")
+  })
+
+  it("falls back to the default protocol version when none is supplied", () => {
+    const response = dispatch({ id: 1, method: "initialize" })
+    assert.equal(response.result.protocolVersion, "2024-11-05")
+  })
+
+  it("maps tool schemas into MCP tools/list shape", () => {
+    const tools = [
+      { name: "get_weather", description: "Get weather", parameters: { type: "object", properties: { city: {} } } },
+      { name: "no_desc" },
+    ]
+    const response = dispatch({ id: 2, method: "tools/list" }, tools)
+    assert.deepEqual(response.result.tools, [
+      { name: "get_weather", description: "Get weather", inputSchema: { type: "object", properties: { city: {} } } },
+      { name: "no_desc", description: "", inputSchema: { type: "object", properties: {} } },
+    ])
+  })
+
+  it("returns an empty tools list when no tools are configured", () => {
+    const response = dispatch({ id: 3, method: "tools/list" })
+    assert.deepEqual(response.result.tools, [])
+  })
+
+  it("responds to ping with an empty result", () => {
+    const response = dispatch({ id: 4, method: "ping" })
+    assert.deepEqual(response.result, {})
+  })
+
+  it("returns a placeholder text content for tools/call", () => {
+    const response = dispatch({ id: 5, method: "tools/call", params: { name: "x" } })
+    assert.equal(response.result.content[0].type, "text")
+    assert.match(response.result.content[0].text, /intercepted by opencode-llm-proxy/)
+  })
+
+  it("returns null (no response) for notifications/initialized", () => {
+    assert.equal(dispatch({ method: "notifications/initialized" }), null)
+  })
+
+  it("returns null for a request without an id", () => {
+    assert.equal(dispatch({ method: "ping" }), null)
+  })
+
+  it("returns a JSON-RPC method-not-found error for unknown methods", () => {
+    const response = dispatch({ id: 6, method: "does/not/exist" })
+    assert.equal(response.error.code, -32601)
+    assert.match(response.error.message, /Method not found: does\/not\/exist/)
+  })
+
+  it("does not emit an error response for an unknown method without an id", () => {
+    assert.equal(dispatch({ method: "does/not/exist" }), null)
+  })
+})
+
+describe("mcp-tool-bridge runStdioServer", () => {
+  function collect(stream) {
+    const chunks = []
+    stream.on("data", (chunk) => chunks.push(chunk.toString()))
+    return () => chunks.join("")
+  }
+
+  it("processes newline-delimited requests and writes JSON-RPC responses", async () => {
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const errorOutput = new PassThrough()
+    const readOutput = collect(output)
+    const readError = collect(errorOutput)
+    let ended = false
+
+    runStdioServer([{ name: "get_weather", description: "d", parameters: { type: "object" } }], {
+      input,
+      output,
+      errorOutput,
+      onEnd: () => {
+        ended = true
+      },
+    })
+
+    input.write('{"jsonrpc":"2.0","id":1,"method":"ping"}\n')
+    input.write('{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n')
+    input.write("\n") // blank line is ignored
+    input.write("{ not valid json\n") // malformed line goes to errorOutput
+    input.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n') // notification -> no output
+    input.end()
+
+    await delay(10)
+
+    const lines = readOutput()
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+
+    assert.equal(lines.length, 2)
+    assert.deepEqual(lines[0], { jsonrpc: "2.0", id: 1, result: {} })
+    assert.equal(lines[1].result.tools[0].name, "get_weather")
+    assert.match(readError(), /failed to parse message/)
+    assert.equal(ended, true)
+  })
+
+  it("reassembles a request split across multiple chunks", async () => {
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const readOutput = collect(output)
+
+    runStdioServer([], {
+      input,
+      output,
+      errorOutput: new PassThrough(),
+      onEnd: () => {},
+    })
+
+    input.write('{"jsonrpc":"2.0","id":')
+    await delay(5)
+    input.write('7,"method":"ping"}\n')
+    await delay(5)
+
+    assert.deepEqual(JSON.parse(readOutput().trim()), { jsonrpc: "2.0", id: 7, result: {} })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// OpenAIProxyPlugin (plugin entrypoint / server bootstrap)
+// ---------------------------------------------------------------------------
+
+describe("OpenAIProxyPlugin", () => {
+  const STATE_KEY = "__opencodeOpenAIProxyState"
+
+  function withMockedBun(serve, run) {
+    const savedBun = globalThis.Bun
+    delete globalThis[STATE_KEY]
+    globalThis.Bun = { serve }
+    return Promise.resolve()
+      .then(run)
+      .finally(() => {
+        if (savedBun === undefined) delete globalThis.Bun
+        else globalThis.Bun = savedBun
+        delete globalThis[STATE_KEY]
+      })
+  }
+
+  it("starts a Bun server and records it in global state", async () => {
+    const calls = []
+    const fakeServer = { stopped: false }
+
+    await withMockedBun(
+      (opts) => {
+        calls.push(opts)
+        return fakeServer
+      },
+      async () => {
+        process.env.OPENCODE_LLM_PROXY_HOST = "127.0.0.1"
+        process.env.OPENCODE_LLM_PROXY_PORT = "4999"
+        try {
+          const result = await OpenAIProxyPlugin({ client: createClient() })
+
+          assert.deepEqual(result, {})
+          assert.equal(calls.length, 1)
+          assert.equal(calls[0].hostname, "127.0.0.1")
+          assert.equal(calls[0].port, 4999)
+          assert.equal(typeof calls[0].fetch, "function")
+          assert.equal(globalThis[STATE_KEY].started, true)
+          assert.equal(globalThis[STATE_KEY].server, fakeServer)
+        } finally {
+          delete process.env.OPENCODE_LLM_PROXY_HOST
+          delete process.env.OPENCODE_LLM_PROXY_PORT
+        }
+      },
+    )
+  })
+
+  it("does not start a second server when already started", async () => {
+    let served = false
+
+    await withMockedBun(
+      () => {
+        served = true
+        return {}
+      },
+      async () => {
+        globalThis[STATE_KEY] = { started: true }
+        const result = await OpenAIProxyPlugin({ client: createClient() })
+
+        assert.deepEqual(result, {})
+        assert.equal(served, false)
+      },
+    )
+  })
+
+  it("returns gracefully when Bun.serve throws (e.g. port in use)", async () => {
+    await withMockedBun(
+      () => {
+        throw new Error("EADDRINUSE: port already in use")
+      },
+      async () => {
+        const result = await OpenAIProxyPlugin({ client: createClient() })
+
+        assert.deepEqual(result, {})
+        assert.equal(globalThis[STATE_KEY].server, undefined)
+      },
+    )
+  })
 })

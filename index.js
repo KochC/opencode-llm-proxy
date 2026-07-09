@@ -275,7 +275,7 @@ async function executePrompt(client, request, model, messages, system, callerToo
     const result = await runAgentTurn(client, model, messages, system, callerTools, () => {})
     return {
       content: result.content,
-      toolCall: result.toolCall,
+      toolCalls: result.toolCalls,
       request,
       sessionID: result.sessionID,
       completion: {
@@ -324,7 +324,7 @@ async function executePrompt(client, request, model, messages, system, callerToo
 
   return {
     content,
-    toolCall: null,
+    toolCalls: [],
     completion,
     request,
     sessionID: session.data.id,
@@ -337,7 +337,7 @@ async function executePromptStreaming(client, model, messages, system, onChunk, 
     sessionID: result.sessionID,
     tokens: result.tokens,
     finish: result.finish,
-    toolCall: result.toolCall,
+    toolCalls: result.toolCalls,
   }
 }
 
@@ -346,25 +346,25 @@ function createChatCompletionResponse(result, model) {
   const tokensIn = result.completion.data.info?.tokens?.input ?? 0
   const tokensOut = result.completion.data.info?.tokens?.output ?? 0
 
-  const message = result.toolCall
-    ? {
-        role: "assistant",
-        content: null,
-        tool_calls: [
-          {
-            id: result.toolCall.id,
+  const toolCalls = result.toolCalls ?? []
+  const message =
+    toolCalls.length > 0
+      ? {
+          role: "assistant",
+          content: null,
+          tool_calls: toolCalls.map((call) => ({
+            id: call.id,
             type: "function",
             function: {
-              name: result.toolCall.name,
-              arguments: JSON.stringify(result.toolCall.arguments ?? {}),
+              name: call.name,
+              arguments: JSON.stringify(call.arguments ?? {}),
             },
-          },
-        ],
-      }
-    : {
-        role: "assistant",
-        content: result.content,
-      }
+          })),
+        }
+      : {
+          role: "assistant",
+          content: result.content,
+        }
 
   return {
     id: `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`,
@@ -374,7 +374,7 @@ function createChatCompletionResponse(result, model) {
     choices: [
       {
         index: 0,
-        finish_reason: result.toolCall ? "tool_calls" : mapFinishReason(result.completion.data.info?.finish),
+        finish_reason: toolCalls.length > 0 ? "tool_calls" : mapFinishReason(result.completion.data.info?.finish),
         message,
       },
     ],
@@ -390,32 +390,32 @@ function createResponsesApiResponse(result, model) {
   const tokensIn = result.completion.data.info?.tokens?.input ?? 0
   const tokensOut = result.completion.data.info?.tokens?.output ?? 0
 
-  const output = result.toolCall
-    ? [
-        {
+  const toolCalls = result.toolCalls ?? []
+  const output =
+    toolCalls.length > 0
+      ? toolCalls.map((call) => ({
           id: `fc_${crypto.randomUUID().replace(/-/g, "")}`,
           type: "function_call",
-          call_id: result.toolCall.id,
-          name: result.toolCall.name,
-          arguments: JSON.stringify(result.toolCall.arguments ?? {}),
+          call_id: call.id,
+          name: call.name,
+          arguments: JSON.stringify(call.arguments ?? {}),
           status: "completed",
-        },
-      ]
-    : [
-        {
-          id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
-          type: "message",
-          status: "completed",
-          role: "assistant",
-          content: [
-            {
-              type: "output_text",
-              text: result.content,
-              annotations: [],
-            },
-          ],
-        },
-      ]
+        }))
+      : [
+          {
+            id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [
+              {
+                type: "output_text",
+                text: result.content,
+                annotations: [],
+              },
+            ],
+          },
+        ]
 
   return {
     id: `resp_${crypto.randomUUID().replace(/-/g, "")}`,
@@ -424,8 +424,8 @@ function createResponsesApiResponse(result, model) {
     status: "completed",
     model: model.id,
     output,
-    output_text: result.toolCall ? "" : result.content,
-    parallel_tool_calls: false,
+    output_text: toolCalls.length > 0 ? "" : result.content,
+    parallel_tool_calls: true,
     reasoning: {
       effort: result.request.reasoning?.effort ?? null,
       summary: null,
@@ -772,7 +772,37 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
 
   let errorMessage = null
   let content = ""
-  let toolCall = null
+  // Tool calls collected live off the event stream, keyed by callID so parallel calls
+  // and the pending -> running -> completed status updates for each collapse into one
+  // entry. session.messages() does NOT carry the tool parts in current OpenCode, so the
+  // live stream is the authoritative source here.
+  const toolCallsByID = new Map()
+  // The assistant message that carries this turn's tool calls. Once set, we only accept
+  // tool parts (and the terminating step-finish) from this same message, so a follow-up
+  // agent step can never leak spurious calls into the result.
+  let toolMessageID = null
+
+  const recordToolPart = (part) => {
+    const callID = part.callID
+    if (!callID) return
+    const input = part.state?.input
+    const hasInput =
+      input && typeof input === "object" && !Array.isArray(input) && Object.keys(input).length > 0
+    const existing = toolCallsByID.get(callID)
+    if (!existing) {
+      toolCallsByID.set(callID, {
+        id: callID,
+        name: bridge.nameMap.get(part.tool) ?? part.tool,
+        arguments: hasInput ? input : {},
+        hasInput: Boolean(hasInput),
+      })
+    } else if (hasInput && !existing.hasInput) {
+      // Upgrade from the empty-input "pending" snapshot to the populated one that
+      // arrives with "running"/"completed".
+      existing.arguments = input
+      existing.hasInput = true
+    }
+  }
 
   try {
     for await (const event of stream) {
@@ -794,19 +824,27 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         }
       } else if (event.type === "message.part.updated") {
         const part = event.properties?.part
+        if (!part || part.sessionID !== sessionID) continue
 
         if (
           toolIDSet &&
-          part?.sessionID === sessionID &&
-          part?.type === "tool" &&
+          part.type === "tool" &&
           toolIDSet.has(part.tool) &&
-          (part.state?.status === "pending" || part.state?.status === "running")
+          (!toolMessageID || part.messageID === toolMessageID)
         ) {
-          toolCall = {
-            id: part.callID,
-            name: bridge.nameMap.get(part.tool) ?? part.tool,
-            arguments: part.state.input ?? {},
-          }
+          // A bridge tool call. Input is empty on "pending" and only populated on
+          // "running"/"completed", so we keep updating until we have the arguments.
+          if (part.messageID) toolMessageID = part.messageID
+          recordToolPart(part)
+        } else if (
+          part.type === "step-finish" &&
+          toolCallsByID.size > 0 &&
+          (!toolMessageID || part.messageID === toolMessageID)
+        ) {
+          // The tool-calling step is complete: every tool call in this assistant
+          // message (including parallel ones) has now been observed with its arguments.
+          // Abort before OpenCode runs a follow-up step on the placeholder bridge
+          // results (which would waste tokens and could emit spurious calls).
           try {
             await client.session.abort({ path: { id: sessionID } })
           } catch {
@@ -829,7 +867,13 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     releaseToolBridge(bridge)
   }
 
-  if (errorMessage && !toolCall) {
+  const toolCalls = [...toolCallsByID.values()].map((call) => ({
+    id: call.id,
+    name: call.name,
+    arguments: call.arguments ?? {},
+  }))
+
+  if (errorMessage && toolCalls.length === 0) {
     throw new Error(errorMessage)
   }
 
@@ -843,16 +887,16 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   // multi-step turns, e.g. continuing a conversation with prior tool calls/results in
   // history): use the authoritative final text from the fetched message's parts
   // instead of leaving content empty.
-  if (!content && !toolCall) {
+  if (!content && toolCalls.length === 0) {
     content = extractAssistantText(assistantEntry?.parts ?? [])
   }
 
   return {
     sessionID,
     content,
-    toolCall,
+    toolCalls,
     tokens: assistantInfo?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    finish: toolCall ? "tool_calls" : assistantInfo?.finish,
+    finish: toolCalls.length > 0 ? "tool_calls" : assistantInfo?.finish,
   }
 }
 
@@ -1058,16 +1102,16 @@ export function mapFinishReasonToAnthropic(finish) {
 function createAnthropicResponse(result, model) {
   const tokensIn = result.completion.data.info?.tokens?.input ?? 0
   const tokensOut = result.completion.data.info?.tokens?.output ?? 0
-  const content = result.toolCall
-    ? [
-        {
+  const toolCalls = result.toolCalls ?? []
+  const content =
+    toolCalls.length > 0
+      ? toolCalls.map((call) => ({
           type: "tool_use",
-          id: result.toolCall.id,
-          name: result.toolCall.name,
-          input: result.toolCall.arguments ?? {},
-        },
-      ]
-    : [{ type: "text", text: result.content }]
+          id: call.id,
+          name: call.name,
+          input: call.arguments ?? {},
+        }))
+      : [{ type: "text", text: result.content }]
 
   return {
     id: `msg_${crypto.randomUUID().replace(/-/g, "")}`,
@@ -1075,7 +1119,7 @@ function createAnthropicResponse(result, model) {
     role: "assistant",
     content,
     model: model.id,
-    stop_reason: result.toolCall ? "tool_use" : mapFinishReasonToAnthropic(result.completion.data.info?.finish),
+    stop_reason: toolCalls.length > 0 ? "tool_use" : mapFinishReasonToAnthropic(result.completion.data.info?.finish),
     stop_sequence: null,
     usage: { input_tokens: tokensIn, output_tokens: tokensOut },
   }
@@ -1148,10 +1192,12 @@ export function mapFinishReasonToGemini(finish) {
   return "STOP"
 }
 
-function createGeminiResponse(content, finish, tokens, toolCall) {
-  const parts = toolCall
-    ? [{ functionCall: { name: toolCall.name, args: toolCall.arguments ?? {} } }]
-    : [{ text: content }]
+function createGeminiResponse(content, finish, tokens, toolCalls) {
+  const calls = toolCalls ?? []
+  const parts =
+    calls.length > 0
+      ? calls.map((call) => ({ functionCall: { name: call.name, args: call.arguments ?? {} } }))
+      : [{ text: content }]
 
   return {
     candidates: [
@@ -1265,7 +1311,8 @@ export function createProxyFetchHandler(client) {
             callerTools,
           )
             .then((streamResult) => {
-              if (streamResult.toolCall) {
+              const toolCalls = streamResult.toolCalls ?? []
+              if (toolCalls.length > 0) {
                 const toolCallChunk = JSON.stringify({
                   id: completionID,
                   object: "chat.completion.chunk",
@@ -1276,17 +1323,15 @@ export function createProxyFetchHandler(client) {
                       index: 0,
                       delta: {
                         role: "assistant",
-                        tool_calls: [
-                          {
-                            index: 0,
-                            id: streamResult.toolCall.id,
-                            type: "function",
-                            function: {
-                              name: streamResult.toolCall.name,
-                              arguments: JSON.stringify(streamResult.toolCall.arguments ?? {}),
-                            },
+                        tool_calls: toolCalls.map((call, index) => ({
+                          index,
+                          id: call.id,
+                          type: "function",
+                          function: {
+                            name: call.name,
+                            arguments: JSON.stringify(call.arguments ?? {}),
                           },
-                        ],
+                        })),
                       },
                       finish_reason: null,
                     },
@@ -1304,7 +1349,7 @@ export function createProxyFetchHandler(client) {
                   {
                     index: 0,
                     delta: {},
-                    finish_reason: streamResult.toolCall ? "tool_calls" : mapFinishReason(streamResult.finish),
+                    finish_reason: toolCalls.length > 0 ? "tool_calls" : mapFinishReason(streamResult.finish),
                   },
                 ],
                 usage: {
@@ -1462,53 +1507,58 @@ export function createProxyFetchHandler(client) {
             callerTools,
           )
             .then((streamResult) => {
-              if (streamResult.toolCall) {
-                const args = JSON.stringify(streamResult.toolCall.arguments ?? {})
-                const callItemID = `fc_${crypto.randomUUID().replace(/-/g, "")}`
-                queue.enqueue(
-                  sseEvent("response.output_item.added", {
-                    type: "response.output_item.added",
-                    output_index: 0,
-                    item: {
-                      id: callItemID,
-                      type: "function_call",
-                      status: "in_progress",
-                      call_id: streamResult.toolCall.id,
-                      name: streamResult.toolCall.name,
-                      arguments: "",
-                    },
-                  }),
-                )
-                queue.enqueue(
-                  sseEvent("response.function_call_arguments.delta", {
-                    type: "response.function_call_arguments.delta",
-                    item_id: callItemID,
-                    output_index: 0,
-                    delta: args,
-                  }),
-                )
-                queue.enqueue(
-                  sseEvent("response.function_call_arguments.done", {
-                    type: "response.function_call_arguments.done",
-                    item_id: callItemID,
-                    output_index: 0,
-                    arguments: args,
-                  }),
-                )
-                queue.enqueue(
-                  sseEvent("response.output_item.done", {
-                    type: "response.output_item.done",
-                    output_index: 0,
-                    item: {
-                      id: callItemID,
-                      type: "function_call",
-                      status: "completed",
-                      call_id: streamResult.toolCall.id,
-                      name: streamResult.toolCall.name,
+              const toolCalls = streamResult.toolCalls ?? []
+              if (toolCalls.length > 0) {
+                // Each parallel tool call is its own output item with a distinct output_index.
+                toolCalls.forEach((call, index) => {
+                  const args = JSON.stringify(call.arguments ?? {})
+                  const callItemID = `fc_${crypto.randomUUID().replace(/-/g, "")}`
+                  const outputIndex = index + 1
+                  queue.enqueue(
+                    sseEvent("response.output_item.added", {
+                      type: "response.output_item.added",
+                      output_index: outputIndex,
+                      item: {
+                        id: callItemID,
+                        type: "function_call",
+                        status: "in_progress",
+                        call_id: call.id,
+                        name: call.name,
+                        arguments: "",
+                      },
+                    }),
+                  )
+                  queue.enqueue(
+                    sseEvent("response.function_call_arguments.delta", {
+                      type: "response.function_call_arguments.delta",
+                      item_id: callItemID,
+                      output_index: outputIndex,
+                      delta: args,
+                    }),
+                  )
+                  queue.enqueue(
+                    sseEvent("response.function_call_arguments.done", {
+                      type: "response.function_call_arguments.done",
+                      item_id: callItemID,
+                      output_index: outputIndex,
                       arguments: args,
-                    },
-                  }),
-                )
+                    }),
+                  )
+                  queue.enqueue(
+                    sseEvent("response.output_item.done", {
+                      type: "response.output_item.done",
+                      output_index: outputIndex,
+                      item: {
+                        id: callItemID,
+                        type: "function_call",
+                        status: "completed",
+                        call_id: call.id,
+                        name: call.name,
+                        arguments: args,
+                      },
+                    }),
+                  )
+                })
                 queue.enqueue(
                   sseEvent("response.completed", {
                     type: "response.completed",
@@ -1716,23 +1766,29 @@ export function createProxyFetchHandler(client) {
             callerTools,
           )
             .then((streamResult) => {
-              if (streamResult.toolCall) {
+              const toolCalls = streamResult.toolCalls ?? []
+              if (toolCalls.length > 0) {
                 if (textBlockStarted) {
                   queue.enqueue(sseEvent("content_block_stop", { type: "content_block_stop", index: 0 }))
                 }
-                const blockIndex = textBlockStarted ? 1 : 0
-                const argsJson = JSON.stringify(streamResult.toolCall.arguments ?? {})
-                queue.enqueue(sseEvent("content_block_start", {
-                  type: "content_block_start",
-                  index: blockIndex,
-                  content_block: { type: "tool_use", id: streamResult.toolCall.id, name: streamResult.toolCall.name, input: {} },
-                }))
-                queue.enqueue(sseEvent("content_block_delta", {
-                  type: "content_block_delta",
-                  index: blockIndex,
-                  delta: { type: "input_json_delta", partial_json: argsJson },
-                }))
-                queue.enqueue(sseEvent("content_block_stop", { type: "content_block_stop", index: blockIndex }))
+                // Each parallel tool call is a separate tool_use content block. Block
+                // indexes follow the (optional) leading text block at index 0.
+                const baseIndex = textBlockStarted ? 1 : 0
+                toolCalls.forEach((call, i) => {
+                  const blockIndex = baseIndex + i
+                  const argsJson = JSON.stringify(call.arguments ?? {})
+                  queue.enqueue(sseEvent("content_block_start", {
+                    type: "content_block_start",
+                    index: blockIndex,
+                    content_block: { type: "tool_use", id: call.id, name: call.name, input: {} },
+                  }))
+                  queue.enqueue(sseEvent("content_block_delta", {
+                    type: "content_block_delta",
+                    index: blockIndex,
+                    delta: { type: "input_json_delta", partial_json: argsJson },
+                  }))
+                  queue.enqueue(sseEvent("content_block_stop", { type: "content_block_stop", index: blockIndex }))
+                })
                 queue.enqueue(sseEvent("message_delta", {
                   type: "message_delta",
                   delta: { stop_reason: "tool_use", stop_sequence: null },
@@ -1850,9 +1906,10 @@ export function createProxyFetchHandler(client) {
             callerTools,
           )
             .then((streamResult) => {
+              const toolCalls = streamResult.toolCalls ?? []
               const finalChunk = JSON.stringify(
-                streamResult.toolCall
-                  ? createGeminiResponse("", streamResult.finish, streamResult.tokens, streamResult.toolCall)
+                toolCalls.length > 0
+                  ? createGeminiResponse("", streamResult.finish, streamResult.tokens, toolCalls)
                   : createGeminiResponse("", streamResult.finish, streamResult.tokens),
               )
               queue.enqueue(finalChunk + "\n")
@@ -1901,7 +1958,7 @@ export function createProxyFetchHandler(client) {
         const result = await executePrompt(client, body, model, messages, system, callerTools)
         const finish = result.completion.data.info?.finish
         const tokens = result.completion.data.info?.tokens
-        return json(createGeminiResponse(result.content, finish, tokens, result.toolCall), 200, {}, request)
+        return json(createGeminiResponse(result.content, finish, tokens, result.toolCalls), 200, {}, request)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(client, "error", "Gemini proxy call failed", { error: message, requestedModel: geminiModelName })
