@@ -7,7 +7,7 @@ filenames below so existing references resolve.
 
 | File | Used by | Notes |
 |---|---|---|
-| `demo.gif` | README hero | 20–40s demo, referenced directly under the intro paragraph |
+| `demo.gif` | README hero | 20–40s demo. Once added, re-insert `![opencode-llm-proxy demo](docs/assets/demo.gif)` under the intro paragraph in the README |
 | `models-endpoint.png` | docs | `curl /v1/models` output |
 | `n8n-credential.png` | docs | n8n OpenAI credential configured with proxy base URL |
 | `open-webui-settings.png` | docs | Open WebUI connection settings |
@@ -33,5 +33,6 @@ filenames below so existing references resolve.
 - GitHub release page
 
 > These are placeholders documented in the promotion plan. Replace this note
-> with the actual media before publishing widely. Until `demo.gif` exists the
-> README image reference will show as broken.
+> with the actual media before publishing widely. The README image reference was
+> removed until `demo.gif` exists — re-add it (see the table above) once the GIF
+> is recorded.

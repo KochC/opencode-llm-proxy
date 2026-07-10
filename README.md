@@ -9,8 +9,6 @@
 
 opencode-llm-proxy is an [OpenCode](https://opencode.ai) plugin that starts a local HTTP server on `http://127.0.0.1:4010`. It translates between the API format your tool speaks and whichever LLM provider OpenCode has configured — so you never reconfigure the same models twice.
 
-![opencode-llm-proxy demo](docs/assets/demo.gif)
-
 ```
 Your tool (OpenAI / Anthropic / Gemini SDK, coding agent, etc.)
          │
