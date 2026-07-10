@@ -1,0 +1,21 @@
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "3000:8080"
+    environment:
+      # Point Open WebUI's OpenAI connection at opencode-llm-proxy.
+      # PROXY_HOST defaults to host.docker.internal (Docker Desktop / macOS / Windows).
+      # On a different machine, set PROXY_HOST to that machine's LAN IP in .env.
+      - OPENAI_API_BASE_URL=http://${PROXY_HOST:-host.docker.internal}:4010/v1
+      - OPENAI_API_KEY=${OPENCODE_LLM_PROXY_TOKEN}
+    extra_hosts:
+      # Lets host.docker.internal resolve on Linux Docker Engine too.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - open-webui:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  open-webui:
