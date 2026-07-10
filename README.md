@@ -32,6 +32,39 @@ Your tool (OpenAI / Anthropic / Gemini SDK, coding agent, etc.)
 
 ---
 
+## Works with
+
+| Tool / Client | API mode | Streaming | Tool calling | Notes |
+|---|---|---:|---:|---|
+| n8n AI Agent | OpenAI / Anthropic | yes | yes | Use native Chat Model credentials pointed at the proxy. See [recipe](docs/recipes/n8n.md) |
+| Open WebUI | OpenAI-compatible | yes | partial | Depends on Open WebUI feature support. See [recipe](docs/recipes/open-webui.md) |
+| LangChain | OpenAI / Anthropic | yes | yes | Works with normal SDK wrappers. See [recipe](docs/recipes/langchain.md) |
+| OpenAI SDK | Chat Completions / Responses | yes | yes | Use `baseURL` / `base_url` |
+| Anthropic SDK | Messages API | yes | yes | Use proxy base URL |
+| Gemini clients | Gemini-compatible | yes | yes | Use `/v1beta/models/...` endpoints |
+| Continue | OpenAI-compatible | yes | not primary | Good for editor model access. See [recipe](docs/recipes/continue.md) |
+| Zed | OpenAI-compatible | yes | not primary | Good for editor model access. See [recipe](docs/recipes/zed.md) |
+| Custom coding agents | OpenAI / Anthropic / Gemini | yes | yes | Best fit for client-executed tools. See [recipe](docs/recipes/custom-agent.md) |
+
+### SDKs & clients
+
+| Client | Endpoint type | Streaming | Tool calling | Notes |
+|---|---|---:|---:|---|
+| OpenAI SDK (JS/TS) | Chat Completions / Responses | yes | yes | Set `baseURL: ".../v1"` |
+| OpenAI SDK (Python) | Chat Completions / Responses | yes | yes | Set `base_url=".../v1"` |
+| Anthropic SDK (JS/TS) | Messages | yes | yes | Set `baseURL` to the proxy root (no `/v1`) |
+| Anthropic SDK (Python) | Messages | yes | yes | Set `base_url` to the proxy root (no `/v1`) |
+| Google Generative AI (JS) | Gemini `/v1beta` | yes | yes | Set `baseUrl` to the proxy root |
+| LangChain | OpenAI / Anthropic wrappers | yes | yes | `.bind_tools()` supported. See [recipe](docs/recipes/langchain.md) |
+| n8n | OpenAI / Anthropic | yes | yes | Native Chat Model + AI Agent nodes. See [recipe](docs/recipes/n8n.md) |
+| Open WebUI | OpenAI-compatible | yes | partial | Depends on Open WebUI feature support. See [recipe](docs/recipes/open-webui.md) |
+| Continue | OpenAI-compatible | yes | not primary | Editor chat/edit. See [recipe](docs/recipes/continue.md) |
+| Zed | OpenAI-compatible | yes | not primary | Editor chat/edit. See [recipe](docs/recipes/zed.md) |
+
+See also: [Security](docs/security.md) · [Comparisons](docs/comparisons.md) · [All recipes](docs/recipes/)
+
+---
+
 ## Contents
 
 - [Why](#why)
@@ -41,6 +74,9 @@ Your tool (OpenAI / Anthropic / Gemini SDK, coding agent, etc.)
 - [Tool calling](#tool-calling)
 - [Using with SDKs and tools](#using-with-sdks-and-tools)
   - [n8n](#n8n)
+- [Recipes](docs/recipes/)
+- [Security](docs/security.md)
+- [Comparisons](docs/comparisons.md)
 - [Finding model IDs](#finding-model-ids)
 - [API reference](#api-reference)
 - [How it works](#how-it-works)

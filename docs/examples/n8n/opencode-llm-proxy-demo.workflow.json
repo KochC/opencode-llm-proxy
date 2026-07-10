@@ -1,0 +1,111 @@
+{
+  "name": "opencode-llm-proxy demo",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "5f1a2b3c-0001-4a00-8000-000000000001",
+      "name": "When clicking 'Test workflow'",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-40, 300]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "github-copilot/claude-sonnet-4.6",
+          "cachedResultName": "github-copilot/claude-sonnet-4.6"
+        },
+        "options": {}
+      },
+      "id": "5f1a2b3c-0002-4a00-8000-000000000002",
+      "name": "OpenCode Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [220, 520],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "OpenCode Proxy"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "Explain what an n8n workflow is in two sentences.",
+        "messages": {}
+      },
+      "id": "5f1a2b3c-0003-4a00-8000-000000000003",
+      "name": "Basic LLM Chain",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [300, 180]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "What is 47 * 89? Use the calculator tool to be sure, then state the result.",
+        "options": {}
+      },
+      "id": "5f1a2b3c-0004-4a00-8000-000000000004",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [640, 300]
+    },
+    {
+      "parameters": {},
+      "id": "5f1a2b3c-0005-4a00-8000-000000000005",
+      "name": "Calculator",
+      "type": "@n8n/n8n-nodes-langchain.toolCalculator",
+      "typeVersion": 1,
+      "position": [640, 540]
+    },
+    {
+      "parameters": {
+        "content": "## opencode-llm-proxy demo\n\nBefore running:\n\n1. Start OpenCode with the proxy bound for network access:\n   `OPENCODE_LLM_PROXY_HOST=0.0.0.0 OPENCODE_LLM_PROXY_TOKEN=your-token opencode`\n2. Create an **OpenAI** credential named \"OpenCode Proxy\":\n   - Base URL: `http://<opencode-host-ip>:4010/v1`\n   - API Key: your token\n3. Open the **OpenCode Chat Model** node and pick a model from the dropdown\n   (it auto-populates from `GET /v1/models`).\n\nThe **Basic LLM Chain** shows simple prompt/response.\nThe **AI Agent** + **Calculator** shows real tool/function calling.",
+        "height": 300,
+        "width": 420
+      },
+      "id": "5f1a2b3c-0006-4a00-8000-000000000006",
+      "name": "Read me",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-560, 160]
+    }
+  ],
+  "connections": {
+    "When clicking 'Test workflow'": {
+      "main": [
+        [
+          { "node": "Basic LLM Chain", "type": "main", "index": 0 },
+          { "node": "AI Agent", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "OpenCode Chat Model": {
+      "ai_languageModel": [
+        [
+          { "node": "Basic LLM Chain", "type": "ai_languageModel", "index": 0 },
+          { "node": "AI Agent", "type": "ai_languageModel", "index": 0 }
+        ]
+      ]
+    },
+    "Calculator": {
+      "ai_tool": [
+        [
+          { "node": "AI Agent", "type": "ai_tool", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
