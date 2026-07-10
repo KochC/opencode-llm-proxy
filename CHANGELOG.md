@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.8.0...v1.9.0) (2026-07-10)
+
+
+### Features
+
+* parallel tool calls + integration docs ([#70](https://github.com/KochC/opencode-llm-proxy/issues/70)) ([03467c0](https://github.com/KochC/opencode-llm-proxy/commit/03467c0b3a488e64f15938aa0aab350f647fc53d))
+
 ## [1.8.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.7.1...v1.8.0) (2026-07-09)
 
 
