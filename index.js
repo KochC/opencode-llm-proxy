@@ -752,59 +752,62 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     toolsMap = buildToolsMap(baseTools, bridge)
   }
 
-  const session = await client.session.create({ body: { title: `Proxy: ${model.id}` } })
-  const sessionID = session.data.id
-  const prompt = buildPrompt(messages)
-  const toolIDSet = bridge ? new Set(bridge.toolIDs) : null
-
-  // Subscribe to the event stream before sending the prompt so we don't miss events.
-  const { stream } = await client.event.subscribe()
-
-  await client.session.promptAsync({
-    path: { id: sessionID },
-    body: {
-      model: { providerID: model.providerID, modelID: model.modelID },
-      system,
-      tools: toolsMap,
-      parts: [{ type: "text", text: prompt }],
-    },
-  })
-
-  let errorMessage = null
-  let content = ""
-  // Tool calls collected live off the event stream, keyed by callID so parallel calls
-  // and the pending -> running -> completed status updates for each collapse into one
-  // entry. session.messages() does NOT carry the tool parts in current OpenCode, so the
-  // live stream is the authoritative source here.
-  const toolCallsByID = new Map()
-  // The assistant message that carries this turn's tool calls. Once set, we only accept
-  // tool parts (and the terminating step-finish) from this same message, so a follow-up
-  // agent step can never leak spurious calls into the result.
-  let toolMessageID = null
-
-  const recordToolPart = (part) => {
-    const callID = part.callID
-    if (!callID) return
-    const input = part.state?.input
-    const hasInput =
-      input && typeof input === "object" && !Array.isArray(input) && Object.keys(input).length > 0
-    const existing = toolCallsByID.get(callID)
-    if (!existing) {
-      toolCallsByID.set(callID, {
-        id: callID,
-        name: bridge.nameMap.get(part.tool) ?? part.tool,
-        arguments: hasInput ? input : {},
-        hasInput: Boolean(hasInput),
-      })
-    } else if (hasInput && !existing.hasInput) {
-      // Upgrade from the empty-input "pending" snapshot to the populated one that
-      // arrives with "running"/"completed".
-      existing.arguments = input
-      existing.hasInput = true
-    }
-  }
-
+  // Wrap all work that happens after bridge acquisition in a try/finally so the
+  // slot is always returned to the pool even if session.create, event.subscribe,
+  // or session.promptAsync throw before the event-loop runs.
   try {
+    const session = await client.session.create({ body: { title: `Proxy: ${model.id}` } })
+    const sessionID = session.data.id
+    const prompt = buildPrompt(messages)
+    const toolIDSet = bridge ? new Set(bridge.toolIDs) : null
+
+    // Subscribe to the event stream before sending the prompt so we don't miss events.
+    const { stream } = await client.event.subscribe()
+
+    await client.session.promptAsync({
+      path: { id: sessionID },
+      body: {
+        model: { providerID: model.providerID, modelID: model.modelID },
+        system,
+        tools: toolsMap,
+        parts: [{ type: "text", text: prompt }],
+      },
+    })
+
+    let errorMessage = null
+    let content = ""
+    // Tool calls collected live off the event stream, keyed by callID so parallel calls
+    // and the pending -> running -> completed status updates for each collapse into one
+    // entry. session.messages() does NOT carry the tool parts in current OpenCode, so the
+    // live stream is the authoritative source here.
+    const toolCallsByID = new Map()
+    // The assistant message that carries this turn's tool calls. Once set, we only accept
+    // tool parts (and the terminating step-finish) from this same message, so a follow-up
+    // agent step can never leak spurious calls into the result.
+    let toolMessageID = null
+
+    const recordToolPart = (part) => {
+      const callID = part.callID
+      if (!callID) return
+      const input = part.state?.input
+      const hasInput =
+        input && typeof input === "object" && !Array.isArray(input) && Object.keys(input).length > 0
+      const existing = toolCallsByID.get(callID)
+      if (!existing) {
+        toolCallsByID.set(callID, {
+          id: callID,
+          name: bridge.nameMap.get(part.tool) ?? part.tool,
+          arguments: hasInput ? input : {},
+          hasInput: Boolean(hasInput),
+        })
+      } else if (hasInput && !existing.hasInput) {
+        // Upgrade from the empty-input "pending" snapshot to the populated one that
+        // arrives with "running"/"completed".
+        existing.arguments = input
+        existing.hasInput = true
+      }
+    }
+
     for await (const event of stream) {
       if (event.type === "message.part.delta") {
         // Real incremental token deltas arrive here, as flat properties (sessionID,
@@ -863,40 +866,40 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         }
       }
     }
+
+    const toolCalls = [...toolCallsByID.values()].map((call) => ({
+      id: call.id,
+      name: call.name,
+      arguments: call.arguments ?? {},
+    }))
+
+    if (errorMessage && toolCalls.length === 0) {
+      throw new Error(errorMessage)
+    }
+
+    // Each list item is { info: Message, parts: Part[] } - matching the shape
+    // client.session.prompt() (the non-tool-calling path) already returns directly.
+    const messagesResult = await client.session.messages({ path: { id: sessionID } })
+    const assistantEntry = (messagesResult.data ?? []).filter((m) => m.info?.role === "assistant").at(-1)
+    const assistantInfo = assistantEntry?.info
+
+    // Fallback for turns where message.part.delta never fired (observed for some
+    // multi-step turns, e.g. continuing a conversation with prior tool calls/results in
+    // history): use the authoritative final text from the fetched message's parts
+    // instead of leaving content empty.
+    if (!content && toolCalls.length === 0) {
+      content = extractAssistantText(assistantEntry?.parts ?? [])
+    }
+
+    return {
+      sessionID,
+      content,
+      toolCalls,
+      tokens: assistantInfo?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      finish: toolCalls.length > 0 ? "tool_calls" : assistantInfo?.finish,
+    }
   } finally {
     releaseToolBridge(bridge)
-  }
-
-  const toolCalls = [...toolCallsByID.values()].map((call) => ({
-    id: call.id,
-    name: call.name,
-    arguments: call.arguments ?? {},
-  }))
-
-  if (errorMessage && toolCalls.length === 0) {
-    throw new Error(errorMessage)
-  }
-
-  // Each list item is { info: Message, parts: Part[] } - matching the shape
-  // client.session.prompt() (the non-tool-calling path) already returns directly.
-  const messagesResult = await client.session.messages({ path: { id: sessionID } })
-  const assistantEntry = (messagesResult.data ?? []).filter((m) => m.info?.role === "assistant").at(-1)
-  const assistantInfo = assistantEntry?.info
-
-  // Fallback for turns where message.part.delta never fired (observed for some
-  // multi-step turns, e.g. continuing a conversation with prior tool calls/results in
-  // history): use the authoritative final text from the fetched message's parts
-  // instead of leaving content empty.
-  if (!content && toolCalls.length === 0) {
-    content = extractAssistantText(assistantEntry?.parts ?? [])
-  }
-
-  return {
-    sessionID,
-    content,
-    toolCalls,
-    tokens: assistantInfo?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    finish: toolCalls.length > 0 ? "tool_calls" : assistantInfo?.finish,
   }
 }
 
