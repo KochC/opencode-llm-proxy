@@ -2511,6 +2511,66 @@ describe("buildToolsMap / registerToolBridge slot isolation", () => {
     assert.ok(bridge.slotName)
     after(() => releaseToolBridge(bridge))
   })
+
+  // Regression test for issue #73: if session.create / event.subscribe / session.promptAsync
+  // throws *after* registerToolBridge() has already handed out a slot, the slot must still
+  // be returned to the pool by the outer try/finally in runAgentTurn(). Without the fix, the
+  // slot was only released inside the inner event-loop try/finally that was never entered,
+  // so any throw between bridge acquisition and the event loop would permanently lose the slot.
+  it("releases the bridge slot when session.create throws after bridge acquisition", async () => {
+    // Build a minimal client whose session.create always fails, simulating any error in the
+    // window between bridge acquisition and the start of the event-loop try/finally.
+    let callCount = 0
+    const client = {
+      tool: { ids: async () => ({ data: [] }) },
+      config: {
+        providers: async () => ({
+          data: {
+            providers: [{ id: "p", models: { m: { id: "m" } } }],
+          },
+        }),
+      },
+      mcp: {
+        disconnect: async () => { throw new Error("not connected") },
+        add: async () => ({ data: {} }),
+      },
+      session: {
+        create: async () => {
+          callCount++
+          throw new Error("session.create failed")
+        },
+      },
+      event: { subscribe: async () => ({ stream: (async function* () {})() }) },
+    }
+
+    const handler = createProxyFetchHandler(client)
+    const makeRequest = () => new Request("http://127.0.0.1:4010/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "p/m",
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "function", function: { name: "my_tool", description: "A tool" } }],
+      }),
+    })
+
+    const timeout = delay(3000).then(() => {
+      throw new Error("timed out - bridge slot was leaked after session.create threw")
+    })
+
+    // Fire many more requests than the pool size. If any slot leaks, the pool is exhausted
+    // and acquireBridgeSlot() hangs forever - caught by the timeout race.
+    await Promise.race([
+      (async () => {
+        for (let i = 0; i < 20; i++) {
+          await handler(makeRequest())
+        }
+      })(),
+      timeout,
+    ])
+
+    assert.ok(callCount >= 20, "session.create should have been called for each request")
+  })
 })
 
 test("POST /v1beta/models/:model:generateContent returns a functionCall part", async () => {
