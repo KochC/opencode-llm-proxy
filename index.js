@@ -16,14 +16,21 @@ function corsHeaders(request) {
   const requestedMethod = request?.headers.get("access-control-request-method")
   const requestedPrivateNetwork = request?.headers.get("access-control-request-private-network")
   const requestOrigin = request?.headers.get("origin") ?? ""
-  const allowOrigin = configuredOrigin === "*" ? "*" : (requestOrigin === configuredOrigin ? requestOrigin : configuredOrigin)
+  // When a specific origin is configured, only echo it back when the request
+  // origin matches exactly. On a mismatch we omit the header entirely so that
+  // browsers block the cross-origin request and the configured origin is not
+  // disclosed to untrusted callers.
+  const allowOrigin = configuredOrigin === "*" ? "*" : (requestOrigin === configuredOrigin ? requestOrigin : null)
 
   const headers = {
     vary: "origin, access-control-request-method, access-control-request-headers",
-    "access-control-allow-origin": allowOrigin,
     "access-control-allow-headers": requestedHeaders ?? "authorization, content-type, x-opencode-provider",
     "access-control-allow-methods": requestedMethod ?? "GET, POST, OPTIONS",
     "access-control-max-age": "86400",
+  }
+
+  if (allowOrigin !== null) {
+    headers["access-control-allow-origin"] = allowOrigin
   }
 
   if (requestedPrivateNetwork === "true") {
