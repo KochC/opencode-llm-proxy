@@ -162,14 +162,14 @@ test("health response includes CORS headers", async () => {
   assert.deepEqual(body, { healthy: true, service: "opencode-openai-proxy" })
 })
 
-test("configured origin is returned for normal requests", async () => {
+test("configured origin is returned when request origin matches", async () => {
   process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN = "https://console.example.com"
 
   try {
     const handler = createProxyFetchHandler(createClient())
     const request = new Request("http://127.0.0.1:4010/health", {
       headers: {
-        Origin: "https://app.example.com",
+        Origin: "https://console.example.com",
       },
     })
 
@@ -181,7 +181,7 @@ test("configured origin is returned for normal requests", async () => {
   }
 })
 
-test("disallowed origin does not receive its own origin back", async () => {
+test("disallowed origin does not receive access-control-allow-origin header", async () => {
   process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN = "https://allowed.example.com"
 
   try {
@@ -192,9 +192,9 @@ test("disallowed origin does not receive its own origin back", async () => {
 
     const response = await handler(request)
 
-    // The header must be the configured origin, not the request's origin
-    assert.equal(response.headers.get("access-control-allow-origin"), "https://allowed.example.com")
-    assert.notEqual(response.headers.get("access-control-allow-origin"), "https://evil.example.com")
+    // On an origin mismatch the header must be absent so neither the
+    // configured origin is leaked nor the browser grants cross-origin access.
+    assert.equal(response.headers.get("access-control-allow-origin"), null)
   } finally {
     delete process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN
   }
@@ -211,7 +211,7 @@ test("request with no Origin header is handled gracefully", async () => {
   assert.equal(response.headers.get("access-control-allow-origin"), "*")
 })
 
-test("OPTIONS preflight for disallowed origin returns configured origin, not request origin", async () => {
+test("OPTIONS preflight for disallowed origin omits access-control-allow-origin header", async () => {
   process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN = "https://allowed.example.com"
 
   try {
@@ -227,8 +227,9 @@ test("OPTIONS preflight for disallowed origin returns configured origin, not req
     const response = await handler(request)
 
     assert.equal(response.status, 204)
-    assert.equal(response.headers.get("access-control-allow-origin"), "https://allowed.example.com")
-    assert.notEqual(response.headers.get("access-control-allow-origin"), "https://evil.example.com")
+    // The configured origin must not be disclosed on a mismatch; the header
+    // should be absent so the preflight is rejected by the browser.
+    assert.equal(response.headers.get("access-control-allow-origin"), null)
   } finally {
     delete process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN
   }
