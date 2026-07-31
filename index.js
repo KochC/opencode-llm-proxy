@@ -1,6 +1,15 @@
 import { fileURLToPath } from "node:url"
 import { Buffer } from "node:buffer"
 import { timingSafeEqual } from "node:crypto"
+import {
+  adaptAnthropic,
+  adaptGemini,
+  adaptOpenAIChat,
+  adaptOpenAIResponses,
+  renderOpenCodePrompt,
+} from "./canonical-messages.js"
+import { getMetrics } from "./metrics.js"
+import { MediaError, prepareMedia } from "./remote-media.js"
 
 const STATE_KEY = "__opencodeOpenAIProxyState"
 const BRIDGE_SCRIPT_PATH = fileURLToPath(new URL("./mcp-tool-bridge.js", import.meta.url))
@@ -18,6 +27,7 @@ const DEFAULTS = Object.freeze({
   maxConcurrentRequests: 8,
   maxQueuedRequests: 32,
   bridgeAcquireTimeoutMs: 10000,
+  bridgeMaxQueue: 32,
 })
 
 class ProxyError extends Error {
@@ -63,22 +73,46 @@ function objectEnv(name) {
   }
 }
 
+function booleanEnv(name, fallback = false) {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === "") return fallback
+  if (raw === "true") return true
+  if (raw === "false") return false
+  throw new ProxyError(`${name} must be 'true' or 'false'.`, 500, "invalid_config")
+}
+
+function jsonArrayEnvDefault(name, fallback) {
+  return process.env[name]?.trim() ? jsonArrayEnv(name) : [...fallback]
+}
+
 function loadConfig() {
   const legacyToken = process.env.OPENCODE_LLM_PROXY_TOKEN?.trim()
   const configuredOrigin = process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN?.trim()
   const origins = jsonArrayEnv("OPENCODE_LLM_PROXY_CORS_ORIGINS")
   if (configuredOrigin) origins.push(configuredOrigin)
+  const maxRequestBytes = integerEnv("OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES", DEFAULTS.maxRequestBytes, { min: 1, max: 100 * 1024 * 1024 })
   return {
     tokens: [...new Set([legacyToken, ...jsonArrayEnv("OPENCODE_LLM_PROXY_TOKENS")].filter(Boolean))],
     corsOrigins: [...new Set(origins)],
     allowPrivateNetwork: process.env.OPENCODE_LLM_PROXY_ALLOW_PRIVATE_NETWORK === "true",
     requestTimeoutMs: integerEnv("OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS", DEFAULTS.requestTimeoutMs, { min: 1, max: 3600000 }),
-    maxRequestBytes: integerEnv("OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES", DEFAULTS.maxRequestBytes, { min: 1, max: 100 * 1024 * 1024 }),
+    maxRequestBytes,
     maxConcurrentRequests: integerEnv("OPENCODE_LLM_PROXY_MAX_CONCURRENT_REQUESTS", DEFAULTS.maxConcurrentRequests, { min: 1, max: 1000 }),
     maxQueuedRequests: integerEnv("OPENCODE_LLM_PROXY_MAX_QUEUED_REQUESTS", DEFAULTS.maxQueuedRequests, { min: 0, max: 10000 }),
     bridgeAcquireTimeoutMs: integerEnv("OPENCODE_LLM_PROXY_TOOL_BRIDGE_ACQUIRE_TIMEOUT_MS", DEFAULTS.bridgeAcquireTimeoutMs, { min: 1, max: 3600000 }),
+    bridgeMaxQueue: integerEnv("OPENCODE_LLM_PROXY_TOOL_BRIDGE_MAX_QUEUE", DEFAULTS.bridgeMaxQueue, { min: 0, max: 10000 }),
     keepSessions: process.env.OPENCODE_LLM_PROXY_KEEP_SESSIONS === "true",
     aliases: objectEnv("OPENCODE_LLM_PROXY_MODEL_ALIASES"),
+    metricsEnabled: booleanEnv("OPENCODE_LLM_PROXY_METRICS_ENABLED"),
+    remoteMedia: {
+      enabled: booleanEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_ENABLED"),
+      allowedSchemes: jsonArrayEnvDefault("OPENCODE_LLM_PROXY_REMOTE_MEDIA_ALLOWED_SCHEMES", ["https"]),
+      maxBytes: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_BYTES", maxRequestBytes || 1024 * 1024, { min: 1, max: 100 * 1024 * 1024 }),
+      maxItems: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_ITEMS", 4, { min: 0, max: 10000 }),
+      maxTotalItems: integerEnv("OPENCODE_LLM_PROXY_MAX_MEDIA_ITEMS", 64, { min: 1, max: 10000 }),
+      maxRedirects: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_REDIRECTS", 3, { min: 0, max: 100 }),
+      timeoutMs: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_TIMEOUT_MS", 10000, { min: 1, max: 3600000 }),
+    },
   }
 }
 
@@ -149,12 +183,13 @@ function unauthorized(request) {
   )
 }
 
-function badRequest(message, status = 400, request) {
+function badRequest(message, status = 400, request, code) {
   return json(
     {
       error: {
         message,
         type: "invalid_request_error",
+        ...(code ? { code } : {}),
       },
     },
     status,
@@ -276,8 +311,11 @@ function getRequestLimiter(config) {
 
 async function acquireRequestSlot(config, signal) {
   const limiter = getRequestLimiter(config)
+  const metrics = getMetrics()
+  if (signal?.aborted) throw signal.reason ?? new ProxyError("Request was cancelled.", 499, "cancelled")
   if (limiter.active < config.maxConcurrentRequests) {
     limiter.active++
+    metrics.setActiveRequests(limiter.active)
     return () => releaseRequestSlot(limiter)
   }
   if (limiter.waiters.length >= config.maxQueuedRequests) {
@@ -289,6 +327,8 @@ async function acquireRequestSlot(config, signal) {
     const onAbort = () => {
       if (!waiter.active) return
       waiter.active = false
+      limiter.waiters = limiter.waiters.filter((entry) => entry !== waiter)
+      metrics.setQueuedRequests(limiter.waiters.length)
       cleanup()
       reject(signal.reason ?? new ProxyError("Request was cancelled.", 499, "cancelled"))
     }
@@ -297,19 +337,84 @@ async function acquireRequestSlot(config, signal) {
       waiter.active = false
       cleanup()
       limiter.active++
+      metrics.setActiveRequests(limiter.active)
+      metrics.setQueuedRequests(limiter.waiters.filter((entry) => entry.active).length)
       resolve(() => releaseRequestSlot(limiter))
       return true
     }
     limiter.waiters.push(waiter)
+    metrics.setQueuedRequests(limiter.waiters.length)
     signal?.addEventListener("abort", onAbort, { once: true })
   })
 }
 
 function releaseRequestSlot(limiter) {
   limiter.active = Math.max(0, limiter.active - 1)
+  getMetrics().setActiveRequests(limiter.active)
   while (limiter.waiters.length > 0) {
     const waiter = limiter.waiters.shift()
     if (waiter.resolve()) return
+  }
+}
+
+function renderedSystem(canonicalSystem) {
+  return [
+    canonicalSystem,
+    "You are answering through a proxy backed by OpenCode.",
+    "Return only the assistant's reply content.",
+  ].filter(Boolean).join("\n\n")
+}
+
+async function prepareCanonicalRequest(canonical, config, signal, candidates = []) {
+  const rendered = renderOpenCodePrompt(canonical)
+  for (const part of rendered.media) {
+    const kind = part.mime === "application/pdf" ? "pdf" : part.mime.split("/", 1)[0]
+    if (candidates.length > 0 && candidates.every((model) => model.capabilities?.input?.[kind] === false)) {
+      throw new ProxyError(`The selected model does not support ${kind} input.`, 400, "unsupported_media")
+    }
+  }
+  let finishRemoteMedia
+  let remoteMediaBytes = 0
+  let remoteMediaRedirects = 0
+  let remoteMediaStarted = 0
+  const finish = (outcome) => {
+    finishRemoteMedia?.({
+      outcome,
+      bytes: remoteMediaBytes,
+      redirects: remoteMediaRedirects,
+      durationMs: Date.now() - remoteMediaStarted,
+    })
+    finishRemoteMedia = undefined
+  }
+  try {
+    const media = await prepareMedia(rendered.media, config.remoteMedia, signal, {
+      increment(name, value = 1) {
+        if (name === "remoteMediaAttempts") {
+          remoteMediaBytes = 0
+          remoteMediaRedirects = 0
+          remoteMediaStarted = Date.now()
+          finishRemoteMedia = getMetrics().startRemoteMedia()
+        } else if (name === "remoteMediaBytes") {
+          remoteMediaBytes += value
+        } else if (name === "remoteMediaRedirects") {
+          remoteMediaRedirects += value
+        } else if (name === "remoteMediaDownloads") {
+          finish("success")
+        }
+      },
+    })
+    return { messages: [{ role: "user", content: rendered.text }], system: renderedSystem(rendered.system), media }
+  } catch (error) {
+    const outcome = error?.code === "media_timeout"
+      ? "timeout"
+      : error?.code === "media_aborted"
+        ? "cancelled"
+        : error?.status === 400 || error?.status === 413 || error?.status === 415
+          ? "rejected"
+          : "error"
+    finish(outcome)
+    if (error instanceof MediaError) throw new ProxyError(error.message, error.status, error.code)
+    throw error
   }
 }
 
@@ -791,14 +896,23 @@ function getToolBridgeState() {
 
 async function acquireBridgeSlot(options = {}) {
   const bridgeState = getToolBridgeState()
+  if (options.signal?.aborted) throw options.signal.reason ?? new ProxyError("Request was cancelled.", 499, "cancelled")
   if (bridgeState.freeSlots.length > 0) {
     return bridgeState.freeSlots.shift()
   }
+  if (bridgeState.waiters.filter((waiter) => waiter.active).length >= (options.maxQueue ?? DEFAULTS.bridgeMaxQueue)) {
+    throw new ProxyError("Tool capacity is busy. Try again later.", 429, "tool_capacity_overloaded")
+  }
   return new Promise((resolve, reject) => {
     const waiter = { active: true }
+    const removeWaiter = () => {
+      bridgeState.waiters = bridgeState.waiters.filter((entry) => entry !== waiter)
+    }
     const timeout = setTimeout(() => {
       if (!waiter.active) return
       waiter.active = false
+      removeWaiter()
+      options.signal?.removeEventListener("abort", onAbort)
       reject(new ProxyError("Timed out waiting for tool capacity.", 503, "tool_capacity_timeout"))
     }, options.timeoutMs ?? DEFAULTS.bridgeAcquireTimeoutMs)
     timeout.unref?.()
@@ -806,6 +920,7 @@ async function acquireBridgeSlot(options = {}) {
       if (!waiter.active) return
       waiter.active = false
       clearTimeout(timeout)
+      removeWaiter()
       reject(options.signal.reason ?? new ProxyError("Request was cancelled.", 499, "cancelled"))
     }
     waiter.resolve = (slot) => {
@@ -1037,11 +1152,14 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     bridge = await registerToolBridge(client, callerTools, {
       signal: options.signal,
       timeoutMs: options.bridgeAcquireTimeoutMs,
+      maxQueue: options.bridgeMaxQueue,
     })
     toolsMap = buildToolsMap(baseTools, bridge)
   }
 
   let sessionID
+  let eventStream
+  let removeAbortListener = () => {}
   const toolIDSet = bridge ? new Set(bridge.toolIDs) : null
 
   let errorMessage = null
@@ -1083,9 +1201,11 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     sessionID = session.data.id
     setGenerationControls(sessionID, options.controls)
     const onAbort = () => client.session.abort?.({ path: { id: sessionID } }).catch(() => {})
+    removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort)
     options.signal?.addEventListener("abort", onAbort, { once: true })
     // Subscribe before prompting so no events are missed.
     const { stream } = await client.event.subscribe({ signal: options.signal })
+    eventStream = stream
     await client.session.promptAsync({
       path: { id: sessionID },
       signal: options.signal,
@@ -1156,11 +1276,16 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         }
       }
     }
-    options.signal?.removeEventListener("abort", onAbort)
   } catch (error) {
     await deleteSession(client, sessionID, options.keepSessions)
     throw error
   } finally {
+    removeAbortListener()
+    try {
+      await eventStream?.return?.()
+    } catch {
+      // Signal and session cleanup remain authoritative if iterator disposal fails.
+    }
     clearGenerationControls(sessionID)
     releaseToolBridge(bridge)
   }
@@ -1232,6 +1357,12 @@ async function listModels(client) {
 
 export async function resolveModel(client, requestedModel, providerOverride) {
   const allModels = await listModels(client)
+  if (providerOverride && requestedModel.includes("/")) {
+    const [providerID] = requestedModel.split("/")
+    if (providerID !== providerOverride) {
+      throw new Error(`Model '${requestedModel}' does not match provider override '${providerOverride}'.`)
+    }
+  }
   if (providerOverride) {
     const match = allModels.find(
       (model) => model.providerID === providerOverride && model.modelID === requestedModel,
@@ -1279,12 +1410,27 @@ function isRetryableError(error) {
   return !error?.message?.toLowerCase().includes("invalid")
 }
 
+function upstreamOutcome(error) {
+  if (error?.code === "timeout" || error?.status === 504) return "timeout"
+  if (error?.code === "cancelled" || error?.status === 499) return "cancelled"
+  return "error"
+}
+
+function recordExecutionMetrics(result) {
+  const tokens = result?.tokens ?? result?.completion?.data?.info?.tokens
+  getMetrics().recordUpstreamAttempt("success")
+  if (tokens) getMetrics().recordTokens(tokens)
+}
+
 async function executeWithFallback(candidates, operation) {
   let lastError
   for (const candidate of candidates) {
     try {
-      return { result: await operation(candidate), model: candidate }
+      const result = await operation(candidate)
+      recordExecutionMetrics(result)
+      return { result, model: candidate }
     } catch (error) {
+      getMetrics().recordUpstreamAttempt(upstreamOutcome(error))
       lastError = error
       if (!isRetryableError(error)) throw error
     }
@@ -1296,8 +1442,11 @@ async function executeStreamingWithFallback(candidates, operation, hasOutput) {
   let lastError
   for (const candidate of candidates) {
     try {
-      return { result: await operation(candidate), model: candidate }
+      const result = await operation(candidate)
+      recordExecutionMetrics(result)
+      return { result, model: candidate }
     } catch (error) {
+      getMetrics().recordUpstreamAttempt(upstreamOutcome(error))
       lastError = error
       if (hasOutput() || !isRetryableError(error)) throw error
     }
@@ -1556,57 +1705,6 @@ export function normalizeGeminiContents(contents) {
     .filter((m) => m.content.length > 0)
 }
 
-function openAIMedia(messages) {
-  const media = []
-  for (const message of messages ?? []) {
-    for (const part of Array.isArray(message?.content) ? message.content : []) {
-      if (part?.type === "image_url") {
-        const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url
-        if (url) media.push({ type: "file", mime: /^data:([^;,]+)/.exec(url)?.[1] ?? "image/*", url })
-      } else if (part?.type === "input_image" && (part.image_url || part.file_data)) {
-        const url = part.image_url ?? part.file_data
-        media.push({ type: "file", mime: /^data:([^;,]+)/.exec(url)?.[1] ?? "image/*", url })
-      } else if (part?.type === "input_file" && (part.file_data || part.file_url)) {
-        const url = part.file_data ?? part.file_url
-        media.push({ type: "file", mime: part.mime_type ?? /^data:([^;,]+)/.exec(url)?.[1] ?? "application/octet-stream", url, filename: part.filename })
-      }
-    }
-  }
-  return media
-}
-
-function anthropicMedia(messages) {
-  const media = []
-  for (const message of messages ?? []) {
-    for (const block of Array.isArray(message?.content) ? message.content : []) {
-      if (!block || !["image", "document"].includes(block.type)) continue
-      const source = block.source
-      if (source?.type === "base64" && source.media_type && source.data) {
-        media.push({ type: "file", mime: source.media_type, url: `data:${source.media_type};base64,${source.data}` })
-      } else if (source?.type === "url" && source.url) {
-        media.push({ type: "file", mime: block.type === "image" ? "image/*" : "application/pdf", url: source.url })
-      }
-    }
-  }
-  return media
-}
-
-function geminiMedia(contents) {
-  const media = []
-  for (const item of contents ?? []) {
-    for (const part of item?.parts ?? []) {
-      const inline = part?.inlineData ?? part?.inline_data
-      const file = part?.fileData ?? part?.file_data
-      if (inline?.mimeType && inline.data) {
-        media.push({ type: "file", mime: inline.mimeType, url: `data:${inline.mimeType};base64,${inline.data}` })
-      } else if (file?.mimeType && file.fileUri) {
-        media.push({ type: "file", mime: file.mimeType, url: file.fileUri })
-      }
-    }
-  }
-  return media
-}
-
 function generationControls(body) {
   const source = body.generationConfig ?? body
   const controls = {}
@@ -1679,7 +1777,7 @@ function geminiModelFromPath(pathname) {
 
 export function createProxyFetchHandler(client) {
   const config = loadConfig()
-  return async (request) => {
+  const handleRequest = async (request) => {
     const url = new URL(request.url)
     const origin = request.headers.get("origin")
 
@@ -1721,6 +1819,7 @@ export function createProxyFetchHandler(client) {
       signal: context.signal,
       maxRequestBytes: config.maxRequestBytes,
       bridgeAcquireTimeoutMs: config.bridgeAcquireTimeoutMs,
+      bridgeMaxQueue: config.bridgeMaxQueue,
       keepSessions: config.keepSessions,
     }
     const streamCleanup = once(() => {
@@ -1737,6 +1836,16 @@ export function createProxyFetchHandler(client) {
 
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ healthy: true, service: "opencode-openai-proxy" }, 200, {}, request)
+    }
+
+    if (request.method === "GET" && url.pathname === "/metrics" && config.metricsEnabled) {
+      return new Response(getMetrics().metrics(), {
+        status: 200,
+        headers: {
+          ...commonHeaders(request, config),
+          "content-type": "text/plain; version=0.0.4; charset=utf-8",
+        },
+      })
     }
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
@@ -1767,15 +1876,20 @@ export function createProxyFetchHandler(client) {
         return badRequest("The 'messages' field must contain at least one message.", 400, request)
       }
 
-      const messages = normalizeMessages(body.messages)
-      const media = openAIMedia(body.messages)
-      if (messages.length === 0 && media.length === 0) {
-        return badRequest("No text content was found in the supplied messages.", 400, request)
+      const callerTools = applyOpenAIToolChoice(parseOpenAITools(body), body.tool_choice)
+      let format
+      let controls
+      try {
+        validateUnsupportedControls(body)
+        format = structuredFormat(body)
+        if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request")
+        controls = generationControls(body)
+      } catch (error) {
+        return badRequest(error.message, error.status ?? 400, request)
       }
 
       let candidates
       try {
-        validateUnsupportedControls(body)
         const providerOverride = request.headers.get("x-opencode-provider")
         candidates = await resolveModelCandidates(client, body.model, providerOverride, config.aliases)
       } catch (error) {
@@ -1787,16 +1901,17 @@ export function createProxyFetchHandler(client) {
         return badRequest(error instanceof ProxyError ? message : "The requested model is unavailable.", error.status ?? 400, request)
       }
 
-      const system = buildSystemPrompt(messages, body)
-      const callerTools = applyOpenAIToolChoice(parseOpenAITools(body), body.tool_choice)
-      let requestOptions
+      let prepared
       try {
-        const format = structuredFormat(body)
-        if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request")
-        requestOptions = { ...options, media, format, controls: generationControls(body), variant: request.headers.get("x-opencode-variant") ?? undefined }
+        prepared = await prepareCanonicalRequest(adaptOpenAIChat(body), config, context.signal, candidates)
       } catch (error) {
-        return badRequest(error.message, error.status ?? 400, request)
+        return badRequest(error.message, error.status ?? 400, request, error.code)
       }
+      const { messages, system, media } = prepared
+      if (!messages[0].content.trim() && media.length === 0) {
+        return badRequest("No text content was found in the supplied messages.", 400, request)
+      }
+      const requestOptions = { ...options, media, format, controls, variant: request.headers.get("x-opencode-variant") ?? undefined }
       let model = candidates[0]
 
       if (body.stream) {
@@ -1936,27 +2051,20 @@ export function createProxyFetchHandler(client) {
         return badRequest("The 'model' field is required.", 400, request)
       }
 
-      const messages = normalizeResponseInput(body.input)
-      const media = openAIMedia(Array.isArray(body.input) ? body.input : [])
-      if (messages.length === 0 && media.length === 0) {
-        return badRequest("The 'input' field must contain at least one text message.", 400, request)
-      }
-
-      const instructionMessages =
-        typeof body.instructions === "string" && body.instructions.trim()
-          ? [{ role: "system", content: body.instructions.trim() }, ...messages]
-          : messages
-
-      const system = buildSystemPrompt(instructionMessages, {
-        temperature: body.temperature,
-        max_tokens: body.max_output_tokens,
-        max_completion_tokens: body.max_output_tokens,
-      })
       const callerTools = applyOpenAIToolChoice(parseOpenAITools(body), body.tool_choice)
+      let format
+      let controls
+      try {
+        validateUnsupportedControls(body)
+        format = structuredFormat(body)
+        if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request")
+        controls = generationControls(body)
+      } catch (error) {
+        return badRequest(error.message, error.status ?? 400, request)
+      }
 
       let candidates
       try {
-        validateUnsupportedControls(body)
         const providerOverride = request.headers.get("x-opencode-provider")
         candidates = await resolveModelCandidates(client, body.model, providerOverride, config.aliases)
       } catch (error) {
@@ -1967,14 +2075,18 @@ export function createProxyFetchHandler(client) {
         })
         return badRequest(error instanceof ProxyError ? message : "The requested model is unavailable.", error.status ?? 400, request)
       }
-      let requestOptions
+
+      let prepared
       try {
-        const format = structuredFormat(body)
-        if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request")
-        requestOptions = { ...options, media, format, controls: generationControls(body), variant: request.headers.get("x-opencode-variant") ?? body.reasoning?.effort ?? undefined }
+        prepared = await prepareCanonicalRequest(adaptOpenAIResponses(body), config, context.signal, candidates)
       } catch (error) {
-        return badRequest(error.message, error.status ?? 400, request)
+        return badRequest(error.message, error.status ?? 400, request, error.code)
       }
+      const { messages, system, media } = prepared
+      if (!messages[0].content.trim() && media.length === 0) {
+        return badRequest("The 'input' field must contain at least one text message.", 400, request)
+      }
+      const requestOptions = { ...options, media, format, controls, variant: request.headers.get("x-opencode-variant") ?? body.reasoning?.effort ?? undefined }
       let model = candidates[0]
 
       if (body.stream) {
@@ -2246,29 +2358,17 @@ export function createProxyFetchHandler(client) {
         return anthropicBadRequest("The 'messages' field must contain at least one message.", 400, request)
       }
 
-      const messages = normalizeAnthropicMessages(body.messages)
-      const media = anthropicMedia(body.messages)
-      if (messages.length === 0 && media.length === 0) {
-        return anthropicBadRequest("No text content was found in the supplied messages.", 400, request)
-      }
-
-      // Prepend Anthropic top-level `system` (string or array-of-content-blocks,
-      // per the Messages API spec) as a system message so buildSystemPrompt
-      // picks it up.
-      const systemText = normalizeAnthropicSystem(body.system)
-      const allMessages = systemText
-        ? [{ role: "system", content: systemText }, ...messages]
-        : messages
-
-      const system = buildSystemPrompt(allMessages, {
-        temperature: body.temperature,
-        max_tokens: body.max_tokens,
-      })
       const callerTools = applyAnthropicToolChoice(parseAnthropicTools(body), body.tool_choice)
+      let controls
+      try {
+        validateUnsupportedControls(body)
+        controls = generationControls(body)
+      } catch (error) {
+        return anthropicBadRequest(error.message, error.status ?? 400, request)
+      }
 
       let candidates
       try {
-        validateUnsupportedControls(body)
         const providerOverride = request.headers.get("x-opencode-provider")
         candidates = await resolveModelCandidates(client, body.model, providerOverride, config.aliases)
       } catch (error) {
@@ -2276,12 +2376,18 @@ export function createProxyFetchHandler(client) {
         await safeLog(client, "error", "Anthropic proxy call failed (model resolve)", { error: message, requestedModel: body.model })
         return anthropicBadRequest(error instanceof ProxyError ? message : "The requested model is unavailable.", error.status ?? 400, request)
       }
-      let requestOptions
+
+      let prepared
       try {
-        requestOptions = { ...options, media, controls: generationControls(body), variant: request.headers.get("x-opencode-variant") ?? undefined }
+        prepared = await prepareCanonicalRequest(adaptAnthropic(body), config, context.signal, candidates)
       } catch (error) {
         return anthropicBadRequest(error.message, error.status ?? 400, request)
       }
+      const { messages, system, media } = prepared
+      if (!messages[0].content.trim() && media.length === 0) {
+        return anthropicBadRequest("No text content was found in the supplied messages.", 400, request)
+      }
+      const requestOptions = { ...options, media, controls, variant: request.headers.get("x-opencode-variant") ?? undefined }
       let model = candidates[0]
 
       if (body.stream) {
@@ -2448,19 +2554,15 @@ export function createProxyFetchHandler(client) {
         return badRequest("The 'contents' field must contain at least one item.", 400, request)
       }
 
-      const messages = normalizeGeminiContents(body.contents)
-      const media = geminiMedia(body.contents)
-      if (messages.length === 0 && media.length === 0) {
-        return badRequest("No text content was found in the supplied contents.", 400, request)
-      }
-
-      const systemText = extractGeminiSystemInstruction(body.systemInstruction)
-      const systemMessages = systemText ? [{ role: "system", content: systemText }, ...messages] : messages
-      const system = buildSystemPrompt(systemMessages, {
-        temperature: body.generationConfig?.temperature,
-        max_tokens: body.generationConfig?.maxOutputTokens,
-      })
       const callerTools = applyGeminiToolChoice(parseGeminiTools(body), body.toolConfig)
+      let format
+      let controls
+      try {
+        format = structuredFormat(body)
+        controls = generationControls(body)
+      } catch (error) {
+        return badRequest(error.message, error.status ?? 400, request)
+      }
 
       let candidates
       try {
@@ -2471,12 +2573,18 @@ export function createProxyFetchHandler(client) {
         await safeLog(client, "error", "Gemini proxy call failed (model resolve)", { error: message, requestedModel: geminiModelName })
         return badRequest(error instanceof ProxyError ? message : "The requested model is unavailable.", error.status ?? 400, request)
       }
-      let requestOptions
+
+      let prepared
       try {
-        requestOptions = { ...options, media, format: structuredFormat(body), controls: generationControls(body), variant: request.headers.get("x-opencode-variant") ?? undefined }
+        prepared = await prepareCanonicalRequest(adaptGemini(body), config, context.signal, candidates)
       } catch (error) {
-        return badRequest(error.message, error.status ?? 400, request)
+        return badRequest(error.message, error.status ?? 400, request, error.code)
       }
+      const { messages, system, media } = prepared
+      if (!messages[0].content.trim() && media.length === 0) {
+        return badRequest("No text content was found in the supplied contents.", 400, request)
+      }
+      const requestOptions = { ...options, media, format, controls, variant: request.headers.get("x-opencode-variant") ?? undefined }
       if (isGeminiStream) {
         const queue = createSseQueue()
         let emitted = false
@@ -2501,11 +2609,10 @@ export function createProxyFetchHandler(client) {
                 queue.enqueue(JSON.stringify(createGeminiResponse(streamResult.content, null, null)) + "\n")
               }
               const toolCalls = streamResult.toolCalls ?? []
-              const finalChunk = JSON.stringify(
-                toolCalls.length > 0
-                  ? createGeminiResponse("", streamResult.finish, streamResult.tokens, toolCalls)
-                  : createGeminiResponse("", streamResult.finish, streamResult.tokens),
-              )
+              if (toolCalls.length > 0) {
+                queue.enqueue(JSON.stringify(createGeminiResponse("", null, null, toolCalls)) + "\n")
+              }
+              const finalChunk = JSON.stringify(createGeminiResponse("", streamResult.finish, streamResult.tokens))
               queue.enqueue(finalChunk + "\n")
             })
             .catch(async (err) => {
@@ -2558,6 +2665,48 @@ export function createProxyFetchHandler(client) {
         })
       }
     }
+  }
+
+  return async (request) => {
+    const started = Date.now()
+    const response = await handleRequest(request)
+    const details = {
+      method: request.method,
+      pathname: new URL(request.url).pathname,
+      status: response.status,
+    }
+    const contentType = response.headers.get("content-type") ?? ""
+    const streaming = contentType.includes("text/event-stream") || contentType.includes("application/x-ndjson")
+    if (streaming && response.body) {
+      const reader = response.body.getReader()
+      const finish = once(() => getMetrics().recordHttpCompletion({ ...details, durationMs: Date.now() - started }))
+      const body = new ReadableStream({
+        async pull(controller) {
+          try {
+            const { done, value } = await reader.read()
+            if (done) {
+              controller.close()
+              finish()
+            } else {
+              controller.enqueue(value)
+            }
+          } catch (error) {
+            controller.error(error)
+            finish()
+          }
+        },
+        async cancel(reason) {
+          try {
+            await reader.cancel(reason)
+          } finally {
+            finish()
+          }
+        },
+      })
+      return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers })
+    }
+    getMetrics().recordHttpCompletion({ ...details, durationMs: Date.now() - started })
+    return response
   }
 }
 
