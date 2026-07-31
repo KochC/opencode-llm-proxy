@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.10.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.9.0...v1.10.0) (2026-07-31)
+
+
+### Features
+
+* complete proxy reliability and observability ([9f416eb](https://github.com/KochC/opencode-llm-proxy/commit/9f416eb1970deb114ce9b960dabb38da9efabd45))
+* complete proxy reliability and observability ([163bf86](https://github.com/KochC/opencode-llm-proxy/commit/163bf86ea9418011426c9c142d887d70dbe02506))
+* harden and extend the LLM proxy ([#79](https://github.com/KochC/opencode-llm-proxy/issues/79)) ([855880e](https://github.com/KochC/opencode-llm-proxy/commit/855880e869ed8c502f6d86119853c2188dd5fc0e))
+
+
+### Bug Fixes
+
+* use public registry URLs in lockfile ([841d850](https://github.com/KochC/opencode-llm-proxy/commit/841d850397dda62a49e97c85c5f9fe9a001947be))
+
 ## [1.9.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.8.0...v1.9.0) (2026-07-10)
 
 
