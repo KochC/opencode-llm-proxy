@@ -36,6 +36,8 @@ If you must front the proxy with a reverse proxy on a trusted network, terminate
 
 When clients attach tools, the model can request actions that your client then executes (reading files, running commands, HTTP requests). Only enable tools you trust, validate arguments, sandbox side effects, and review any auto-approve settings in agent clients.
 
+Tool bridges have a bounded pool and waiting queue. Requests beyond `OPENCODE_LLM_PROXY_TOOL_BRIDGE_MAX_QUEUE` receive `429`, limiting unbounded bridge-waiter growth under load.
+
 ## Do not share provider access beyond your intended environment
 
 The whole point of the proxy is reuse of your OpenCode providers. Anyone who can call the proxy is using your GitHub Copilot / Anthropic / Bedrock / etc. access. Keep the audience limited to yourself or your team.
@@ -50,7 +52,21 @@ Browser origins are denied by default. Configure an explicit JSON allowlist with
 
 The proxy enforces request timeouts, request/media size limits, active-request and queue limits, and tool-bridge acquisition timeouts. Tune the corresponding variables documented in the README for your host capacity. Temporary OpenCode sessions are deleted after requests by default; enable `OPENCODE_LLM_PROXY_KEEP_SESSIONS` only when retained sessions are needed for diagnostics.
 
-Multimodal inputs are accepted only through supported content shapes and URL schemes and are checked against model capabilities. Structured-output schemas and generation controls are validated, and unsupported controls are rejected rather than silently accepted.
+Multimodal inputs are accepted only through supported content shapes and are checked against model capabilities. Structured-output schemas and supported generation controls are validated. Maximum-token controls are accepted for client compatibility but cannot currently be enforced by the OpenCode SDK; other unsupported OpenAI/Anthropic controls are rejected rather than silently accepted.
+
+## Remote media fetching
+
+Remote media is disabled by default. Keep `OPENCODE_LLM_PROXY_REMOTE_MEDIA_ENABLED=false` unless a trusted client genuinely needs URL-based media; embedded data URLs avoid outbound requests and are safer.
+
+When enabled, the fetcher defaults to HTTPS only and converts successful downloads to embedded data URLs before forwarding them to OpenCode. Its SSRF protections include:
+
+- Resolving every initial and redirected hostname itself, rejecting credentials and non-public IPv4/IPv6 ranges, including loopback, private, link-local, shared, documentation, multicast, reserved, and IPv4-mapped addresses.
+- Pinning the connection to the validated DNS address and verifying the actual socket peer is that same public address, preventing DNS rebinding between validation and connection.
+- Re-resolving and re-validating every redirect target, bounding redirect count, and rejecting HTTPS-to-HTTP downgrades.
+- Bounding the total item count, bytes per item, and total preparation time, including DNS and redirects. Both declared `Content-Length` and bytes actually read are checked.
+- Accepting only supported media MIME types, requiring identity content encoding, and rejecting URL credentials and unconfigured schemes.
+
+Do not add `http` to `OPENCODE_LLM_PROXY_REMOTE_MEDIA_ALLOWED_SCHEMES` unless transport security is provided by a trusted environment and the risk is understood. These controls reduce SSRF risk but do not make arbitrary untrusted URL fetching preferable to leaving the feature disabled.
 
 ## Checklist
 
@@ -60,4 +76,5 @@ Multimodal inputs are accepted only through supported content shapes and URL sch
 - [ ] Not reachable from the public internet
 - [ ] Firewall restricts inbound access to known hosts
 - [ ] Tool-using clients are trusted and reviewed
+- [ ] Remote media remains disabled, or its HTTPS-only limits are reviewed
 - [ ] Tokens never written to logs

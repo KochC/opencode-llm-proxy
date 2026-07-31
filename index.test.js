@@ -34,6 +34,7 @@ import {
 } from "./index.js"
 
 import { dispatch, parseTools, runStdioServer } from "./mcp-tool-bridge.js"
+import { getMetrics, resetMetrics } from "./metrics.js"
 
 // Keep the suite hermetic: environment variables leaking in from the developer's
 // shell or CI (e.g. OPENCODE_LLM_PROXY_TOKEN) must not change test outcomes.
@@ -42,6 +43,7 @@ beforeEach(() => {
   for (const name of Object.keys(process.env)) {
     if (name.startsWith("OPENCODE_LLM_PROXY_")) delete process.env[name]
   }
+  resetMetrics()
 })
 
 // ---------------------------------------------------------------------------
@@ -224,6 +226,22 @@ test("remote media URLs are rejected to prevent SSRF", async () => {
     }),
   }))
   assert.equal(response.status, 400)
+})
+
+test("unknown model takes precedence over remote media fetching", async () => {
+  const handler = createProxyFetchHandler(createModelsClient([]))
+  const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "nonexistent",
+      input: [{ role: "user", content: [{ type: "input_image", image_url: "http://127.0.0.1/private" }] }],
+    }),
+  }))
+  const body = await response.json()
+
+  assert.equal(response.status, 400)
+  assert.equal(body.error.message, "The requested model is unavailable.")
 })
 
 test("request with no Origin header is handled gracefully", async () => {
@@ -543,6 +561,42 @@ test("unknown route returns 404", async () => {
   const response = await handler(request)
 
   assert.equal(response.status, 404)
+})
+
+test("HTTP metrics record exact auth, CORS, route, and stream statuses", async () => {
+  process.env.OPENCODE_LLM_PROXY_TOKEN = "secret"
+  process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN = "https://allowed.example.com"
+  let handler = createProxyFetchHandler(createClient())
+
+  await handler(new Request("http://127.0.0.1:4010/health"))
+  await handler(new Request("http://127.0.0.1:4010/health", { headers: { origin: "https://denied.example.com" } }))
+
+  delete process.env.OPENCODE_LLM_PROXY_TOKEN
+  delete process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN
+  handler = createProxyFetchHandler(createStreamingClient([
+    { type: "session.idle", properties: { sessionID: "sess-123" } },
+  ]))
+  const stream = await handler(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  }))
+  await stream.text()
+
+  const output = getMetrics().metrics()
+  assert.match(output, /method="GET",route="\/health",status="401"\} 1/)
+  assert.match(output, /method="GET",route="\/health",status="403"\} 1/)
+  assert.match(output, /method="POST",route="\/v1\/chat\/completions",status="200"\} 1/)
+})
+
+test("metrics endpoint is available only when enabled", async () => {
+  let response = await createProxyFetchHandler(createClient())(new Request("http://127.0.0.1:4010/metrics"))
+  assert.equal(response.status, 404)
+
+  process.env.OPENCODE_LLM_PROXY_METRICS_ENABLED = "true"
+  response = await createProxyFetchHandler(createClient())(new Request("http://127.0.0.1:4010/metrics"))
+  assert.equal(response.status, 200)
+  assert.match(await response.text(), /opencode_proxy_http_requests_total/)
 })
 
 // ---------------------------------------------------------------------------
@@ -876,6 +930,14 @@ describe("resolveModel", () => {
     assert.equal(model.providerID, "openai")
     assert.equal(model.modelID, "gpt-4o-mini")
   })
+
+  it("rejects a fully-qualified ID with a mismatching providerOverride", async () => {
+    const client = makeClient(providers)
+    await assert.rejects(
+      () => resolveModel(client, "openai/gpt-4o", "anthropic"),
+      /does not match provider override/,
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1160,6 +1222,32 @@ test("OpenAI image content is forwarded as an OpenCode file part", async () => {
 
   assert.equal(response.status, 200)
   assert.deepEqual(parts[1], { type: "file", mime: "image/png", url: image })
+})
+
+test("canonical request rendering preserves tool calls and results as structured history", async () => {
+  const client = createResponsesClient()
+  let prompt
+  client.session.prompt = async ({ body }) => {
+    prompt = body.parts[0].text
+    return { data: { parts: [{ type: "text", text: "done" }], info: { tokens: {}, finish: "stop" } } }
+  }
+  const response = await createProxyFetchHandler(client)(new Request("http://127.0.0.1:4010/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "anthropic/claude-3-5-sonnet",
+      input: [
+        { type: "function_call", call_id: "call-1", name: "lookup", arguments: "{\"id\":7}" },
+        { type: "function_call_output", call_id: "call-1", output: { found: true } },
+      ],
+    }),
+  }))
+
+  assert.equal(response.status, 200)
+  const lines = prompt.split("\n\n")[1].split("\n").map(JSON.parse)
+  assert.equal(lines[0].content[0].type, "tool_call")
+  assert.deepEqual(lines[0].content[0].arguments, { type: "json", value: { id: 7 } })
+  assert.deepEqual(lines[1].content[0].content[0], { type: "json", value: { found: true } })
 })
 
 test("model aliases fall back to the next target after an upstream failure", async () => {
@@ -2713,6 +2801,24 @@ describe("buildToolsMap / registerToolBridge slot isolation", () => {
     assert.equal(response.status, 502)
     assert.deepEqual(state.toolBridge.freeSlots, ["px_tools_0"])
   })
+
+  it("enforces the configured bridge waiting queue limit", async () => {
+    const state = globalThis.__opencodeOpenAIProxyState
+    state.toolBridge = { freeSlots: [], waiters: [], slotToolIDs: new Map() }
+    const client = { mcp: {} }
+    const tools = [{ name: "queued", description: "", parameters: { type: "object", properties: {} } }]
+    const controller = new AbortController()
+    const waiting = registerToolBridge(client, tools, { signal: controller.signal, timeoutMs: 1000, maxQueue: 1 })
+
+    await assert.rejects(
+      registerToolBridge(client, tools, { timeoutMs: 1000, maxQueue: 1 }),
+      (error) => error.status === 429 && error.code === "tool_capacity_overloaded",
+    )
+    controller.abort()
+    await assert.rejects(waiting)
+    assert.equal(state.toolBridge.waiters.length, 0)
+    delete state.toolBridge
+  })
 })
 
 test("POST /v1beta/models/:model:generateContent returns a functionCall part", async () => {
@@ -2807,7 +2913,7 @@ test("tool_choice: none disables tool calling even when tools are supplied", asy
   assert.equal(client.mcp, undefined)
 })
 
-test("POST /v1beta/models/:model:streamGenerateContent emits a functionCall in the final chunk", async () => {
+test("POST /v1beta/models/:model:streamGenerateContent emits functionCall before the terminal chunk", async () => {
   const client = createToolCallClient({
     toolName: "get_weather",
     toolArgs: { city: "NYC" },
@@ -2830,11 +2936,12 @@ test("POST /v1beta/models/:model:streamGenerateContent emits a functionCall in t
     .split("\n")
     .filter(Boolean)
     .map((line) => JSON.parse(line))
-  const functionCall = chunks.at(-1).candidates[0].content.parts[0].functionCall
+  const functionCall = chunks.at(-2).candidates[0].content.parts[0].functionCall
 
   assert.ok(functionCall)
   assert.equal(functionCall.name, "get_weather")
   assert.deepEqual(functionCall.args, { city: "NYC" })
+  assert.equal(chunks.at(-1).candidates[0].finishReason, "STOP")
 })
 
 // ---------------------------------------------------------------------------

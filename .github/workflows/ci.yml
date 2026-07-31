@@ -62,6 +62,9 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Run stream conformance tests
+        run: npm run test:conformance
+
   package:
     name: Audit and package
     runs-on: ubuntu-latest

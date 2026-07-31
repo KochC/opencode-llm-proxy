@@ -1,0 +1,11 @@
+{
+  "text": [
+    { "candidates": [{ "content": { "role": "model", "parts": [{ "text": "Hello" }] }, "finishReason": "STOP", "index": 0 }], "usageMetadata": { "promptTokenCount": 0, "candidatesTokenCount": 0, "totalTokenCount": 0 } },
+    { "candidates": [{ "content": { "role": "model", "parts": [{ "text": " world" }] }, "finishReason": "STOP", "index": 0 }], "usageMetadata": { "promptTokenCount": 0, "candidatesTokenCount": 0, "totalTokenCount": 0 } },
+    { "candidates": [{ "content": { "role": "model", "parts": [{ "text": "" }] }, "finishReason": "STOP", "index": 0 }], "usageMetadata": { "promptTokenCount": 11, "candidatesTokenCount": 4, "totalTokenCount": 15 } }
+  ],
+  "parallelTools": [
+    { "candidates": [{ "content": { "role": "model", "parts": [{ "functionCall": { "name": "get_weather", "args": { "city": "Paris" } } }, { "functionCall": { "name": "get_time", "args": { "timezone": "Europe/Paris" } } }] }, "finishReason": "STOP", "index": 0 }], "usageMetadata": { "promptTokenCount": 0, "candidatesTokenCount": 0, "totalTokenCount": 0 } },
+    { "candidates": [{ "content": { "role": "model", "parts": [{ "text": "" }] }, "finishReason": "STOP", "index": 0 }], "usageMetadata": { "promptTokenCount": 11, "candidatesTokenCount": 4, "totalTokenCount": 15 } }
+  ]
+}
