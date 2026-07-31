@@ -8,7 +8,7 @@ By default the proxy binds to `127.0.0.1`, so only processes on the same machine
 
 ## Use a bearer token when exposing beyond localhost
 
-If you bind to a network interface (`OPENCODE_LLM_PROXY_HOST=0.0.0.0`) for LAN or Docker use, always set a token:
+If you bind to a network interface (`OPENCODE_LLM_PROXY_HOST=0.0.0.0`) for LAN or Docker use, the proxy requires at least one token and refuses to start without one:
 
 ```bash
 OPENCODE_LLM_PROXY_HOST=0.0.0.0 \
@@ -17,6 +17,8 @@ opencode
 ```
 
 Every request must then send `Authorization: Bearer some-long-random-token`. Use a long, random value and rotate it if it may have leaked.
+
+For rotation or multiple clients, `OPENCODE_LLM_PROXY_TOKENS` accepts a JSON array of non-empty token strings. It can be used alongside the single `OPENCODE_LLM_PROXY_TOKEN` value.
 
 ## Do not expose the proxy to the public internet
 
@@ -42,10 +44,19 @@ The whole point of the proxy is reuse of your OpenCode providers. Anyone who can
 
 Never log the `Authorization` header or the token value in application logs, reverse-proxy logs, or debugging output. Scrub them from any shared traces or issue reports.
 
+## Browser and resource controls
+
+Browser origins are denied by default. Configure an explicit JSON allowlist with `OPENCODE_LLM_PROXY_CORS_ORIGINS`; avoid `"*"` on network-exposed installations. Browser Private Network Access is also denied unless `OPENCODE_LLM_PROXY_ALLOW_PRIVATE_NETWORK=true`.
+
+The proxy enforces request timeouts, request/media size limits, active-request and queue limits, and tool-bridge acquisition timeouts. Tune the corresponding variables documented in the README for your host capacity. Temporary OpenCode sessions are deleted after requests by default; enable `OPENCODE_LLM_PROXY_KEEP_SESSIONS` only when retained sessions are needed for diagnostics.
+
+Multimodal inputs are accepted only through supported content shapes and URL schemes and are checked against model capabilities. Structured-output schemas and generation controls are validated, and unsupported controls are rejected rather than silently accepted.
+
 ## Checklist
 
 - [ ] Localhost binding unless network access is genuinely required
 - [ ] `OPENCODE_LLM_PROXY_TOKEN` set whenever bound to a network interface
+- [ ] Browser origins explicitly allowlisted when browser access is needed
 - [ ] Not reachable from the public internet
 - [ ] Firewall restricts inbound access to known hosts
 - [ ] Tool-using clients are trusted and reviewed

@@ -1,4 +1,6 @@
 import { fileURLToPath } from "node:url"
+import { Buffer } from "node:buffer"
+import { timingSafeEqual } from "node:crypto"
 
 const STATE_KEY = "__opencodeOpenAIProxyState"
 const BRIDGE_SCRIPT_PATH = fileURLToPath(new URL("./mcp-tool-bridge.js", import.meta.url))
@@ -10,44 +12,126 @@ function getState() {
   return globalThis[STATE_KEY]
 }
 
-function corsHeaders(request) {
-  const configuredOrigin = process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN ?? "*"
-  const requestedHeaders = request?.headers.get("access-control-request-headers")
-  const requestedMethod = request?.headers.get("access-control-request-method")
+const DEFAULTS = Object.freeze({
+  requestTimeoutMs: 120000,
+  maxRequestBytes: 1024 * 1024,
+  maxConcurrentRequests: 8,
+  maxQueuedRequests: 32,
+  bridgeAcquireTimeoutMs: 10000,
+})
+
+class ProxyError extends Error {
+  constructor(message, status = 500, code = "server_error") {
+    super(message)
+    this.name = "ProxyError"
+    this.status = status
+    this.code = code
+  }
+}
+
+function integerEnv(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === "") return fallback
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new ProxyError(`${name} must be an integer between ${min} and ${max}.`, 500, "invalid_config")
+  }
+  return value
+}
+
+function jsonArrayEnv(name) {
+  const raw = process.env[name]
+  if (!raw?.trim()) return []
+  try {
+    const value = JSON.parse(raw)
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim())) throw new Error()
+    return value.map((entry) => entry.trim())
+  } catch {
+    throw new ProxyError(`${name} must be a JSON array of non-empty strings.`, 500, "invalid_config")
+  }
+}
+
+function objectEnv(name) {
+  const raw = process.env[name]
+  if (!raw?.trim()) return {}
+  try {
+    const value = JSON.parse(raw)
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error()
+    return value
+  } catch {
+    throw new ProxyError(`${name} must be a JSON object.`, 500, "invalid_config")
+  }
+}
+
+function loadConfig() {
+  const legacyToken = process.env.OPENCODE_LLM_PROXY_TOKEN?.trim()
+  const configuredOrigin = process.env.OPENCODE_LLM_PROXY_CORS_ORIGIN?.trim()
+  const origins = jsonArrayEnv("OPENCODE_LLM_PROXY_CORS_ORIGINS")
+  if (configuredOrigin) origins.push(configuredOrigin)
+  return {
+    tokens: [...new Set([legacyToken, ...jsonArrayEnv("OPENCODE_LLM_PROXY_TOKENS")].filter(Boolean))],
+    corsOrigins: [...new Set(origins)],
+    allowPrivateNetwork: process.env.OPENCODE_LLM_PROXY_ALLOW_PRIVATE_NETWORK === "true",
+    requestTimeoutMs: integerEnv("OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS", DEFAULTS.requestTimeoutMs, { min: 1, max: 3600000 }),
+    maxRequestBytes: integerEnv("OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES", DEFAULTS.maxRequestBytes, { min: 1, max: 100 * 1024 * 1024 }),
+    maxConcurrentRequests: integerEnv("OPENCODE_LLM_PROXY_MAX_CONCURRENT_REQUESTS", DEFAULTS.maxConcurrentRequests, { min: 1, max: 1000 }),
+    maxQueuedRequests: integerEnv("OPENCODE_LLM_PROXY_MAX_QUEUED_REQUESTS", DEFAULTS.maxQueuedRequests, { min: 0, max: 10000 }),
+    bridgeAcquireTimeoutMs: integerEnv("OPENCODE_LLM_PROXY_TOOL_BRIDGE_ACQUIRE_TIMEOUT_MS", DEFAULTS.bridgeAcquireTimeoutMs, { min: 1, max: 3600000 }),
+    keepSessions: process.env.OPENCODE_LLM_PROXY_KEEP_SESSIONS === "true",
+    aliases: objectEnv("OPENCODE_LLM_PROXY_MODEL_ALIASES"),
+  }
+}
+
+function commonHeaders(request, config) {
+  return {
+    "cache-control": "no-store",
+    pragma: "no-cache",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    "x-frame-options": "DENY",
+    "content-security-policy": "default-src 'none'; frame-ancestors 'none'",
+    "x-request-id": request?.headers.get("x-request-id")?.slice(0, 128) || crypto.randomUUID(),
+    ...corsHeaders(request, config),
+  }
+}
+
+function corsHeaders(request, config = loadConfig()) {
   const requestedPrivateNetwork = request?.headers.get("access-control-request-private-network")
-  const requestOrigin = request?.headers.get("origin") ?? ""
-  const allowOrigin = configuredOrigin === "*" ? "*" : (requestOrigin === configuredOrigin ? requestOrigin : configuredOrigin)
+  const requestOrigin = request?.headers.get("origin")
+  if (!requestOrigin) return {}
+  const allowed = config.corsOrigins.includes("*") || config.corsOrigins.includes(requestOrigin)
+  if (!allowed) return { vary: "origin, access-control-request-method, access-control-request-headers" }
 
   const headers = {
     vary: "origin, access-control-request-method, access-control-request-headers",
-    "access-control-allow-origin": allowOrigin,
-    "access-control-allow-headers": requestedHeaders ?? "authorization, content-type, x-opencode-provider",
-    "access-control-allow-methods": requestedMethod ?? "GET, POST, OPTIONS",
+    "access-control-allow-origin": config.corsOrigins.includes("*") ? "*" : requestOrigin,
+    "access-control-allow-headers": "authorization, content-type, x-opencode-provider, x-opencode-variant, x-request-id",
+    "access-control-allow-methods": "GET, POST, OPTIONS",
     "access-control-max-age": "86400",
   }
 
-  if (requestedPrivateNetwork === "true") {
+  if (requestedPrivateNetwork === "true" && config.allowPrivateNetwork) {
     headers["access-control-allow-private-network"] = "true"
   }
 
   return headers
 }
 
-function json(data, status = 200, headers = {}, request) {
+function json(data, status = 200, headers = {}, request, config) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      ...corsHeaders(request),
+      ...commonHeaders(request, config ?? loadConfig()),
       ...headers,
     },
   })
 }
 
-function text(message, status = 200, request) {
+function text(message, status = 200, request, config) {
   return new Response(message, {
     status,
-    headers: corsHeaders(request),
+    headers: commonHeaders(request, config ?? loadConfig()),
   })
 }
 
@@ -100,10 +184,133 @@ function getBearerToken(request) {
   return header.slice(prefix.length).trim()
 }
 
-function isAuthorized(request) {
-  const configured = process.env.OPENCODE_LLM_PROXY_TOKEN
-  if (!configured) return true
-  return getBearerToken(request) === configured
+function tokensEqual(left, right) {
+  const a = Buffer.from(left)
+  const b = Buffer.from(right)
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
+function isAuthorized(request, config = loadConfig()) {
+  if (config.tokens.length === 0) return true
+  const supplied = getBearerToken(request)
+  return Boolean(supplied && config.tokens.some((token) => tokensEqual(supplied, token)))
+}
+
+function isPlainObject(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value))
+}
+
+async function readJsonBody(request, maxBytes, signal) {
+  const declared = Number(request.headers.get("content-length"))
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new ProxyError("Request body is too large.", 413, "request_too_large")
+  }
+  if (!request.body) throw new ProxyError("Request body must be valid JSON.", 400, "invalid_json")
+  const reader = request.body.getReader()
+  const onAbort = () => reader.cancel(signal.reason).catch(() => {})
+  signal?.addEventListener("abort", onAbort, { once: true })
+  const read = () => new Promise((resolve, reject) => {
+    const abort = () => {
+      cleanup()
+      reject(signal.reason)
+    }
+    const cleanup = () => signal?.removeEventListener("abort", abort)
+    signal?.addEventListener("abort", abort, { once: true })
+    reader.read().then((value) => {
+      cleanup()
+      resolve(value)
+    }, (error) => {
+      cleanup()
+      reject(error)
+    })
+  })
+  const chunks = []
+  let size = 0
+  try {
+    while (true) {
+      const { value, done } = await read()
+      if (done) break
+      size += value.byteLength
+      if (size > maxBytes) {
+        await reader.cancel()
+        throw new ProxyError("Request body is too large.", 413, "request_too_large")
+      }
+      chunks.push(value)
+    }
+    const body = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"))
+    if (!isPlainObject(body)) throw new ProxyError("Request body must be a JSON object.", 400, "invalid_json")
+    return body
+  } catch (error) {
+    if (error instanceof ProxyError) throw error
+    throw new ProxyError("Request body must be valid JSON.", 400, "invalid_json")
+  } finally {
+    signal?.removeEventListener("abort", onAbort)
+    reader.releaseLock()
+  }
+}
+
+function createRequestSignal(request, timeoutMs) {
+  const controller = new AbortController()
+  const onAbort = () => controller.abort(new ProxyError("Request was cancelled.", 499, "cancelled"))
+  request.signal?.addEventListener("abort", onAbort, { once: true })
+  const timer = setTimeout(() => controller.abort(new ProxyError("Upstream request timed out.", 504, "timeout")), timeoutMs)
+  timer.unref?.()
+  return {
+    signal: controller.signal,
+    abort: (reason) => controller.abort(reason),
+    finish() {
+      clearTimeout(timer)
+      request.signal?.removeEventListener("abort", onAbort)
+    },
+  }
+}
+
+function getRequestLimiter(config) {
+  const state = getState()
+  const key = `${config.maxConcurrentRequests}:${config.maxQueuedRequests}`
+  if (!state.requestLimiter || state.requestLimiter.key !== key) {
+    state.requestLimiter = { key, active: 0, waiters: [] }
+  }
+  return state.requestLimiter
+}
+
+async function acquireRequestSlot(config, signal) {
+  const limiter = getRequestLimiter(config)
+  if (limiter.active < config.maxConcurrentRequests) {
+    limiter.active++
+    return () => releaseRequestSlot(limiter)
+  }
+  if (limiter.waiters.length >= config.maxQueuedRequests) {
+    throw new ProxyError("The proxy is busy. Try again later.", 503, "overloaded")
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = { active: true }
+    const cleanup = () => signal?.removeEventListener("abort", onAbort)
+    const onAbort = () => {
+      if (!waiter.active) return
+      waiter.active = false
+      cleanup()
+      reject(signal.reason ?? new ProxyError("Request was cancelled.", 499, "cancelled"))
+    }
+    waiter.resolve = () => {
+      if (!waiter.active) return false
+      waiter.active = false
+      cleanup()
+      limiter.active++
+      resolve(() => releaseRequestSlot(limiter))
+      return true
+    }
+    limiter.waiters.push(waiter)
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+function releaseRequestSlot(limiter) {
+  limiter.active = Math.max(0, limiter.active - 1)
+  while (limiter.waiters.length > 0) {
+    const waiter = limiter.waiters.shift()
+    if (waiter.resolve()) return
+  }
 }
 
 export function toTextContent(content) {
@@ -117,10 +324,12 @@ export function toTextContent(content) {
 }
 
 export function normalizeMessages(messages) {
+  if (!Array.isArray(messages)) return []
   const toolNameByCallId = new Map()
 
   return messages
     .map((message) => {
+      if (!isPlainObject(message) || typeof message.role !== "string") return null
       if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
         const baseText = toTextContent(message.content).trim()
         const callsText = message.tool_calls
@@ -145,7 +354,7 @@ export function normalizeMessages(messages) {
         content: toTextContent(message.content).trim(),
       }
     })
-    .filter((message) => message.content.length > 0)
+    .filter((message) => message && message.content.length > 0)
 }
 
 export function normalizeResponseInput(input) {
@@ -213,7 +422,7 @@ export function normalizeResponseInput(input) {
     .filter((message) => message.content.length > 0)
 }
 
-export function buildSystemPrompt(messages, request) {
+export function buildSystemPrompt(messages, _request) {
   const systemMessages = messages
     .filter((message) => message.role === "system" || message.role === "developer")
     .map((message) => message.content)
@@ -222,14 +431,6 @@ export function buildSystemPrompt(messages, request) {
     "You are answering through a proxy backed by OpenCode.",
     "Return only the assistant's reply content.",
   ]
-
-  if (typeof request.temperature === "number") {
-    hints.push(`Requested temperature: ${request.temperature}`)
-  }
-
-  if (typeof request.max_completion_tokens === "number" || typeof request.max_tokens === "number") {
-    hints.push(`Requested max output tokens: ${request.max_completion_tokens ?? request.max_tokens}`)
-  }
 
   return [...systemMessages, ...hints].join("\n\n").trim()
 }
@@ -248,7 +449,7 @@ export function buildPrompt(messages) {
   }
 
   const transcript = chatMessages
-    .map((message) => `${message.role.toUpperCase()}:\n${message.content}`)
+    .map((message) => `${String(message.role).toUpperCase()}:\n${message.content}`)
     .join("\n\n")
 
   return [
@@ -267,16 +468,84 @@ export function extractAssistantText(parts) {
     .trim()
 }
 
-async function executePrompt(client, request, model, messages, system, callerTools = []) {
+function dataUrlSize(url) {
+  if (typeof url !== "string" || !url.startsWith("data:")) return 0
+  const comma = url.indexOf(",")
+  if (comma === -1) return Number.POSITIVE_INFINITY
+  const metadata = url.slice(0, comma)
+  const payload = url.slice(comma + 1)
+  return metadata.endsWith(";base64") ? Math.ceil(payload.length * 0.75) : Buffer.byteLength(decodeURIComponent(payload))
+}
+
+function validateFilePart(part, model, maxBytes) {
+  if (!part?.mime || !part?.url) throw new ProxyError("Invalid file or image content part.", 400, "invalid_media")
+  if (!part.url.startsWith("data:")) {
+    throw new ProxyError("Only embedded data URLs are supported for media.", 400, "invalid_media")
+  }
+  if (dataUrlSize(part.url) > maxBytes) throw new ProxyError("Embedded media is too large.", 413, "request_too_large")
+  const kind = part.mime === "application/pdf" ? "pdf" : part.mime.split("/", 1)[0]
+  const input = model.capabilities?.input
+  if (input && kind in input && !input[kind]) {
+    throw new ProxyError(`Model '${model.id}' does not support ${kind} input.`, 400, "unsupported_media")
+  }
+}
+
+function promptParts(messages, media, model, maxBytes) {
+  const parts = [{ type: "text", text: buildPrompt(messages) }]
+  for (const part of media ?? []) {
+    validateFilePart(part, model, maxBytes)
+    parts.push({ type: "file", mime: part.mime, url: part.url, ...(part.filename ? { filename: part.filename } : {}) })
+  }
+  return parts
+}
+
+function structuredFormat(request) {
+  const openAI = request.response_format?.json_schema?.schema ?? request.text?.format?.schema
+  const gemini = request.generationConfig?.responseSchema
+  const schema = openAI ?? gemini
+  if (!schema) return undefined
+  if (!isPlainObject(schema)) throw new ProxyError("Structured output schema must be a JSON object.", 400, "invalid_schema")
+  return { type: "json_schema", schema }
+}
+
+function validateUnsupportedControls(request) {
+  const unsupported = ["stop", "seed", "frequency_penalty", "presence_penalty", "logprobs", "n"]
+    .filter((name) => request[name] !== undefined)
+  if (unsupported.length > 0) {
+    throw new ProxyError(`Unsupported generation controls: ${unsupported.join(", ")}.`, 400, "unsupported_parameter")
+  }
+}
+
+async function deleteSession(client, sessionID, keepSessions) {
+  if (keepSessions || !sessionID || typeof client.session.delete !== "function") return
+  try {
+    await client.session.delete({ path: { id: sessionID } })
+  } catch {
+    // Best-effort cleanup for compatibility with older OpenCode clients.
+  }
+}
+
+function setGenerationControls(sessionID, controls) {
+  if (!sessionID || !controls || Object.keys(controls).length === 0) return
+  const state = getState()
+  state.generationControls ??= new Map()
+  state.generationControls.set(sessionID, controls)
+}
+
+function clearGenerationControls(sessionID) {
+  getState().generationControls?.delete(sessionID)
+}
+
+async function executePrompt(client, _request, model, messages, system, callerTools = [], options = {}) {
   if (Array.isArray(callerTools) && callerTools.length > 0) {
     // Tool-aware path: must watch the event stream (via runAgentTurn) rather than
     // block on session.prompt, so we can intercept a proposed tool call instead of
     // letting OpenCode's agent loop run to a final text answer.
-    const result = await runAgentTurn(client, model, messages, system, callerTools, () => {})
+    const result = await runAgentTurn(client, model, messages, system, callerTools, () => {}, options)
     return {
       content: result.content,
       toolCalls: result.toolCalls,
-      request,
+      request: _request,
       sessionID: result.sessionID,
       completion: {
         data: {
@@ -290,54 +559,45 @@ async function executePrompt(client, request, model, messages, system, callerToo
   }
 
   const tools = await getDisabledTools(client)
-  const session = await client.session.create({
-    body: {
-      title: `Proxy: ${model.id}`,
-    },
-  })
-
-  const prompt = buildPrompt(messages)
-
-  const completion = await client.session.prompt({
-    path: { id: session.data.id },
-    body: {
-      model: {
-        providerID: model.providerID,
-        modelID: model.modelID,
+  let sessionID
+  try {
+    const session = await client.session.create({ body: { title: `Proxy: ${model.id}` }, signal: options.signal })
+    sessionID = session.data.id
+    setGenerationControls(sessionID, options.controls)
+    const completion = await client.session.prompt({
+      path: { id: sessionID },
+      signal: options.signal,
+      body: {
+        model: { providerID: model.providerID, modelID: model.modelID },
+        system,
+        tools,
+        parts: promptParts(messages, options.media, model, options.maxRequestBytes ?? DEFAULTS.maxRequestBytes),
+        ...(options.format ? { format: options.format } : {}),
+        ...(options.variant ? { variant: options.variant } : {}),
       },
-      system,
-      tools,
-      parts: [
-        {
-          type: "text",
-          text: prompt,
-        },
-      ],
-    },
-  })
+    })
 
-  const content = extractAssistantText(completion.data.parts ?? [])
+    const structured = completion.data.info?.structured
+    const content = structured === undefined ? extractAssistantText(completion.data.parts ?? []) : JSON.stringify(structured)
 
-  if (!content && completion.data.info?.error) {
-    throw new Error(completion.data.info.error.message ?? "Model call failed.")
-  }
+    if (!content && completion.data.info?.error) throw new Error(completion.data.info.error.message ?? "Model call failed.")
 
-  return {
-    content,
-    toolCalls: [],
-    completion,
-    request,
-    sessionID: session.data.id,
+    return { content, structured, toolCalls: [], completion, request: _request, sessionID }
+  } finally {
+    clearGenerationControls(sessionID)
+    await deleteSession(client, sessionID, options.keepSessions)
   }
 }
 
-async function executePromptStreaming(client, model, messages, system, onChunk, callerTools = []) {
-  const result = await runAgentTurn(client, model, messages, system, callerTools, onChunk)
+async function executePromptStreaming(client, model, messages, system, onChunk, callerTools = [], options = {}) {
+  const result = await runAgentTurn(client, model, messages, system, callerTools, onChunk, options)
   return {
     sessionID: result.sessionID,
     tokens: result.tokens,
     finish: result.finish,
     toolCalls: result.toolCalls,
+    content: result.structured === undefined ? result.content : JSON.stringify(result.structured),
+    structured: result.structured,
   }
 }
 
@@ -529,24 +789,47 @@ function getToolBridgeState() {
   return state.toolBridge
 }
 
-async function acquireBridgeSlot() {
+async function acquireBridgeSlot(options = {}) {
   const bridgeState = getToolBridgeState()
   if (bridgeState.freeSlots.length > 0) {
     return bridgeState.freeSlots.shift()
   }
-  return new Promise((resolve) => {
-    bridgeState.waiters.push(resolve)
+  return new Promise((resolve, reject) => {
+    const waiter = { active: true }
+    const timeout = setTimeout(() => {
+      if (!waiter.active) return
+      waiter.active = false
+      reject(new ProxyError("Timed out waiting for tool capacity.", 503, "tool_capacity_timeout"))
+    }, options.timeoutMs ?? DEFAULTS.bridgeAcquireTimeoutMs)
+    timeout.unref?.()
+    const onAbort = () => {
+      if (!waiter.active) return
+      waiter.active = false
+      clearTimeout(timeout)
+      reject(options.signal.reason ?? new ProxyError("Request was cancelled.", 499, "cancelled"))
+    }
+    waiter.resolve = (slot) => {
+      if (!waiter.active) return false
+      waiter.active = false
+      clearTimeout(timeout)
+      options.signal?.removeEventListener("abort", onAbort)
+      resolve(slot)
+      return true
+    }
+    bridgeState.waiters.push(waiter)
+    options.signal?.addEventListener("abort", onAbort, { once: true })
   })
 }
 
 function releaseBridgeSlot(slotName) {
   const bridgeState = getToolBridgeState()
   if (bridgeState.waiters.length > 0) {
-    const resolve = bridgeState.waiters.shift()
-    resolve(slotName)
-  } else {
-    bridgeState.freeSlots.push(slotName)
+    while (bridgeState.waiters.length > 0) {
+      const waiter = bridgeState.waiters.shift()
+      if (waiter.resolve(slotName)) return
+    }
   }
+  if (!bridgeState.freeSlots.includes(slotName)) bridgeState.freeSlots.push(slotName)
 }
 
 export function sanitizeToolName(name, seen = new Set()) {
@@ -665,8 +948,8 @@ export function applyGeminiToolChoice(tools, toolConfig) {
   return tools
 }
 
-export async function registerToolBridge(client, tools) {
-  const slotName = await acquireBridgeSlot()
+export async function registerToolBridge(client, tools, options = {}) {
+  const slotName = await acquireBridgeSlot(options)
   try {
     const seen = new Set()
     const nameMap = new Map() // full bridge tool ID ("<slot>_<sanitized>") -> original caller-facing name
@@ -715,7 +998,10 @@ export async function registerToolBridge(client, tools) {
 }
 
 export function releaseToolBridge(bridge) {
-  if (bridge) releaseBridgeSlot(bridge.slotName)
+  if (bridge && !bridge.released) {
+    bridge.released = true
+    releaseBridgeSlot(bridge.slotName)
+  }
 }
 
 // Builds the per-turn `tools` map sent to OpenCode: the caller's bridge tools enabled,
@@ -742,33 +1028,21 @@ export function buildToolsMap(baseTools, bridge) {
   return toolsMap
 }
 
-async function runAgentTurn(client, model, messages, system, callerTools, onChunk) {
+async function runAgentTurn(client, model, messages, system, callerTools, onChunk, options = {}) {
   const baseTools = await getDisabledTools(client)
   let toolsMap = baseTools
   let bridge = null
 
   if (Array.isArray(callerTools) && callerTools.length > 0) {
-    bridge = await registerToolBridge(client, callerTools)
+    bridge = await registerToolBridge(client, callerTools, {
+      signal: options.signal,
+      timeoutMs: options.bridgeAcquireTimeoutMs,
+    })
     toolsMap = buildToolsMap(baseTools, bridge)
   }
 
-  const session = await client.session.create({ body: { title: `Proxy: ${model.id}` } })
-  const sessionID = session.data.id
-  const prompt = buildPrompt(messages)
+  let sessionID
   const toolIDSet = bridge ? new Set(bridge.toolIDs) : null
-
-  // Subscribe to the event stream before sending the prompt so we don't miss events.
-  const { stream } = await client.event.subscribe()
-
-  await client.session.promptAsync({
-    path: { id: sessionID },
-    body: {
-      model: { providerID: model.providerID, modelID: model.modelID },
-      system,
-      tools: toolsMap,
-      parts: [{ type: "text", text: prompt }],
-    },
-  })
 
   let errorMessage = null
   let content = ""
@@ -805,6 +1079,25 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   }
 
   try {
+    const session = await client.session.create({ body: { title: `Proxy: ${model.id}` }, signal: options.signal })
+    sessionID = session.data.id
+    setGenerationControls(sessionID, options.controls)
+    const onAbort = () => client.session.abort?.({ path: { id: sessionID } }).catch(() => {})
+    options.signal?.addEventListener("abort", onAbort, { once: true })
+    // Subscribe before prompting so no events are missed.
+    const { stream } = await client.event.subscribe({ signal: options.signal })
+    await client.session.promptAsync({
+      path: { id: sessionID },
+      signal: options.signal,
+      body: {
+        model: { providerID: model.providerID, modelID: model.modelID },
+        system,
+        tools: toolsMap,
+        parts: promptParts(messages, options.media, model, options.maxRequestBytes ?? DEFAULTS.maxRequestBytes),
+        ...(options.format ? { format: options.format } : {}),
+        ...(options.variant ? { variant: options.variant } : {}),
+      },
+    })
     for await (const event of stream) {
       if (event.type === "message.part.delta") {
         // Real incremental token deltas arrive here, as flat properties (sessionID,
@@ -820,7 +1113,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
           props.delta.length > 0
         ) {
           content += props.delta
-          onChunk?.(props.delta)
+          await onChunk?.(props.delta)
         }
       } else if (event.type === "message.part.updated") {
         const part = event.properties?.part
@@ -853,7 +1146,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
           break
         }
       } else if (event.type === "session.error") {
-        if (!event.properties?.sessionID || event.properties.sessionID === sessionID) {
+        if (event.properties?.sessionID === sessionID) {
           errorMessage = event.properties?.error?.message ?? "Model call failed."
         }
         break
@@ -863,7 +1156,12 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         }
       }
     }
+    options.signal?.removeEventListener("abort", onAbort)
+  } catch (error) {
+    await deleteSession(client, sessionID, options.keepSessions)
+    throw error
   } finally {
+    clearGenerationControls(sessionID)
     releaseToolBridge(bridge)
   }
 
@@ -874,13 +1172,20 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   }))
 
   if (errorMessage && toolCalls.length === 0) {
+    await deleteSession(client, sessionID, options.keepSessions)
     throw new Error(errorMessage)
   }
 
   // Each list item is { info: Message, parts: Part[] } - matching the shape
   // client.session.prompt() (the non-tool-calling path) already returns directly.
-  const messagesResult = await client.session.messages({ path: { id: sessionID } })
-  const assistantEntry = (messagesResult.data ?? []).filter((m) => m.info?.role === "assistant").at(-1)
+  let assistantEntry
+  try {
+    const messagesResult = await client.session.messages({ path: { id: sessionID }, signal: options.signal })
+    assistantEntry = (messagesResult.data ?? []).filter((m) => m.info?.role === "assistant").at(-1)
+  } catch (error) {
+    await deleteSession(client, sessionID, options.keepSessions)
+    throw error
+  }
   const assistantInfo = assistantEntry?.info
 
   // Fallback for turns where message.part.delta never fired (observed for some
@@ -890,14 +1195,18 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   if (!content && toolCalls.length === 0) {
     content = extractAssistantText(assistantEntry?.parts ?? [])
   }
+  if (!content && assistantInfo?.structured !== undefined) content = JSON.stringify(assistantInfo.structured)
 
-  return {
+  const result = {
     sessionID,
     content,
     toolCalls,
     tokens: assistantInfo?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     finish: toolCalls.length > 0 ? "tool_calls" : assistantInfo?.finish,
+    structured: assistantInfo?.structured,
   }
+  await deleteSession(client, sessionID, options.keepSessions)
+  return result
 }
 
 async function listModels(client) {
@@ -912,6 +1221,11 @@ async function listModels(client) {
       providerID: provider.id,
       modelID: model.id,
       name: model.name ?? model.id,
+      capabilities: model.capabilities,
+      limit: model.limit,
+      cost: model.cost,
+      status: model.status,
+      variants: model.variants,
     }))
   })
 }
@@ -946,6 +1260,49 @@ export async function resolveModel(client, requestedModel, providerOverride) {
     )
   }
   throw new Error(`Unknown model '${requestedModel}'. Call GET /v1/models to inspect available IDs.`)
+}
+
+async function resolveModelCandidates(client, requestedModel, providerOverride, aliases = {}) {
+  const configured = aliases[requestedModel]
+  const targets = typeof configured === "string" ? [configured] : configured
+  if (configured !== undefined && (!Array.isArray(targets) || targets.length === 0 || targets.some((target) => typeof target !== "string"))) {
+    throw new ProxyError(`Model alias '${requestedModel}' is invalid.`, 500, "invalid_config")
+  }
+  const ids = targets ?? [requestedModel]
+  const models = []
+  for (const id of ids) models.push(await resolveModel(client, id, providerOverride))
+  return models
+}
+
+function isRetryableError(error) {
+  if (error instanceof ProxyError && error.status < 500) return false
+  return !error?.message?.toLowerCase().includes("invalid")
+}
+
+async function executeWithFallback(candidates, operation) {
+  let lastError
+  for (const candidate of candidates) {
+    try {
+      return { result: await operation(candidate), model: candidate }
+    } catch (error) {
+      lastError = error
+      if (!isRetryableError(error)) throw error
+    }
+  }
+  throw lastError
+}
+
+async function executeStreamingWithFallback(candidates, operation, hasOutput) {
+  let lastError
+  for (const candidate of candidates) {
+    try {
+      return { result: await operation(candidate), model: candidate }
+    } catch (error) {
+      lastError = error
+      if (hasOutput() || !isRetryableError(error)) throw error
+    }
+  }
+  throw lastError
 }
 
 export function createSseQueue() {
@@ -990,7 +1347,7 @@ export function createSseQueue() {
   return { enqueue, finish, generateChunks }
 }
 
-function sseResponse(corsHeadersObj, generator) {
+function streamResponse(headers, generator, options = {}) {
   const encoder = new TextEncoder()
   const body = new ReadableStream({
     async start(controller) {
@@ -1002,7 +1359,12 @@ function sseResponse(corsHeadersObj, generator) {
         // Stream errors are surfaced via SSE data before this point.
       } finally {
         controller.close()
+        options.onDone?.()
       }
+    },
+    cancel(reason) {
+      options.onCancel?.(reason)
+      options.onDone?.()
     },
   })
 
@@ -1010,11 +1372,24 @@ function sseResponse(corsHeadersObj, generator) {
     status: 200,
     headers: {
       "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
+      "cache-control": "no-store",
       connection: "keep-alive",
-      ...corsHeadersObj,
+      ...headers,
     },
   })
+}
+
+function sseResponse(headers, generator, options) {
+  return streamResponse(headers, generator, options)
+}
+
+function once(callback) {
+  let called = false
+  return () => {
+    if (called) return
+    called = true
+    callback?.()
+  }
 }
 
 function createModelResponse(models) {
@@ -1026,6 +1401,14 @@ function createModelResponse(models) {
       created: 0,
       owned_by: model.providerID,
       root: model.id,
+      x_opencode: {
+        name: model.name,
+        status: model.status,
+        capabilities: model.capabilities,
+        limits: model.limit,
+        variants: model.variants,
+        cost: model.cost,
+      },
     })),
   }
 }
@@ -1173,6 +1556,79 @@ export function normalizeGeminiContents(contents) {
     .filter((m) => m.content.length > 0)
 }
 
+function openAIMedia(messages) {
+  const media = []
+  for (const message of messages ?? []) {
+    for (const part of Array.isArray(message?.content) ? message.content : []) {
+      if (part?.type === "image_url") {
+        const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url
+        if (url) media.push({ type: "file", mime: /^data:([^;,]+)/.exec(url)?.[1] ?? "image/*", url })
+      } else if (part?.type === "input_image" && (part.image_url || part.file_data)) {
+        const url = part.image_url ?? part.file_data
+        media.push({ type: "file", mime: /^data:([^;,]+)/.exec(url)?.[1] ?? "image/*", url })
+      } else if (part?.type === "input_file" && (part.file_data || part.file_url)) {
+        const url = part.file_data ?? part.file_url
+        media.push({ type: "file", mime: part.mime_type ?? /^data:([^;,]+)/.exec(url)?.[1] ?? "application/octet-stream", url, filename: part.filename })
+      }
+    }
+  }
+  return media
+}
+
+function anthropicMedia(messages) {
+  const media = []
+  for (const message of messages ?? []) {
+    for (const block of Array.isArray(message?.content) ? message.content : []) {
+      if (!block || !["image", "document"].includes(block.type)) continue
+      const source = block.source
+      if (source?.type === "base64" && source.media_type && source.data) {
+        media.push({ type: "file", mime: source.media_type, url: `data:${source.media_type};base64,${source.data}` })
+      } else if (source?.type === "url" && source.url) {
+        media.push({ type: "file", mime: block.type === "image" ? "image/*" : "application/pdf", url: source.url })
+      }
+    }
+  }
+  return media
+}
+
+function geminiMedia(contents) {
+  const media = []
+  for (const item of contents ?? []) {
+    for (const part of item?.parts ?? []) {
+      const inline = part?.inlineData ?? part?.inline_data
+      const file = part?.fileData ?? part?.file_data
+      if (inline?.mimeType && inline.data) {
+        media.push({ type: "file", mime: inline.mimeType, url: `data:${inline.mimeType};base64,${inline.data}` })
+      } else if (file?.mimeType && file.fileUri) {
+        media.push({ type: "file", mime: file.mimeType, url: file.fileUri })
+      }
+    }
+  }
+  return media
+}
+
+function generationControls(body) {
+  const source = body.generationConfig ?? body
+  const controls = {}
+  if (source.temperature !== undefined) {
+    if (typeof source.temperature !== "number" || source.temperature < 0 || source.temperature > 2) {
+      throw new ProxyError("'temperature' must be a number between 0 and 2.", 400, "invalid_parameter")
+    }
+    controls.temperature = source.temperature
+  }
+  const topP = source.top_p ?? source.topP
+  if (topP !== undefined) {
+    if (typeof topP !== "number" || topP < 0 || topP > 1) throw new ProxyError("'top_p' must be between 0 and 1.", 400, "invalid_parameter")
+    controls.topP = topP
+  }
+  const topK = source.topK
+  if (topK !== undefined) {
+    if (!Number.isInteger(topK) || topK < 1) throw new ProxyError("'topK' must be a positive integer.", 400, "invalid_parameter")
+    controls.topK = topK
+  }
+  return controls
+}
+
 export function extractGeminiSystemInstruction(systemInstruction) {
   if (!systemInstruction) return null
   if (typeof systemInstruction === "string") return systemInstruction.trim()
@@ -1217,21 +1673,67 @@ function createGeminiResponse(content, finish, tokens, toolCalls) {
 
 function geminiModelFromPath(pathname) {
   // Matches /v1beta/models/some-model:generateContent or :streamGenerateContent
-  const match = pathname.match(/^\/v1beta\/models\/([^/:]+)(?::(?:generate|stream)(?:Content|GenerateContent))?$/)
-  return match ? match[1] : null
+  const match = pathname.match(/^\/v1beta\/models\/(.+):(?:generateContent|streamGenerateContent)$/)
+  return match ? decodeURIComponent(match[1]) : null
 }
 
 export function createProxyFetchHandler(client) {
+  const config = loadConfig()
   return async (request) => {
     const url = new URL(request.url)
+    const origin = request.headers.get("origin")
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders(request) })
+      const method = request.headers.get("access-control-request-method")
+      const requestedHeaders = (request.headers.get("access-control-request-headers") ?? "")
+        .split(",").map((value) => value.trim().toLowerCase()).filter(Boolean)
+      const allowedHeaders = new Set(["authorization", "content-type", "x-opencode-provider", "x-opencode-variant", "x-request-id"])
+      const allowedOrigin = origin && (config.corsOrigins.includes("*") || config.corsOrigins.includes(origin))
+      if (!allowedOrigin || (method && !["GET", "POST", "OPTIONS"].includes(method)) || requestedHeaders.some((value) => !allowedHeaders.has(value))) {
+        return text("CORS preflight rejected", 403, request, config)
+      }
+      return new Response(null, { status: 204, headers: commonHeaders(request, config) })
     }
 
-    if (!isAuthorized(request)) {
+    if (origin && !config.corsOrigins.includes("*") && !config.corsOrigins.includes(origin)) {
+      return text("Origin not allowed", 403, request, config)
+    }
+
+    if (!isAuthorized(request, config)) {
       return unauthorized(request)
     }
+
+    const started = Date.now()
+    const context = createRequestSignal(request, config.requestTimeoutMs)
+    let releaseSlot = () => {}
+    let deferredCleanup = false
+    if (request.method === "POST") {
+      try {
+        releaseSlot = await acquireRequestSlot(config, context.signal)
+      } catch (error) {
+        context.finish()
+        const status = error instanceof ProxyError ? error.status : 503
+        return badRequest(status === 503 ? "The proxy is busy. Try again later." : "Request was cancelled.", status, request)
+      }
+    }
+
+    const options = {
+      signal: context.signal,
+      maxRequestBytes: config.maxRequestBytes,
+      bridgeAcquireTimeoutMs: config.bridgeAcquireTimeoutMs,
+      keepSessions: config.keepSessions,
+    }
+    const streamCleanup = once(() => {
+      releaseSlot()
+      context.finish()
+      safeLog(client, "info", "Proxy stream completed", {
+        method: request.method,
+        path: url.pathname,
+        durationMs: Date.now() - started,
+      })
+    })
+
+    try {
 
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ healthy: true, service: "opencode-openai-proxy" }, 200, {}, request)
@@ -1252,9 +1754,9 @@ export function createProxyFetchHandler(client) {
     if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
       let body
       try {
-        body = await request.json()
-      } catch {
-        return badRequest("Request body must be valid JSON.", 400, request)
+        body = await readJsonBody(request, config.maxRequestBytes, context.signal)
+      } catch (error) {
+        return badRequest(error.message, error.status ?? 400, request)
       }
 
       if (!body.model) {
@@ -1266,39 +1768,52 @@ export function createProxyFetchHandler(client) {
       }
 
       const messages = normalizeMessages(body.messages)
-      if (messages.length === 0) {
+      const media = openAIMedia(body.messages)
+      if (messages.length === 0 && media.length === 0) {
         return badRequest("No text content was found in the supplied messages.", 400, request)
       }
 
-      let model
+      let candidates
       try {
+        validateUnsupportedControls(body)
         const providerOverride = request.headers.get("x-opencode-provider")
-        model = await resolveModel(client, body.model, providerOverride)
+        candidates = await resolveModelCandidates(client, body.model, providerOverride, config.aliases)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(client, "error", "Proxy completion failed", {
           error: message,
           requestedModel: body.model,
         })
-        return badRequest(message, 502, request)
+        return badRequest(error instanceof ProxyError ? message : "The requested model is unavailable.", error.status ?? 400, request)
       }
 
       const system = buildSystemPrompt(messages, body)
       const callerTools = applyOpenAIToolChoice(parseOpenAITools(body), body.tool_choice)
+      let requestOptions
+      try {
+        const format = structuredFormat(body)
+        if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request")
+        requestOptions = { ...options, media, format, controls: generationControls(body), variant: request.headers.get("x-opencode-variant") ?? undefined }
+      } catch (error) {
+        return badRequest(error.message, error.status ?? 400, request)
+      }
+      let model = candidates[0]
 
       if (body.stream) {
         const completionID = `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`
         const now = Math.floor(Date.now() / 1000)
 
         const queue = createSseQueue()
+        let emitted = false
 
         async function* generateSse() {
-          const runPromise = executePromptStreaming(
+          const runPromise = executeStreamingWithFallback(candidates, (candidate) => executePromptStreaming(
             client,
-            model,
+            candidate,
             messages,
             system,
             (delta) => {
+              emitted = true
               const chunk = JSON.stringify({
                 id: completionID,
                 object: "chat.completion.chunk",
@@ -1309,8 +1824,15 @@ export function createProxyFetchHandler(client) {
               queue.enqueue(`data: ${chunk}\n\n`)
             },
             callerTools,
-          )
-            .then((streamResult) => {
+            requestOptions,
+          ), () => emitted)
+            .then(({ result: streamResult, model: selectedModel }) => {
+              model = selectedModel
+              if (!emitted && streamResult.content && !(streamResult.toolCalls?.length > 0)) {
+                emitted = true
+                const chunk = JSON.stringify({ id: completionID, object: "chat.completion.chunk", created: now, model: model.id, choices: [{ index: 0, delta: { role: "assistant", content: streamResult.content }, finish_reason: null }] })
+                queue.enqueue(`data: ${chunk}\n\n`)
+              }
               const toolCalls = streamResult.toolCalls ?? []
               if (toolCalls.length > 0) {
                 const toolCallChunk = JSON.stringify({
@@ -1367,7 +1889,7 @@ export function createProxyFetchHandler(client) {
                 requestedModel: body.model,
               })
               const errChunk = JSON.stringify({
-                error: { message: streamError, type: "server_error" },
+                error: { message: "Upstream request failed.", type: "server_error" },
               })
               queue.enqueue(`data: ${errChunk}\n\ndata: [DONE]\n\n`)
             })
@@ -1380,28 +1902,34 @@ export function createProxyFetchHandler(client) {
           await runPromise
         }
 
-        return sseResponse(corsHeaders(request), generateSse())
+        deferredCleanup = true
+        return sseResponse(commonHeaders(request, config), generateSse(), {
+          onCancel: (reason) => context.abort(reason),
+          onDone: streamCleanup,
+        })
       }
 
       try {
-        const result = await executePrompt(client, body, model, messages, system, callerTools)
-        return json(createChatCompletionResponse(result, model), 200, {}, request)
+        const executed = await executeWithFallback(candidates, (candidate) =>
+          executePrompt(client, body, candidate, messages, system, callerTools, requestOptions))
+        model = executed.model
+        return json(createChatCompletionResponse(executed.result, model), 200, {}, request)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(client, "error", "Proxy completion failed", {
           error: message,
           requestedModel: body.model,
         })
-        return badRequest(message, 502, request)
+        return badRequest(error instanceof ProxyError ? message : "Upstream request failed.", error.status ?? 502, request)
       }
     }
 
     if (request.method === "POST" && url.pathname === "/v1/responses") {
       let body
       try {
-        body = await request.json()
-      } catch {
-        return badRequest("Request body must be valid JSON.", 400, request)
+        body = await readJsonBody(request, config.maxRequestBytes, context.signal)
+      } catch (error) {
+        return badRequest(error.message, error.status ?? 400, request)
       }
 
       if (!body.model) {
@@ -1409,7 +1937,8 @@ export function createProxyFetchHandler(client) {
       }
 
       const messages = normalizeResponseInput(body.input)
-      if (messages.length === 0) {
+      const media = openAIMedia(Array.isArray(body.input) ? body.input : [])
+      if (messages.length === 0 && media.length === 0) {
         return badRequest("The 'input' field must contain at least one text message.", 400, request)
       }
 
@@ -1425,18 +1954,28 @@ export function createProxyFetchHandler(client) {
       })
       const callerTools = applyOpenAIToolChoice(parseOpenAITools(body), body.tool_choice)
 
-      let model
+      let candidates
       try {
+        validateUnsupportedControls(body)
         const providerOverride = request.headers.get("x-opencode-provider")
-        model = await resolveModel(client, body.model, providerOverride)
+        candidates = await resolveModelCandidates(client, body.model, providerOverride, config.aliases)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(client, "error", "Proxy responses call failed", {
           error: message,
           requestedModel: body.model,
         })
-        return badRequest(message, 502, request)
+        return badRequest(error instanceof ProxyError ? message : "The requested model is unavailable.", error.status ?? 400, request)
       }
+      let requestOptions
+      try {
+        const format = structuredFormat(body)
+        if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request")
+        requestOptions = { ...options, media, format, controls: generationControls(body), variant: request.headers.get("x-opencode-variant") ?? body.reasoning?.effort ?? undefined }
+      } catch (error) {
+        return badRequest(error.message, error.status ?? 400, request)
+      }
+      let model = candidates[0]
 
       if (body.stream) {
         const responseID = `resp_${crypto.randomUUID().replace(/-/g, "")}`
@@ -1444,6 +1983,7 @@ export function createProxyFetchHandler(client) {
         const now = Math.floor(Date.now() / 1000)
 
         const queue = createSseQueue()
+        let emitted = false
 
         function sseEvent(eventType, data) {
           return `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`
@@ -1463,25 +2003,25 @@ export function createProxyFetchHandler(client) {
               },
             }),
           )
-          queue.enqueue(
-            sseEvent("response.output_item.added", {
-              type: "response.output_item.added",
-              output_index: 0,
-              item: { id: itemID, type: "message", status: "in_progress", role: "assistant", content: [] },
-            }),
-          )
-
           let partIndex = 0
           // Accumulate delta tokens so we can populate `text` on output_text.done and content_part.done per the
           // OpenAI Responses API SSE spec (https://platform.openai.com/docs/api-reference/responses-streaming).
           let accumulatedText = ""
-          const runPromise = executePromptStreaming(
+          const runPromise = executeStreamingWithFallback(candidates, (candidate) => executePromptStreaming(
             client,
-            model,
+            candidate,
             messages,
             system,
             (delta) => {
+              emitted = true
               if (partIndex === 0) {
+                queue.enqueue(
+                  sseEvent("response.output_item.added", {
+                    type: "response.output_item.added",
+                    output_index: 0,
+                    item: { id: itemID, type: "message", status: "in_progress", role: "assistant", content: [] },
+                  }),
+                )
                 queue.enqueue(
                   sseEvent("response.content_part.added", {
                     type: "response.content_part.added",
@@ -1505,15 +2045,25 @@ export function createProxyFetchHandler(client) {
               )
             },
             callerTools,
-          )
-            .then((streamResult) => {
+            requestOptions,
+          ), () => emitted)
+            .then(({ result: streamResult, model: selectedModel }) => {
+              model = selectedModel
+              if (!emitted && streamResult.content && !(streamResult.toolCalls?.length > 0)) {
+                accumulatedText = streamResult.content
+                emitted = true
+                queue.enqueue(sseEvent("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { id: itemID, type: "message", status: "in_progress", role: "assistant", content: [] } }))
+                queue.enqueue(sseEvent("response.content_part.added", { type: "response.content_part.added", item_id: itemID, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }))
+                queue.enqueue(sseEvent("response.output_text.delta", { type: "response.output_text.delta", item_id: itemID, output_index: 0, content_index: 0, delta: accumulatedText }))
+                partIndex = 1
+              }
               const toolCalls = streamResult.toolCalls ?? []
               if (toolCalls.length > 0) {
                 // Each parallel tool call is its own output item with a distinct output_index.
                 toolCalls.forEach((call, index) => {
                   const args = JSON.stringify(call.arguments ?? {})
                   const callItemID = `fc_${crypto.randomUUID().replace(/-/g, "")}`
-                  const outputIndex = index + 1
+                  const outputIndex = index
                   queue.enqueue(
                     sseEvent("response.output_item.added", {
                       type: "response.output_item.added",
@@ -1640,7 +2190,7 @@ export function createProxyFetchHandler(client) {
                     object: "response",
                     created_at: now,
                     status: "failed",
-                    error: { message: errMsg, code: "server_error" },
+                    error: { message: "Upstream request failed.", code: "server_error" },
                   },
                 }),
               )
@@ -1654,19 +2204,25 @@ export function createProxyFetchHandler(client) {
           await runPromise
         }
 
-        return sseResponse(corsHeaders(request), generateSse())
+        deferredCleanup = true
+        return sseResponse(commonHeaders(request, config), generateSse(), {
+          onCancel: (reason) => context.abort(reason),
+          onDone: streamCleanup,
+        })
       }
 
       try {
-        const result = await executePrompt(client, body, model, messages, system, callerTools)
-        return json(createResponsesApiResponse(result, model), 200, {}, request)
+        const executed = await executeWithFallback(candidates, (candidate) =>
+          executePrompt(client, body, candidate, messages, system, callerTools, requestOptions))
+        model = executed.model
+        return json(createResponsesApiResponse(executed.result, model), 200, {}, request)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(client, "error", "Proxy responses call failed", {
           error: message,
           requestedModel: body.model,
         })
-        return badRequest(message, 502, request)
+        return badRequest(error instanceof ProxyError ? message : "Upstream request failed.", error.status ?? 502, request)
       }
     }
 
@@ -1677,9 +2233,9 @@ export function createProxyFetchHandler(client) {
     if (request.method === "POST" && url.pathname === "/v1/messages") {
       let body
       try {
-        body = await request.json()
-      } catch {
-        return anthropicBadRequest("Request body must be valid JSON.", 400, request)
+        body = await readJsonBody(request, config.maxRequestBytes, context.signal)
+      } catch (error) {
+        return anthropicBadRequest(error.message, error.status ?? 400, request)
       }
 
       if (!body.model) {
@@ -1691,7 +2247,8 @@ export function createProxyFetchHandler(client) {
       }
 
       const messages = normalizeAnthropicMessages(body.messages)
-      if (messages.length === 0) {
+      const media = anthropicMedia(body.messages)
+      if (messages.length === 0 && media.length === 0) {
         return anthropicBadRequest("No text content was found in the supplied messages.", 400, request)
       }
 
@@ -1709,19 +2266,28 @@ export function createProxyFetchHandler(client) {
       })
       const callerTools = applyAnthropicToolChoice(parseAnthropicTools(body), body.tool_choice)
 
-      let model
+      let candidates
       try {
+        validateUnsupportedControls(body)
         const providerOverride = request.headers.get("x-opencode-provider")
-        model = await resolveModel(client, body.model, providerOverride)
+        candidates = await resolveModelCandidates(client, body.model, providerOverride, config.aliases)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(client, "error", "Anthropic proxy call failed (model resolve)", { error: message, requestedModel: body.model })
-        return anthropicBadRequest(message, 400, request)
+        return anthropicBadRequest(error instanceof ProxyError ? message : "The requested model is unavailable.", error.status ?? 400, request)
       }
+      let requestOptions
+      try {
+        requestOptions = { ...options, media, controls: generationControls(body), variant: request.headers.get("x-opencode-variant") ?? undefined }
+      } catch (error) {
+        return anthropicBadRequest(error.message, error.status ?? 400, request)
+      }
+      let model = candidates[0]
 
       if (body.stream) {
         const msgID = `msg_${crypto.randomUUID().replace(/-/g, "")}`
         const queue = createSseQueue()
+        let emitted = false
 
         function sseEvent(eventType, data) {
           return `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`
@@ -1743,12 +2309,13 @@ export function createProxyFetchHandler(client) {
           }))
 
           let textBlockStarted = false
-          const runPromise = executePromptStreaming(
+          const runPromise = executeStreamingWithFallback(candidates, (candidate) => executePromptStreaming(
             client,
-            model,
+            candidate,
             messages,
             system,
             (delta) => {
+              emitted = true
               if (!textBlockStarted) {
                 queue.enqueue(sseEvent("content_block_start", {
                   type: "content_block_start",
@@ -1764,8 +2331,16 @@ export function createProxyFetchHandler(client) {
               }))
             },
             callerTools,
-          )
-            .then((streamResult) => {
+            requestOptions,
+          ), () => emitted)
+            .then(({ result: streamResult, model: selectedModel }) => {
+              model = selectedModel
+              if (!emitted && streamResult.content && !(streamResult.toolCalls?.length > 0)) {
+                emitted = true
+                textBlockStarted = true
+                queue.enqueue(sseEvent("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }))
+                queue.enqueue(sseEvent("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: streamResult.content } }))
+              }
               const toolCalls = streamResult.toolCalls ?? []
               if (toolCalls.length > 0) {
                 if (textBlockStarted) {
@@ -1819,7 +2394,7 @@ export function createProxyFetchHandler(client) {
             .catch(async (err) => {
               const errMsg = err instanceof Error ? err.message : String(err)
               await safeLog(client, "error", "Anthropic proxy streaming call failed", { error: errMsg, requestedModel: body.model })
-              queue.enqueue(sseEvent("error", { type: "error", error: { type: "api_error", message: errMsg } }))
+              queue.enqueue(sseEvent("error", { type: "error", error: { type: "api_error", message: "Upstream request failed." } }))
             })
             .finally(() => {
               queue.finish()
@@ -1829,16 +2404,22 @@ export function createProxyFetchHandler(client) {
           await runPromise
         }
 
-        return sseResponse(corsHeaders(request), generateSse())
+        deferredCleanup = true
+        return sseResponse(commonHeaders(request, config), generateSse(), {
+          onCancel: (reason) => context.abort(reason),
+          onDone: streamCleanup,
+        })
       }
 
       try {
-        const result = await executePrompt(client, body, model, messages, system, callerTools)
-        return json(createAnthropicResponse(result, model), 200, {}, request)
+        const executed = await executeWithFallback(candidates, (candidate) =>
+          executePrompt(client, body, candidate, messages, system, callerTools, requestOptions))
+        model = executed.model
+        return json(createAnthropicResponse(executed.result, model), 200, {}, request)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(client, "error", "Anthropic proxy call failed", { error: message, requestedModel: body.model })
-        return anthropicInternalError(message, 500, request)
+        return anthropicInternalError(error instanceof ProxyError ? message : "Upstream request failed.", error.status ?? 502, request)
       }
     }
 
@@ -1858,9 +2439,9 @@ export function createProxyFetchHandler(client) {
 
       let body
       try {
-        body = await request.json()
-      } catch {
-        return badRequest("Request body must be valid JSON.", 400, request)
+        body = await readJsonBody(request, config.maxRequestBytes, context.signal)
+      } catch (error) {
+        return badRequest(error.message, error.status ?? 400, request)
       }
 
       if (!Array.isArray(body.contents) || body.contents.length === 0) {
@@ -1868,7 +2449,8 @@ export function createProxyFetchHandler(client) {
       }
 
       const messages = normalizeGeminiContents(body.contents)
-      if (messages.length === 0) {
+      const media = geminiMedia(body.contents)
+      if (messages.length === 0 && media.length === 0) {
         return badRequest("No text content was found in the supplied contents.", 400, request)
       }
 
@@ -1880,32 +2462,44 @@ export function createProxyFetchHandler(client) {
       })
       const callerTools = applyGeminiToolChoice(parseGeminiTools(body), body.toolConfig)
 
-      let model
+      let candidates
       try {
         const providerOverride = request.headers.get("x-opencode-provider")
-        model = await resolveModel(client, geminiModelName, providerOverride)
+        candidates = await resolveModelCandidates(client, geminiModelName, providerOverride, config.aliases)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(client, "error", "Gemini proxy call failed (model resolve)", { error: message, requestedModel: geminiModelName })
-        return badRequest(message, 400, request)
+        return badRequest(error instanceof ProxyError ? message : "The requested model is unavailable.", error.status ?? 400, request)
       }
-
+      let requestOptions
+      try {
+        requestOptions = { ...options, media, format: structuredFormat(body), controls: generationControls(body), variant: request.headers.get("x-opencode-variant") ?? undefined }
+      } catch (error) {
+        return badRequest(error.message, error.status ?? 400, request)
+      }
       if (isGeminiStream) {
         const queue = createSseQueue()
+        let emitted = false
 
         async function* generateNdJson() {
-          const runPromise = executePromptStreaming(
+          const runPromise = executeStreamingWithFallback(candidates, (candidate) => executePromptStreaming(
             client,
-            model,
+            candidate,
             messages,
             system,
             (delta) => {
+              emitted = true
               const chunk = JSON.stringify(createGeminiResponse(delta, null, null))
               queue.enqueue(chunk + "\n")
             },
             callerTools,
-          )
-            .then((streamResult) => {
+            requestOptions,
+          ), () => emitted)
+            .then(({ result: streamResult }) => {
+              if (!emitted && streamResult.content && !(streamResult.toolCalls?.length > 0)) {
+                emitted = true
+                queue.enqueue(JSON.stringify(createGeminiResponse(streamResult.content, null, null)) + "\n")
+              }
               const toolCalls = streamResult.toolCalls ?? []
               const finalChunk = JSON.stringify(
                 toolCalls.length > 0
@@ -1917,7 +2511,7 @@ export function createProxyFetchHandler(client) {
             .catch(async (err) => {
               const errMsg = err instanceof Error ? err.message : String(err)
               await safeLog(client, "error", "Gemini proxy streaming call failed", { error: errMsg, requestedModel: geminiModelName })
-              const errChunk = JSON.stringify({ error: { code: 500, message: errMsg, status: "INTERNAL" } })
+              const errChunk = JSON.stringify({ error: { code: 502, message: "Upstream request failed.", status: "UNAVAILABLE" } })
               queue.enqueue(errChunk + "\n")
             })
             .finally(() => {
@@ -1928,45 +2522,42 @@ export function createProxyFetchHandler(client) {
           await runPromise
         }
 
-        const encoder = new TextEncoder()
-        const body_ = new ReadableStream({
-          async start(controller) {
-            try {
-              for await (const chunk of generateNdJson()) {
-                controller.enqueue(encoder.encode(chunk))
-              }
-            } catch {
-              // errors surfaced via data
-            } finally {
-              controller.close()
-            }
-          },
-        })
-
-        return new Response(body_, {
-          status: 200,
-          headers: {
-            "content-type": "application/json",
-            "cache-control": "no-cache",
-            connection: "keep-alive",
-            ...corsHeaders(request),
-          },
+        deferredCleanup = true
+        return streamResponse({
+          ...commonHeaders(request, config),
+          "content-type": "application/x-ndjson; charset=utf-8",
+        }, generateNdJson(), {
+          onCancel: (reason) => context.abort(reason),
+          onDone: streamCleanup,
         })
       }
 
       try {
-        const result = await executePrompt(client, body, model, messages, system, callerTools)
+        const executed = await executeWithFallback(candidates, (candidate) =>
+          executePrompt(client, body, candidate, messages, system, callerTools, requestOptions))
+        const result = executed.result
         const finish = result.completion.data.info?.finish
         const tokens = result.completion.data.info?.tokens
         return json(createGeminiResponse(result.content, finish, tokens, result.toolCalls), 200, {}, request)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(client, "error", "Gemini proxy call failed", { error: message, requestedModel: geminiModelName })
-        return badRequest(message, 500, request)
+        return badRequest(error instanceof ProxyError ? message : "Upstream request failed.", error.status ?? 502, request)
       }
     }
 
-    return text("Not found", 404, request)
+    return text("Not found", 404, request, config)
+    } finally {
+      if (!deferredCleanup) {
+        releaseSlot()
+        context.finish()
+        safeLog(client, "info", "Proxy request completed", {
+          method: request.method,
+          path: url.pathname,
+          durationMs: Date.now() - started,
+        })
+      }
+    }
   }
 }
 
@@ -1976,10 +2567,23 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     return {}
   }
 
-  state.started = true
-
   const hostname = process.env.OPENCODE_LLM_PROXY_HOST ?? "127.0.0.1"
   const port = Number.parseInt(process.env.OPENCODE_LLM_PROXY_PORT ?? "4010", 10)
+  let config
+  try {
+    config = loadConfig()
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new ProxyError("Proxy port must be between 1 and 65535.", 500, "invalid_config")
+    const normalizedHost = hostname.replace(/^\[|\]$/g, "")
+    const loopback = normalizedHost === "localhost" || normalizedHost === "::1" || normalizedHost.startsWith("127.") || normalizedHost.startsWith("::ffff:127.")
+    if (!loopback && config.tokens.length === 0) {
+      throw new ProxyError("A bearer token is required when binding beyond loopback.", 500, "invalid_config")
+    }
+  } catch (error) {
+    await safeLog(client, "warn", "OpenAI proxy configuration is invalid", {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return {}
+  }
 
   let server
   try {
@@ -1998,6 +2602,7 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     return {}
   }
 
+  state.started = true
   state.server = server
 
   await safeLog(client, "info", "OpenAI proxy server started", {
@@ -2006,5 +2611,13 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     protected: Boolean(process.env.OPENCODE_LLM_PROXY_TOKEN),
   })
 
-  return {}
+  return {
+    "chat.params": async (input, output) => {
+      const controls = getState().generationControls?.get(input.sessionID)
+      if (!controls) return
+      if (controls.temperature !== undefined) output.temperature = controls.temperature
+      if (controls.topP !== undefined) output.topP = controls.topP
+      if (controls.topK !== undefined) output.topK = controls.topK
+    },
+  }
 }

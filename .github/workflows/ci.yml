@@ -10,10 +10,18 @@ on:
       - main
       - dev
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -25,7 +33,7 @@ jobs:
           node-version: "22"
 
       - name: Install dev dependencies
-        run: npm install
+        run: npm ci
 
       - name: Run lint
         run: npm run lint
@@ -33,6 +41,7 @@ jobs:
   test:
     name: Test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     strategy:
       matrix:
@@ -48,7 +57,30 @@ jobs:
           node-version: ${{ matrix.node-version }}
 
       - name: Install dev dependencies
-        run: npm install
+        run: npm ci
 
       - name: Run tests
         run: npm test
+
+  package:
+    name: Audit and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install dev dependencies
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit
+
+      - name: Check package contents
+        run: npm pack --dry-run
