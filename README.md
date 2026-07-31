@@ -121,6 +121,8 @@ Start OpenCode — the proxy starts automatically:
 opencode
 ```
 
+This package is an OpenCode plugin, not a standalone server. It intentionally has no `npm start` command; load it through OpenCode as shown above.
+
 Send a request:
 
 ```bash
@@ -177,9 +179,23 @@ curl -o .opencode/plugins/llm-proxy.js \
 |---|---|---|
 | `OPENCODE_LLM_PROXY_HOST` | `127.0.0.1` | Bind address. `0.0.0.0` to expose on LAN or Docker. |
 | `OPENCODE_LLM_PROXY_PORT` | `4010` | TCP port. |
-| `OPENCODE_LLM_PROXY_TOKEN` | _(unset)_ | Bearer token required on every request. Unset = no auth. |
-| `OPENCODE_LLM_PROXY_CORS_ORIGIN` | `*` | `Access-Control-Allow-Origin` value for browser clients. |
+| `OPENCODE_LLM_PROXY_TOKEN` | _(unset)_ | Single accepted bearer token. A token is required when binding beyond loopback. |
+| `OPENCODE_LLM_PROXY_TOKENS` | `[]` | JSON array of additional accepted bearer-token strings. |
+| `OPENCODE_LLM_PROXY_CORS_ORIGINS` | `[]` | JSON array of allowed browser origins. Browser cross-origin requests are denied by default; use `"*"` explicitly to allow all. |
+| `OPENCODE_LLM_PROXY_CORS_ORIGIN` | _(unset)_ | Legacy single origin appended to the CORS allowlist. |
+| `OPENCODE_LLM_PROXY_ALLOW_PRIVATE_NETWORK` | `false` | Set to `true` to allow browser Private Network Access preflights. |
+| `OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS` | `120000` | Total request timeout, from 1 to 3,600,000 ms. |
+| `OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES` | `1048576` | Maximum JSON request body and embedded data-URL size, up to 100 MiB. |
+| `OPENCODE_LLM_PROXY_MAX_CONCURRENT_REQUESTS` | `8` | Maximum active POST requests. |
+| `OPENCODE_LLM_PROXY_MAX_QUEUED_REQUESTS` | `32` | Maximum POST requests waiting for capacity; excess requests receive `503`. |
 | `OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE` | `8` | Max concurrent in-flight requests using [tool calling](#tool-calling). |
+| `OPENCODE_LLM_PROXY_TOOL_BRIDGE_ACQUIRE_TIMEOUT_MS` | `10000` | Maximum wait for a tool-bridge slot, from 1 to 3,600,000 ms. |
+| `OPENCODE_LLM_PROXY_KEEP_SESSIONS` | `false` | Set to `true` to retain temporary OpenCode sessions; otherwise they are deleted after use. |
+| `OPENCODE_LLM_PROXY_MODEL_ALIASES` | `{}` | JSON object mapping aliases to a model ID string or ordered array of fallback model IDs. |
+
+Use `x-opencode-variant` to select an OpenCode model variant for a request. The proxy accepts multimodal image, document, and file inputs in each API's native content shape, using embedded data URLs and validating model capabilities. Structured JSON output is supported through OpenAI `response_format.json_schema`, Responses API `text.format.schema`, and Gemini `generationConfig.responseSchema`.
+
+Generation `temperature`, `top_p`/`topP`, and `topK` values are validated and applied through the plugin's `chat.params` hook. Unsupported controls (`stop`, `seed`, `frequency_penalty`, `presence_penalty`, `logprobs`, and `n`) are rejected with `400` instead of being silently ignored.
 
 ```bash
 OPENCODE_LLM_PROXY_HOST=0.0.0.0 \
@@ -491,9 +507,9 @@ Same as above, returns newline-delimited JSON stream.
 
 Each request:
 
-1. Is authenticated if `OPENCODE_LLM_PROXY_TOKEN` is set
+1. Is authenticated if either token setting is configured; non-loopback binding requires a token
 2. Has its model resolved — `provider/model`, bare model ID, or Gemini URL path
-3. Creates a temporary OpenCode session (visible in the session list)
+3. Creates a temporary OpenCode session and deletes it after use unless `OPENCODE_LLM_PROXY_KEEP_SESSIONS=true`
 4. Sends the prompt via `client.session.prompt` / `client.session.promptAsync`
 5. Returns the response in the same format as the request
 
@@ -503,9 +519,9 @@ Streaming uses OpenCode's `client.event.subscribe()` SSE stream. Text deltas are
 
 ## Limitations
 
-- Text only — image, audio, and file inputs are ignored
+- Media support depends on the selected model's advertised image, audio, video, and PDF/file capabilities
 - No cross-request session state — send full conversation history on every request
-- Temperature and max tokens are advisory (passed as system prompt hints)
+- `temperature`, `top_p`/`topP`, and `topK` are applied through OpenCode's plugin hook. Maximum-token controls are accepted for client compatibility but cannot be enforced by the current OpenCode SDK.
 - Tool calling supports parallel calls in a single turn — see [Tool calling](#tool-calling) above
 
 ---

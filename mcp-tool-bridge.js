@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { Buffer } from "node:buffer"
+
 // Minimal MCP (Model Context Protocol) stdio server used internally by opencode-llm-proxy
 // to expose a proxy caller's OpenAI/Anthropic/Gemini tool schemas to OpenCode as if they
 // were real MCP tools.
@@ -37,7 +39,14 @@ function error(id, code, message) {
 // returns the response object to send, or null when no response is expected
 // (notifications, or requests without an id).
 export function dispatch(message, tools = []) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } }
+  }
+
   const { id, method, params } = message ?? {}
+  if (message.jsonrpc !== "2.0" || typeof method !== "string") {
+    return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } }
+  }
 
   switch (method) {
     case "initialize":
@@ -85,31 +94,75 @@ export function runStdioServer(tools, options = {}) {
   const output = options.output ?? process.stdout
   const errorOutput = options.errorOutput ?? process.stderr
   const onEnd = options.onEnd ?? (() => process.exit(0))
+  const configuredMax = Number(options.maxFrameBytes ?? process.env.OPENCODE_LLM_PROXY_BRIDGE_MAX_FRAME_BYTES)
+  const maxFrameBytes = Number.isSafeInteger(configuredMax) && configuredMax > 0 ? configuredMax : 1024 * 1024
 
   function send(message) {
     output.write(JSON.stringify(message) + "\n")
   }
 
+  function sendError(code, message) {
+    send({ jsonrpc: "2.0", id: null, error: { code, message } })
+  }
+
+  function processFrame(frame) {
+    const line = frame.trim()
+    if (!line) return
+    let message
+    try {
+      message = JSON.parse(line)
+    } catch (err) {
+      sendError(-32700, "Parse error")
+      errorOutput.write(`opencode-llm-proxy bridge: failed to parse message: ${err}\n`)
+      return
+    }
+    const response = dispatch(message, tools)
+    if (response) send(response)
+  }
+
   let buffer = ""
+  let bufferBytes = 0
+  let oversized = false
   input.setEncoding("utf8")
   input.on("data", (chunk) => {
-    buffer += chunk
-    let newlineIndex
-    while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
-      const line = buffer.slice(0, newlineIndex).trim()
-      buffer = buffer.slice(newlineIndex + 1)
-      if (!line) continue
-      try {
-        const message = JSON.parse(line)
-        const response = dispatch(message, tools)
-        if (response) send(response)
-      } catch (err) {
-        errorOutput.write(`opencode-llm-proxy bridge: failed to parse message: ${err}\n`)
+    let start = 0
+    for (let newlineIndex; (newlineIndex = chunk.indexOf("\n", start)) !== -1; start = newlineIndex + 1) {
+      const part = chunk.slice(start, newlineIndex)
+      if (!oversized) {
+        const partBytes = Buffer.byteLength(part)
+        if (bufferBytes + partBytes > maxFrameBytes) {
+          oversized = true
+          buffer = ""
+          bufferBytes = 0
+          sendError(-32600, "Invalid Request")
+        } else {
+          processFrame(buffer + part)
+        }
+      }
+      buffer = ""
+      bufferBytes = 0
+      oversized = false
+    }
+
+    const part = chunk.slice(start)
+    if (!oversized) {
+      const partBytes = Buffer.byteLength(part)
+      if (bufferBytes + partBytes > maxFrameBytes) {
+        oversized = true
+        buffer = ""
+        bufferBytes = 0
+        sendError(-32600, "Invalid Request")
+      } else {
+        buffer += part
+        bufferBytes += partBytes
       }
     }
   })
 
-  input.on("end", onEnd)
+  input.on("end", () => {
+    if (!oversized) processFrame(buffer)
+    onEnd()
+  })
 }
 
 // Only start the stdio server when executed directly (`node mcp-tool-bridge.js`),

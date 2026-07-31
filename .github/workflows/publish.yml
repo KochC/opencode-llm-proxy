@@ -11,10 +11,18 @@ on:
         description: "Git ref (tag or SHA) to publish"
         required: true
 
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
 jobs:
   test:
     name: Test before publish
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
     steps:
@@ -28,12 +36,16 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install dev dependencies
+        run: npm ci
+
       - name: Run tests
         run: npm test
 
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: test
     permissions:
       contents: read
@@ -64,6 +76,18 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        if: steps.check.outputs.skip == 'false'
+        run: npm ci
+
+      - name: Audit dependencies
+        if: steps.check.outputs.skip == 'false'
+        run: npm audit
+
+      - name: Check package contents
+        if: steps.check.outputs.skip == 'false'
+        run: npm pack --dry-run
 
       - name: Publish
         if: steps.check.outputs.skip == 'false'

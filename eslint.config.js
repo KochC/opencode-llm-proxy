@@ -19,6 +19,9 @@ export default [
         URL: "readonly",
         TextEncoder: "readonly",
         ReadableStream: "readonly",
+        AbortController: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
       },
     },
     rules: {

@@ -5,12 +5,19 @@
   "main": "index.js",
   "type": "module",
   "engines": {
+    "node": ">=20.19.0",
     "bun": ">=1.0.0"
   },
+  "files": [
+    "index.js",
+    "mcp-tool-bridge.js",
+    "README.md",
+    "LICENSE",
+    "docs/"
+  ],
   "scripts": {
     "test": "node --test --experimental-test-coverage",
-    "lint": "eslint .",
-    "start": "node index.js"
+    "lint": "eslint ."
   },
   "keywords": [
     "opencode",
@@ -49,7 +56,7 @@
     "url": "https://github.com/KochC/opencode-llm-proxy.git"
   },
   "peerDependencies": {
-    "opencode-ai": "*"
+    "opencode-ai": ">=1.0.0 <2"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
