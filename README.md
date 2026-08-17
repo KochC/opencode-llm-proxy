@@ -535,6 +535,12 @@ Streaming uses OpenCode's `client.event.subscribe()` SSE stream. Text deltas are
 
 ---
 
+## Compatibility
+
+The plugin ships a V1 plugin descriptor (`export default { id, server }`). OpenCode detects it (present in every release checked back to 1.15) and loads the plugin cleanly. On older builds the legacy loader probes every exported function, so you may see a harmless `failed to load plugin ... is not a function` line per worker in the startup log — the proxy still starts and serves normally.
+
+---
+
 ## Limitations
 
 - Media support depends on the selected model's advertised image, audio, video, and PDF/file capabilities
