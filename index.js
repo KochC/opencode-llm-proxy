@@ -621,12 +621,34 @@ function validateUnsupportedControls(request) {
   }
 }
 
-async function deleteSession(client, sessionID, keepSessions) {
+// Bound the best-effort delete: client.session.delete() accepts no abort signal
+// in older SDK shapes, and on the happy path it runs INSIDE the request's
+// finally — a hung SDK connection there would block the response forever and
+// hold the concurrency slot (observed as a full limiter wedge: /models keeps
+// answering while every completion hangs). Race it with a short timer; on
+// timeout give up — sweepStaleProxySessions reaps the session later anyway.
+// Read per-call (not at module load) so tests and runtime config changes apply.
+function deleteTimeoutMs() {
+  return integerEnv("OPENCODE_LLM_PROXY_DELETE_TIMEOUT_MS", 5000, { min: 100, max: 60000 })
+}
+
+async function deleteSession(client, sessionID, keepSessions, signal) {
   if (keepSessions || !sessionID || typeof client.session.delete !== "function") return
+  const attempt = client.session.delete({ path: { id: sessionID }, signal })
   try {
-    await client.session.delete({ path: { id: sessionID } })
+    await Promise.race([
+      attempt,
+      new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error("session delete timed out")), deleteTimeoutMs())
+        timer.unref?.()
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer)
+          reject(new Error("session delete aborted"))
+        }, { once: true })
+      }),
+    ])
   } catch {
-    // Best-effort cleanup for compatibility with older OpenCode clients.
+    // Best-effort cleanup: gave up (timeout/abort) — the stale-session sweep reaps it.
   }
 }
 
@@ -757,7 +779,7 @@ async function executePrompt(client, _request, model, messages, system, callerTo
     // Deleting an aborted/errored session here races the server's final persist
     // of the aborted turn (FOREIGN KEY constraint failures under bulk cancels).
     // Leak it instead; sweepStaleProxySessions reaps it once long idle.
-    if (settled) await deleteSession(client, sessionID, options.keepSessions)
+    if (settled) await deleteSession(client, sessionID, options.keepSessions, options.signal)
   }
 }
 
@@ -1402,7 +1424,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   // Safe teardown: only delete when the turn completed without a server-side
   // error (errorMessage with partial tool calls still lands here — the turn did
   // not settle cleanly, so leak it for the sweep instead).
-  if (!errorMessage) await deleteSession(client, sessionID, options.keepSessions)
+  if (!errorMessage) await deleteSession(client, sessionID, options.keepSessions, options.signal)
   return result
 }
 

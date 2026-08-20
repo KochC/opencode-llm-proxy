@@ -1172,7 +1172,9 @@ test("completed sessions are deleted when the client supports deletion", async (
   }))
 
   assert.equal(response.status, 200)
-  assert.deepEqual(deleted, [{ path: { id: "sess-resp-1" } }])
+  assert.equal(deleted.length, 1)
+  assert.equal(deleted[0].path.id, "sess-resp-1")
+  assert.ok(deleted[0].signal instanceof AbortSignal, "delete carries the request signal")
 })
 
 test("structured output schema is forwarded and structured data is extracted", async () => {

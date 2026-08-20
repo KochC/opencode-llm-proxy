@@ -274,6 +274,49 @@ test("sweep ignores seconds-epoch timestamps (units mismatch fails safe)", async
   assert.deepEqual(deleted, [], "seconds-epoch timestamps must not classify as stale ms-epoch")
 })
 
+test("hung session.delete does not block the response past the delete timeout", async () => {
+  process.env.OPENCODE_LLM_PROXY_DELETE_TIMEOUT_MS = "250"
+  try {
+    const state = { created: [], deleted: [] }
+    const client = {
+      state,
+      app: { log: async () => {} },
+      tool: { ids: async () => ({ data: [] }) },
+      config: {
+        providers: async () => ({
+          data: { providers: [{ id: "openai", models: { first: { id: "first" } } }] },
+        }),
+      },
+      session: {
+        create: async () => {
+          const id = `session-${state.created.length + 1}`
+          state.created.push(id)
+          return { data: { id } }
+        },
+        prompt: async () => ({
+          data: {
+            info: { finish: "stop", tokens: TOKENS },
+            parts: [{ type: "text", text: "hello" }],
+          },
+        }),
+        list: async () => ({ data: [] }),
+        delete: () => new Promise(() => {}), // never resolves — hung SDK connection
+      },
+    }
+    await withServer(client, async (port) => {
+      const t0 = Date.now()
+      const response = await postCompletion(port, { timeoutMs: 8000 })
+      const elapsed = Date.now() - t0
+      assert.equal(response.status, 200)
+      assert.ok(elapsed < 3000, `response took ${elapsed}ms; hung delete must not block it`)
+      assert.equal(client.state.created.length, 1)
+      assert.deepEqual(client.state.deleted, [], "hung delete means no completed delete")
+    })
+  } finally {
+    delete process.env.OPENCODE_LLM_PROXY_DELETE_TIMEOUT_MS
+  }
+})
+
 test("streaming success still deletes the throwaway session", async () => {
   const client = createMockClient({ streamEvents: deltaThenIdle })
   await withServer(client, async (port) => {
