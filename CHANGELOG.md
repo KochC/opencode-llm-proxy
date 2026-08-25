@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.10.1](https://github.com/KochC/opencode-llm-proxy/compare/v1.10.0...v1.10.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* **plugin:** add V1 default export descriptor to stop legacy loader probing every helper ([8c262c4](https://github.com/KochC/opencode-llm-proxy/commit/8c262c440c5b3864089281be5b97a06ba35d5312))
+* **plugin:** add V1 default export descriptor to stop legacy loader probing every helper ([d0ba94e](https://github.com/KochC/opencode-llm-proxy/commit/d0ba94e0ce5bc5d572eda9934258a2baff457b41)), closes [#86](https://github.com/KochC/opencode-llm-proxy/issues/86)
+
 ## [1.10.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.9.0...v1.10.0) (2026-07-31)
 
 
