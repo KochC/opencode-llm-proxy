@@ -191,7 +191,7 @@ curl -o .opencode/plugins/llm-proxy.js \
 | `OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE` | `8` | Max concurrent in-flight requests using [tool calling](#tool-calling). |
 | `OPENCODE_LLM_PROXY_TOOL_BRIDGE_ACQUIRE_TIMEOUT_MS` | `10000` | Maximum wait for a tool-bridge slot, from 1 to 3,600,000 ms. |
 | `OPENCODE_LLM_PROXY_TOOL_BRIDGE_MAX_QUEUE` | `32` | Maximum tool-calling requests waiting for a bridge slot, from 0 to 10,000; excess requests receive `429`. |
-| `OPENCODE_LLM_PROXY_KEEP_SESSIONS` | `false` | Set to `true` to retain temporary OpenCode sessions; otherwise they are deleted after use. |
+| `OPENCODE_LLM_PROXY_KEEP_SESSIONS` | `false` | Set to `true` to retain temporary OpenCode sessions; otherwise they are deleted after use. Kept sessions are still swept after 24h idle (see [Session lifecycle](#session-lifecycle-safe-teardown)). |
 | `OPENCODE_LLM_PROXY_MODEL_ALIASES` | `{}` | JSON object mapping aliases to a model ID string or ordered array of fallback model IDs. |
 | `OPENCODE_LLM_PROXY_METRICS_ENABLED` | `false` | Set to `true` to expose the authenticated Prometheus endpoint at `GET /metrics`. |
 | `OPENCODE_LLM_PROXY_REMOTE_MEDIA_ENABLED` | `false` | Set to `true` to fetch remote media URLs and convert them to embedded data URLs. Leave disabled unless required. |
@@ -205,6 +205,15 @@ curl -o .opencode/plugins/llm-proxy.js \
 Use `x-opencode-variant` to select an OpenCode model variant for a request. The proxy accepts multimodal image, document, and file inputs in each API's native content shape, using embedded data URLs and validating model capabilities. Remote URLs are rejected unless the SSRF-safe remote-media fetcher is explicitly enabled; fetched content is converted to a data URL before it reaches OpenCode. Structured JSON output is supported through OpenAI `response_format.json_schema`, Responses API `text.format.schema`, and Gemini `generationConfig.responseSchema`.
 
 Generation `temperature`, top-p (`top_p`/`topP`), and top-k (`topK`) values are validated and applied through the plugin's `chat.params` hook. Maximum-token fields (`max_tokens`, `max_completion_tokens`, `max_output_tokens`, and Gemini `maxOutputTokens`) are accepted where clients require them, but the current OpenCode SDK cannot enforce them. OpenAI and Anthropic requests reject unsupported controls (`stop`, `seed`, `frequency_penalty`, `presence_penalty`, `logprobs`, and `n`) with `400` instead of silently ignoring them.
+
+### Session lifecycle (safe teardown)
+
+Each proxied request runs in a throwaway OpenCode session titled `Proxy: <model-id>` (**"Proxy: " is a reserved title prefix** — do not name your own sessions with it). When a request completes normally, the session is deleted immediately. When a request is abandoned mid-turn (client disconnect, timeout, or error), the session is **intentionally left in place**: deleting it immediately races the OpenCode server's final persist of the aborted turn, which surfaces as `FOREIGN KEY constraint failed` errors in the server log (observed at thousands per day under bulk clients that cancel slow streams, e.g. RAG pipelines with aggressive timeouts).
+
+Leaked sessions are reaped by a background sweep at plugin start and every 6 hours: `Proxy:`-titled sessions idle for more than 24 hours are deleted (long-idle deletes are race-free). Notes:
+
+- The first start after upgrading to this behavior will burn down any previously leaked backlog in one pass.
+- With `OPENCODE_LLM_PROXY_KEEP_SESSIONS=true`, kept sessions carry the same title and are subject to the same 24h reap — if you need a longer inspection window, inspect within a day or copy what you need.
 
 ```bash
 OPENCODE_LLM_PROXY_HOST=0.0.0.0 \

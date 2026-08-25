@@ -621,13 +621,97 @@ function validateUnsupportedControls(request) {
   }
 }
 
-async function deleteSession(client, sessionID, keepSessions) {
+// Bound the best-effort delete: client.session.delete() accepts no abort signal
+// in older SDK shapes, and on the happy path it runs INSIDE the request's
+// finally — a hung SDK connection there would block the response forever and
+// hold the concurrency slot (observed as a full limiter wedge: /models keeps
+// answering while every completion hangs). Race it with a short timer; on
+// timeout give up — sweepStaleProxySessions reaps the session later anyway.
+// Read per-call (not at module load) so tests and runtime config changes apply.
+function deleteTimeoutMs() {
+  return integerEnv("OPENCODE_LLM_PROXY_DELETE_TIMEOUT_MS", 5000, { min: 100, max: 60000 })
+}
+
+async function deleteSession(client, sessionID, keepSessions, signal) {
   if (keepSessions || !sessionID || typeof client.session.delete !== "function") return
+  const attempt = client.session.delete({ path: { id: sessionID }, signal })
   try {
-    await client.session.delete({ path: { id: sessionID } })
+    await Promise.race([
+      attempt,
+      new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error("session delete timed out")), deleteTimeoutMs())
+        timer.unref?.()
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer)
+          reject(new Error("session delete aborted"))
+        }, { once: true })
+      }),
+    ])
   } catch {
-    // Best-effort cleanup for compatibility with older OpenCode clients.
+    // Best-effort cleanup: gave up (timeout/abort) — the stale-session sweep reaps it.
   }
+}
+
+// Safe teardown: sessions abandoned mid-turn (client abort, error, timeout) are
+// intentionally leaked at abandon time and reaped by this sweep once they are
+// long idle. Deleting them immediately races the server's final persist of the
+// aborted turn: the delete commits while the turn's last message insert is still
+// in flight, and the insert then fails with
+// "FOREIGN KEY constraint failed: insert into message" against the deleted
+// session row. Under bulk clients that cancel slow streams (RAG pipelines with
+// aggressive timeouts, retry loops), this produced thousands of constraint
+// errors per day. Deleting only settled sessions mirrors how long-lived SDK
+// consumers (e.g. chat bots that keep one session per conversation) avoid the
+// race entirely.
+//
+// NOTE: "Proxy: " is a reserved title prefix — this plugin titles its throwaway
+// sessions `Proxy: <model-id>` at creation. Do not name real sessions with this
+// prefix: idle ones get reaped here. Internal helper — exported for tests.
+export async function sweepStaleProxySessions(client, maxAgeMs = 24 * 60 * 60 * 1000) {
+  if (typeof client.session.list !== "function") return
+  let sessions
+  try {
+    const result = await client.session.list()
+    sessions = result.data ?? []
+  } catch (error) {
+    await safeLog(client, "warn", "OpenAI proxy stale-session sweep could not list sessions", {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return
+  }
+  const cutoff = Date.now() - maxAgeMs
+  let reaped = 0
+  for (const s of sessions) {
+    if (!s?.title?.startsWith("Proxy:")) continue
+    const updated = Number(s.time_updated ?? s.timeUpdated ?? 0)
+    // Fail safe: only treat as a stale ms-epoch timestamp. Rejects seconds-epoch
+    // values, NaN, and missing fields (those sessions are left for the next sweep
+    // rather than risk mass-deleting fresh ones on a units mismatch).
+    if (!(updated > 1e12) || updated >= cutoff) continue
+    try {
+      await client.session.delete({ path: { id: s.id } })
+      reaped++
+    } catch {
+      // skip; a later sweep retries
+    }
+  }
+  if (reaped > 0) {
+    await safeLog(client, "info", "OpenAI proxy stale-session sweep", { reaped })
+  }
+}
+
+const SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+// Run the sweep at startup and every SWEEP_INTERVAL_MS so long-lived processes
+// still reap leaked sessions. The timer is unref'd: it never keeps the process
+// alive on its own.
+function scheduleSessionSweeps(client) {
+  void sweepStaleProxySessions(client).catch(() => {})
+  const timer = setInterval(() => {
+    void sweepStaleProxySessions(client).catch(() => {})
+  }, SWEEP_INTERVAL_MS)
+  timer.unref?.()
+  return timer
 }
 
 function setGenerationControls(sessionID, controls) {
@@ -665,6 +749,7 @@ async function executePrompt(client, _request, model, messages, system, callerTo
 
   const tools = await getDisabledTools(client)
   let sessionID
+  let settled = false // safe teardown: only delete sessions whose turn fully settled
   try {
     const session = await client.session.create({ body: { title: `Proxy: ${model.id}` }, signal: options.signal })
     sessionID = session.data.id
@@ -687,10 +772,14 @@ async function executePrompt(client, _request, model, messages, system, callerTo
 
     if (!content && completion.data.info?.error) throw new Error(completion.data.info.error.message ?? "Model call failed.")
 
+    settled = true
     return { content, structured, toolCalls: [], completion, request: _request, sessionID }
   } finally {
     clearGenerationControls(sessionID)
-    await deleteSession(client, sessionID, options.keepSessions)
+    // Deleting an aborted/errored session here races the server's final persist
+    // of the aborted turn (FOREIGN KEY constraint failures under bulk cancels).
+    // Leak it instead; sweepStaleProxySessions reaps it once long idle.
+    if (settled) await deleteSession(client, sessionID, options.keepSessions, options.signal)
   }
 }
 
@@ -1277,7 +1366,9 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
       }
     }
   } catch (error) {
-    await deleteSession(client, sessionID, options.keepSessions)
+    // Safe teardown: no delete on abort/error — it races the server's final
+    // persist of the aborted turn (FOREIGN KEY failures under bulk cancels).
+    // The session leaks inert; sweepStaleProxySessions reaps it once long idle.
     throw error
   } finally {
     removeAbortListener()
@@ -1297,7 +1388,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   }))
 
   if (errorMessage && toolCalls.length === 0) {
-    await deleteSession(client, sessionID, options.keepSessions)
+    // Safe teardown: leak-on-error (was: delete then throw).
     throw new Error(errorMessage)
   }
 
@@ -1308,7 +1399,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     const messagesResult = await client.session.messages({ path: { id: sessionID }, signal: options.signal })
     assistantEntry = (messagesResult.data ?? []).filter((m) => m.info?.role === "assistant").at(-1)
   } catch (error) {
-    await deleteSession(client, sessionID, options.keepSessions)
+    // Safe teardown: leak-on-error (was: delete then throw).
     throw error
   }
   const assistantInfo = assistantEntry?.info
@@ -1330,7 +1421,10 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     finish: toolCalls.length > 0 ? "tool_calls" : assistantInfo?.finish,
     structured: assistantInfo?.structured,
   }
-  await deleteSession(client, sessionID, options.keepSessions)
+  // Safe teardown: only delete when the turn completed without a server-side
+  // error (errorMessage with partial tool calls still lands here — the turn did
+  // not settle cleanly, so leak it for the sweep instead).
+  if (!errorMessage) await deleteSession(client, sessionID, options.keepSessions, options.signal)
   return result
 }
 
@@ -2753,6 +2847,10 @@ export const OpenAIProxyPlugin = async ({ client }) => {
 
   state.started = true
   state.server = server
+
+  // Safe teardown: reap stale leaked "Proxy:" sessions now and periodically
+  // (fire-and-forget; never blocks or fails startup).
+  state.sweepTimer = scheduleSessionSweeps(client)
 
   await safeLog(client, "info", "OpenAI proxy server started", {
     hostname,
