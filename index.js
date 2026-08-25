@@ -2868,3 +2868,13 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     },
   }
 }
+
+// V1 plugin descriptor. opencode's plugin loader (readV1Plugin in
+// packages/opencode/src/plugin/shared.ts) prefers a default export of this
+// shape and invokes only `server`. Without it, the loader falls back to the
+// legacy path, which invokes EVERY function-typed export as if it were the
+// plugin — the pure helpers (buildPrompt, mapFinishReason, ...) then throw on
+// the plugin-init argument and every worker logs "failed to load plugin"
+// (see issue #86). Exporting the descriptor keeps all named exports intact
+// for direct imports and tests.
+export default { id: "opencode-llm-proxy", server: OpenAIProxyPlugin }

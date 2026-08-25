@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { setTimeout as delay } from "node:timers/promises"
 import { PassThrough } from "node:stream"
 
+import * as mod from "./index.js"
 import {
   createProxyFetchHandler,
   createSseQueue,
@@ -3440,21 +3441,25 @@ describe("mcp-tool-bridge runStdioServer", () => {
 // OpenAIProxyPlugin (plugin entrypoint / server bootstrap)
 // ---------------------------------------------------------------------------
 
-describe("OpenAIProxyPlugin", () => {
-  const STATE_KEY = "__opencodeOpenAIProxyState"
+// Shared Bun.serve mock: the plugin starts its HTTP server via Bun.serve, so
+// tests stub globalThis.Bun and inspect the options it was called with.
+const PROXY_STATE_KEY = "__opencodeOpenAIProxyState"
 
-  function withMockedBun(serve, run) {
-    const savedBun = globalThis.Bun
-    delete globalThis[STATE_KEY]
-    globalThis.Bun = { serve }
-    return Promise.resolve()
-      .then(run)
-      .finally(() => {
-        if (savedBun === undefined) delete globalThis.Bun
-        else globalThis.Bun = savedBun
-        delete globalThis[STATE_KEY]
-      })
-  }
+function withMockedBun(serve, run) {
+  const savedBun = globalThis.Bun
+  delete globalThis[PROXY_STATE_KEY]
+  globalThis.Bun = { serve }
+  return Promise.resolve()
+    .then(run)
+    .finally(() => {
+      if (savedBun === undefined) delete globalThis.Bun
+      else globalThis.Bun = savedBun
+      delete globalThis[PROXY_STATE_KEY]
+    })
+}
+
+describe("OpenAIProxyPlugin", () => {
+  const STATE_KEY = PROXY_STATE_KEY
 
   it("starts a Bun server and records it in global state", async () => {
     const calls = []
@@ -3589,3 +3594,42 @@ describe("OpenAIProxyPlugin", () => {
     )
   })
 })
+
+// ---------------------------------------------------------------------------
+// V1 plugin descriptor (default export)
+// ---------------------------------------------------------------------------
+
+describe("V1 plugin default export", () => {
+  it("exposes a { id, server } descriptor so opencode's loader skips the legacy fallback", async () => {
+    assert.ok(mod.default, "index.js must have a default export")
+    assert.equal(typeof mod.default, "object", "default export must be a V1 descriptor object")
+    assert.equal(mod.default.id, "opencode-llm-proxy")
+    assert.equal(typeof mod.default.server, "function", "descriptor.server must be the plugin factory")
+  })
+
+  it("descriptor.server starts the proxy when invoked, like the loader would", async () => {
+    const calls = []
+
+    await withMockedBun(
+      (opts) => {
+        calls.push(opts)
+        return { stopped: false }
+      },
+      async () => {
+        process.env.OPENCODE_LLM_PROXY_HOST = "127.0.0.1"
+        process.env.OPENCODE_LLM_PROXY_PORT = "4997"
+        try {
+          const result = await mod.default.server({ client: createClient() })
+
+          assert.equal(typeof result["chat.params"], "function")
+          assert.equal(calls.length, 1)
+          assert.equal(calls[0].port, 4997)
+        } finally {
+          delete process.env.OPENCODE_LLM_PROXY_HOST
+          delete process.env.OPENCODE_LLM_PROXY_PORT
+        }
+      },
+    )
+  })
+})
+

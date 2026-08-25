@@ -3389,6 +3389,7 @@ var OpenAIProxyPlugin = async ({ client }) => {
     }
   };
 };
+var index_default = { id: "opencode-llm-proxy", server: OpenAIProxyPlugin };
 export {
   OpenAIProxyPlugin,
   applyAnthropicToolChoice,
@@ -3399,6 +3400,7 @@ export {
   buildToolsMap,
   createProxyFetchHandler,
   createSseQueue,
+  index_default as default,
   extractAssistantText,
   extractGeminiSystemInstruction,
   mapFinishReason,
