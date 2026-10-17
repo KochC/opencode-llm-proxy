@@ -1027,6 +1027,274 @@ async function prepareMedia(media, config = {}, signal, metrics) {
   }
 }
 
+// opencode-v2.js
+var TOOL_PREFIX = "px";
+var MAX_TOOL_NAME = 64;
+var MEDIA_KINDS = ["text", "image", "audio", "video", "pdf"];
+var TOOL_PLACEHOLDER_TIMEOUT_MS = 6e4;
+var SUBSCRIBE_READY_TIMEOUT_MS = 2e3;
+var USAGE_GRACE_MS = 3e3;
+var EMPTY_TOKENS = Object.freeze({ input: 0, output: 0, reasoning: 0, cache: Object.freeze({ read: 0, write: 0 }) });
+function delay(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    timer.unref?.();
+  });
+}
+function cancelled(signal) {
+  const error = signal?.reason;
+  if (error instanceof Error) return error;
+  const fallback = new Error("Request was cancelled.");
+  fallback.status = 499;
+  fallback.code = "cancelled";
+  return fallback;
+}
+function toolName(prefix, name, seen) {
+  let base = String(name ?? "").replace(/[^a-zA-Z0-9_]/g, "_") || "tool";
+  base = base.slice(0, MAX_TOOL_NAME - prefix.length - 4);
+  let candidate = `${prefix}${base}`;
+  let suffix = 2;
+  while (seen.has(candidate)) candidate = `${prefix}${base}_${suffix++}`;
+  seen.add(candidate);
+  return candidate;
+}
+function normalizeV2Model(model) {
+  const input = Array.isArray(model.capabilities?.input) ? model.capabilities.input : [];
+  const capabilities = {
+    ...model.capabilities,
+    input: Object.fromEntries([.../* @__PURE__ */ new Set([...MEDIA_KINDS, ...input])].map((kind) => [kind, input.includes(kind)]))
+  };
+  return {
+    id: `${model.providerID}/${model.modelID}`,
+    providerID: model.providerID,
+    modelID: model.modelID,
+    name: model.name ?? model.modelID,
+    capabilities,
+    limit: model.limit,
+    cost: model.cost,
+    status: model.status,
+    variants: Object.fromEntries((model.variants ?? []).map((variant) => [variant.id, variant.settings ?? {}]))
+  };
+}
+function addTokens(total, tokens) {
+  if (!tokens) return total;
+  return {
+    input: total.input + (tokens.input ?? 0),
+    output: total.output + (tokens.output ?? 0),
+    reasoning: total.reasoning + (tokens.reasoning ?? 0),
+    cache: {
+      read: total.cache.read + (tokens.cache?.read ?? 0),
+      write: total.cache.write + (tokens.cache?.write ?? 0)
+    }
+  };
+}
+function mapFinish(finish) {
+  if (finish === "tool-calls") return "tool_calls";
+  return finish;
+}
+function structuredInstruction(format) {
+  return [
+    "Respond with only a JSON value that conforms to the following JSON Schema.",
+    "Do not wrap it in Markdown code fences and do not add any commentary.",
+    JSON.stringify(format.schema)
+  ].join("\n");
+}
+function parseStructured(text2) {
+  const trimmed = String(text2 ?? "").trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+  try {
+    return JSON.parse(fenced ? fenced[1] : trimmed);
+  } catch {
+    return void 0;
+  }
+}
+function assistantText(messages) {
+  const assistant = (messages ?? []).filter((message) => message.type === "assistant").at(-1);
+  return (assistant?.content ?? []).filter((part) => part.type === "text" && typeof part.text === "string").map((part) => part.text).join("").trim();
+}
+function waitForAbort(signal, timeoutMs) {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve({ content: "The tool call was forwarded to the API caller." });
+    };
+    const timer = setTimeout(done, timeoutMs);
+    timer.unref?.();
+    if (signal?.aborted) return done();
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+function createV2Backend(ctx, options = {}) {
+  const turns = /* @__PURE__ */ new Map();
+  let nextTurn = 0;
+  const placeholderTimeoutMs = options.toolPlaceholderTimeoutMs ?? TOOL_PLACEHOLDER_TIMEOUT_MS;
+  const proxyToolPattern = new RegExp(`^${TOOL_PREFIX}\\d+_`);
+  async function install() {
+    await ctx.session.hook("context", (event) => {
+      const turn = turns.get(event.sessionID);
+      if (!turn) {
+        for (const name of Object.keys(event.tools)) {
+          if (proxyToolPattern.test(name)) delete event.tools[name];
+        }
+        return;
+      }
+      event.system = turn.system ? [{ type: "text", text: turn.system }] : [];
+      event.tools = Object.fromEntries(Object.entries(event.tools).filter(([name]) => turn.toolNames.has(name)));
+      const controls = turn.controls ?? {};
+      if (controls.temperature !== void 0) event.options.temperature = controls.temperature;
+      if (controls.topP !== void 0) event.options.topP = controls.topP;
+      if (controls.topK !== void 0) event.options.topK = controls.topK;
+    });
+  }
+  async function listModels2() {
+    const result = await ctx.model.list();
+    const models = Array.isArray(result?.data) ? result.data : Array.isArray(result) ? result : [];
+    return models.filter((model) => model.enabled !== false).map(normalizeV2Model);
+  }
+  async function registerTools(tools) {
+    const prefix = `${TOOL_PREFIX}${nextTurn++}_`;
+    const seen = /* @__PURE__ */ new Set();
+    const nameMap = /* @__PURE__ */ new Map();
+    const definitions = tools.map((tool) => {
+      const name = toolName(prefix, tool.name, seen);
+      nameMap.set(name, tool.name);
+      return {
+        name,
+        description: tool.description || tool.name,
+        input: tool.parameters,
+        // Direct tools only: Code Mode tools are reachable solely through OpenCode's `execute` tool.
+        options: { codemode: false },
+        execute: (_input, context) => waitForAbort(context?.signal, placeholderTimeoutMs)
+      };
+    });
+    const registration = await ctx.tool.transform((editor) => {
+      for (const definition of definitions) editor.add(definition);
+    });
+    return { registration, nameMap, toolNames: new Set(nameMap.keys()) };
+  }
+  async function runTurn(input) {
+    const { model, system, text: text2, media = [], tools = [], format, variant, controls, onChunk, signal, keepSessions } = input;
+    if (signal?.aborted) throw cancelled(signal);
+    const bridge = tools.length > 0 ? await registerTools(tools) : null;
+    const subscription = new AbortController();
+    const abortSubscription = () => subscription.abort();
+    signal?.addEventListener("abort", abortSubscription, { once: true });
+    let sessionID;
+    let content = "";
+    let tokens = EMPTY_TOKENS;
+    let finish;
+    let errorMessage = null;
+    let toolMessageID = null;
+    const calls = /* @__PURE__ */ new Map();
+    const interrupt = () => ctx.session.interrupt({ sessionID }).catch(() => {
+    });
+    try {
+      const session = await ctx.session.create({
+        title: `Proxy: ${model.id}`,
+        model: { providerID: model.providerID, id: model.modelID, ...variant ? { variant } : {} }
+      });
+      sessionID = session.id;
+      turns.set(sessionID, {
+        system: [system, format ? structuredInstruction(format) : ""].filter(Boolean).join("\n\n"),
+        toolNames: bridge?.toolNames ?? /* @__PURE__ */ new Set(),
+        controls
+      });
+      signal?.addEventListener("abort", interrupt, { once: true });
+      const events = ctx.event.subscribe({ signal: subscription.signal })[Symbol.asyncIterator]();
+      let pending = events.next();
+      const first = await Promise.race([pending, delay(SUBSCRIBE_READY_TIMEOUT_MS)]);
+      if (first && !first.done && first.value?.type === "server.connected") pending = null;
+      await ctx.session.prompt({
+        sessionID,
+        text: text2,
+        ...media.length > 0 ? { files: media.map((part) => ({ uri: part.url, ...part.filename ? { name: part.filename } : {} })) } : {}
+      });
+      let captured = false;
+      while (true) {
+        const next = await (captured ? Promise.race([pending ?? events.next(), delay(USAGE_GRACE_MS)]) : pending ?? events.next());
+        pending = null;
+        if (!next || next.done) break;
+        const event = next.value;
+        const data = event?.data;
+        if (data?.sessionID !== sessionID) continue;
+        if (event.type === "session.text.delta") {
+          if (typeof data.delta === "string" && data.delta.length > 0) {
+            content += data.delta;
+            await onChunk?.(data.delta);
+          }
+        } else if (event.type === "session.tool.input.started") {
+          if (bridge?.toolNames.has(data.name) && (!toolMessageID || data.assistantMessageID === toolMessageID)) {
+            toolMessageID = data.assistantMessageID;
+            calls.set(data.id, { id: data.id, name: bridge.nameMap.get(data.name), arguments: {} });
+          }
+        } else if (event.type === "session.tool.called") {
+          const call = calls.get(data.id);
+          if (call && data.input && typeof data.input === "object") call.arguments = data.input;
+        } else if (event.type === "session.step.streamed") {
+          if (!captured && calls.size > 0 && data.assistantMessageID === toolMessageID) {
+            captured = true;
+            void interrupt();
+          }
+        } else if (event.type === "session.step.ended") {
+          tokens = addTokens(tokens, data.tokens);
+          finish = data.finish;
+          if (calls.size > 0 && data.assistantMessageID === toolMessageID) {
+            if (!captured) await interrupt();
+            break;
+          }
+        } else if (event.type === "session.step.failed") {
+          tokens = addTokens(tokens, data.tokens);
+          errorMessage = data.error?.message ?? "Model call failed.";
+        } else if (event.type === "session.execution.failed") {
+          errorMessage = data.error?.message ?? errorMessage ?? "Model call failed.";
+          break;
+        } else if (event.type === "session.execution.succeeded" || event.type === "session.execution.interrupted" || event.type === "session.idle") {
+          break;
+        }
+      }
+      if (signal?.aborted) throw cancelled(signal);
+      const toolCalls = [...calls.values()];
+      if (errorMessage && toolCalls.length === 0) throw new Error(errorMessage);
+      if (!content && toolCalls.length === 0) {
+        try {
+          content = assistantText(await ctx.session.context({ sessionID }));
+        } catch {
+        }
+      }
+      const structured = format && toolCalls.length === 0 ? parseStructured(content) : void 0;
+      return {
+        sessionID,
+        content: structured === void 0 ? content : JSON.stringify(structured),
+        structured,
+        toolCalls,
+        tokens,
+        finish: toolCalls.length > 0 ? "tool_calls" : mapFinish(finish)
+      };
+    } catch (error) {
+      if (signal?.aborted) throw cancelled(signal);
+      throw error;
+    } finally {
+      signal?.removeEventListener("abort", abortSubscription);
+      signal?.removeEventListener("abort", interrupt);
+      subscription.abort();
+      if (sessionID) turns.delete(sessionID);
+      if (bridge) await bridge.registration.dispose().catch(() => {
+      });
+      if (sessionID && !keepSessions) await ctx.session.remove({ sessionID }).catch(() => {
+      });
+    }
+  }
+  function log(level, message, extra) {
+    const write = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
+    try {
+      write(`[opencode-llm-proxy] ${message}`, extra ?? "");
+    } catch {
+    }
+  }
+  return { v2: true, install, listModels: listModels2, runTurn, log };
+}
+
 // index.js
 var STATE_KEY = "__opencodeOpenAIProxyState";
 var BRIDGE_SCRIPT_PATH = fileURLToPath(new URL("./mcp-tool-bridge.js", import.meta.url));
@@ -1563,7 +1831,34 @@ function setGenerationControls(sessionID, controls) {
 function clearGenerationControls(sessionID) {
   getState().generationControls?.delete(sessionID);
 }
+function v2TurnInput(model, messages, system, callerTools, options, onChunk) {
+  const [prompt, ...media] = promptParts(messages, options.media, model, options.maxRequestBytes ?? DEFAULTS.maxRequestBytes);
+  return {
+    model,
+    system,
+    text: prompt.text,
+    media,
+    tools: Array.isArray(callerTools) ? callerTools : [],
+    format: options.format,
+    variant: options.variant,
+    controls: options.controls,
+    onChunk,
+    signal: options.signal,
+    keepSessions: options.keepSessions
+  };
+}
 async function executePrompt(client, _request, model, messages, system, callerTools = [], options = {}) {
+  if (client.v2) {
+    const result = await client.runTurn(v2TurnInput(model, messages, system, callerTools, options));
+    return {
+      content: result.content,
+      structured: result.structured,
+      toolCalls: result.toolCalls,
+      request: _request,
+      sessionID: result.sessionID,
+      completion: { data: { info: { finish: result.finish, tokens: result.tokens } } }
+    };
+  }
   if (Array.isArray(callerTools) && callerTools.length > 0) {
     const result = await runAgentTurn(client, model, messages, system, callerTools, () => {
     }, options);
@@ -1610,6 +1905,7 @@ async function executePrompt(client, _request, model, messages, system, callerTo
   }
 }
 async function executePromptStreaming(client, model, messages, system, onChunk, callerTools = [], options = {}) {
+  if (client.v2) return client.runTurn(v2TurnInput(model, messages, system, callerTools, options, onChunk));
   const result = await runAgentTurn(client, model, messages, system, callerTools, onChunk, options);
   return {
     sessionID: result.sessionID,
@@ -1723,6 +2019,7 @@ function mapFinishReason(finish) {
   return "stop";
 }
 async function safeLog(client, level, message, extra) {
+  if (client.v2) return client.log(level, message, extra);
   try {
     await client.app.log({
       body: {
@@ -2112,6 +2409,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   return result;
 }
 async function listModels(client) {
+  if (client.v2) return client.listModels();
   const result = await client.config.providers();
   const payload = result.data;
   const all = Array.isArray(payload?.providers) ? payload.providers : [];
@@ -3335,10 +3633,10 @@ data: ${JSON.stringify(data)}
     return response;
   };
 }
-var OpenAIProxyPlugin = async ({ client }) => {
+async function startProxyServer(client) {
   const state = getState();
   if (state.started) {
-    return {};
+    return null;
   }
   const hostname = process.env.OPENCODE_LLM_PROXY_HOST ?? "127.0.0.1";
   const port = Number.parseInt(process.env.OPENCODE_LLM_PROXY_PORT ?? "4010", 10);
@@ -3355,7 +3653,7 @@ var OpenAIProxyPlugin = async ({ client }) => {
     await safeLog(client, "warn", "OpenAI proxy configuration is invalid", {
       error: error instanceof Error ? error.message : String(error)
     });
-    return {};
+    return null;
   }
   let server;
   try {
@@ -3370,7 +3668,7 @@ var OpenAIProxyPlugin = async ({ client }) => {
       port,
       error: error instanceof Error ? error.message : String(error)
     });
-    return {};
+    return null;
   }
   state.started = true;
   state.server = server;
@@ -3379,6 +3677,13 @@ var OpenAIProxyPlugin = async ({ client }) => {
     port,
     protected: Boolean(process.env.OPENCODE_LLM_PROXY_TOKEN)
   });
+  return server;
+}
+var OpenAIProxyPlugin = async ({ client }) => {
+  const server = await startProxyServer(client);
+  if (!server) {
+    return {};
+  }
   return {
     "chat.params": async (input, output) => {
       const controls = getState().generationControls?.get(input.sessionID);
@@ -3389,7 +3694,35 @@ var OpenAIProxyPlugin = async ({ client }) => {
     }
   };
 };
-var index_default = { id: "opencode-llm-proxy", server: OpenAIProxyPlugin };
+async function setupV2(ctx) {
+  const state = getState();
+  const backend = createV2Backend(ctx);
+  await backend.install();
+  state.v2Backends ??= [];
+  state.v2Backends.push(backend);
+  if (!state.v2Client) {
+    const current = () => state.v2Backends[0];
+    state.v2Client = {
+      v2: true,
+      listModels: (...args) => current().listModels(...args),
+      runTurn: (...args) => current().runTurn(...args),
+      log: (...args) => current().log(...args)
+    };
+  }
+  const server = await startProxyServer(state.v2Client);
+  if (server) state.v2Server = server;
+  return async () => {
+    state.v2Backends = state.v2Backends.filter((entry) => entry !== backend);
+    if (state.v2Backends.length > 0 || !state.v2Server) return;
+    const owned = state.v2Server;
+    state.v2Server = void 0;
+    state.v2Client = void 0;
+    state.started = false;
+    state.server = void 0;
+    await owned.stop(true);
+  };
+}
+var index_default = { id: "opencode-llm-proxy", setup: setupV2, server: OpenAIProxyPlugin };
 export {
   OpenAIProxyPlugin,
   applyAnthropicToolChoice,
@@ -3418,5 +3751,6 @@ export {
   releaseToolBridge,
   resolveModel,
   sanitizeToolName,
+  setupV2,
   toTextContent
 };
