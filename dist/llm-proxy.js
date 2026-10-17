@@ -2271,6 +2271,47 @@ function buildToolsMap(baseTools, bridge) {
   for (const id of bridge.toolIDs) toolsMap[id] = true;
   return toolsMap;
 }
+var POLL_INTERVAL_MS = 300;
+async function pollAgentTurn(client, sessionID, ctx) {
+  while (!ctx.state.finished) {
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    if (ctx.state.finished || ctx.signal?.aborted) return void 0;
+    let list;
+    try {
+      const result = await client.session.messages({ path: { id: sessionID }, signal: ctx.signal });
+      list = result.data ?? [];
+    } catch {
+      continue;
+    }
+    if (ctx.state.finished) return void 0;
+    const assistants = list.filter((entry) => entry.info?.role === "assistant");
+    if (assistants.length === 0) continue;
+    const failed = assistants.find((entry) => entry.info?.error);
+    if (failed) {
+      const error = failed.info.error;
+      ctx.onError(error?.data?.message ?? error?.message ?? "Model call failed.");
+      return "done";
+    }
+    if (ctx.toolIDSet) {
+      const toolEntry = assistants.find(
+        (entry) => (entry.parts ?? []).some((part) => part.type === "tool" && ctx.toolIDSet.has(part.tool))
+      );
+      if (toolEntry) {
+        for (const part of toolEntry.parts ?? []) {
+          if (part.type === "tool" && ctx.toolIDSet.has(part.tool)) ctx.recordToolPart(part);
+        }
+        const stepDone = (toolEntry.parts ?? []).some((part) => part.type === "step-finish") || toolEntry.info?.finish === "tool-calls" || Boolean(toolEntry.info?.time?.completed);
+        if (stepDone) return "tool";
+        continue;
+      }
+    }
+    const text2 = assistants.flatMap((entry) => entry.parts ?? []).filter((part) => part.type === "text" && typeof part.text === "string" && !part.synthetic).map((part) => part.text).join("");
+    if (text2) ctx.onText(text2);
+    const last = assistants.at(-1);
+    if (last.info?.time?.completed && last.info?.finish && last.info.finish !== "tool-calls") return "done";
+  }
+  return void 0;
+}
 async function runAgentTurn(client, model, messages, system, callerTools, onChunk, options = {}) {
   const baseTools = await getDisabledTools(client);
   let toolsMap = baseTools;
@@ -2292,6 +2333,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   let content = "";
   const toolCallsByID = /* @__PURE__ */ new Map();
   let toolMessageID = null;
+  let turnState = null;
   const recordToolPart = (part) => {
     const callID = part.callID;
     if (!callID) return;
@@ -2332,44 +2374,84 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         ...options.variant ? { variant: options.variant } : {}
       }
     });
-    for await (const event of stream) {
-      if (event.type === "message.part.delta") {
-        const props = event.properties;
-        if (props?.sessionID === sessionID && props?.field === "text" && typeof props.delta === "string" && props.delta.length > 0) {
-          content += props.delta;
-          await onChunk?.(props.delta);
-        }
-      } else if (event.type === "message.part.updated") {
-        const part = event.properties?.part;
-        if (!part || part.sessionID !== sessionID) continue;
-        if (toolIDSet && part.type === "tool" && toolIDSet.has(part.tool) && (!toolMessageID || part.messageID === toolMessageID)) {
-          if (part.messageID) toolMessageID = part.messageID;
-          recordToolPart(part);
-        } else if (part.type === "step-finish" && toolCallsByID.size > 0 && (!toolMessageID || part.messageID === toolMessageID)) {
-          try {
-            await client.session.abort({ path: { id: sessionID } });
-          } catch {
+    turnState = { finished: false };
+    const eventLoop = (async () => {
+      for await (const event of stream) {
+        if (turnState.finished) break;
+        if (event.type === "message.part.delta") {
+          const props = event.properties;
+          if (props?.sessionID === sessionID && props?.field === "text" && typeof props.delta === "string" && props.delta.length > 0) {
+            content += props.delta;
+            await onChunk?.(props.delta);
+          }
+        } else if (event.type === "message.part.updated") {
+          const part = event.properties?.part;
+          if (!part || part.sessionID !== sessionID) continue;
+          if (toolIDSet && part.type === "tool" && toolIDSet.has(part.tool) && (!toolMessageID || part.messageID === toolMessageID)) {
+            if (part.messageID) toolMessageID = part.messageID;
+            recordToolPart(part);
+          } else if (part.type === "step-finish" && toolCallsByID.size > 0 && (!toolMessageID || part.messageID === toolMessageID)) {
+            try {
+              await client.session.abort({ path: { id: sessionID } });
+            } catch {
+            }
+            break;
+          }
+        } else if (event.type === "session.error") {
+          if (event.properties?.sessionID === sessionID) {
+            errorMessage = event.properties?.error?.message ?? "Model call failed.";
           }
           break;
-        }
-      } else if (event.type === "session.error") {
-        if (event.properties?.sessionID === sessionID) {
-          errorMessage = event.properties?.error?.message ?? "Model call failed.";
-        }
-        break;
-      } else if (event.type === "session.idle") {
-        if (event.properties?.sessionID === sessionID) {
-          break;
+        } else if (event.type === "session.idle") {
+          if (event.properties?.sessionID === sessionID) {
+            break;
+          }
         }
       }
+    })();
+    const pollLoop = pollAgentTurn(client, sessionID, {
+      state: turnState,
+      signal: options.signal,
+      toolIDSet,
+      recordToolPart,
+      onError: (message) => {
+        errorMessage = message;
+      },
+      onText: (fullText) => {
+        if (fullText.length > content.length && fullText.startsWith(content)) {
+          const delta = fullText.slice(content.length);
+          content = fullText;
+          Promise.resolve(onChunk?.(delta)).catch(() => {
+          });
+        }
+      }
+    });
+    eventLoop.catch(() => {
+    });
+    const winner = await Promise.race([
+      eventLoop.then(() => "events"),
+      pollLoop.then((outcome) => outcome ?? "aborted")
+    ]);
+    turnState.finished = true;
+    if (winner === "tool") {
+      try {
+        await client.session.abort({ path: { id: sessionID } });
+      } catch {
+      }
     }
+    if (options.signal?.aborted) throw options.signal.reason ?? new Error("Request was cancelled.");
   } catch (error) {
     await deleteSession(client, sessionID, options.keepSessions);
     throw error;
   } finally {
+    if (turnState) turnState.finished = true;
     removeAbortListener();
     try {
-      await eventStream?.return?.();
+      const disposal = eventStream?.return?.();
+      if (disposal && typeof disposal.then === "function") {
+        await Promise.race([disposal.catch(() => {
+        }), new Promise((resolve) => setTimeout(resolve, 250))]);
+      }
     } catch {
     }
     clearGenerationControls(sessionID);

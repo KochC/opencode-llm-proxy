@@ -1175,6 +1175,67 @@ export function buildToolsMap(baseTools, bridge) {
   return toolsMap
 }
 
+// Polls the session's persisted messages and resolves when the turn is over. This is the
+// fallback for OpenCode builds whose event stream (client.event.subscribe) never delivers
+// message/session events to the plugin, which otherwise leaves the read loop waiting forever.
+// Returns "tool" (bridge tool-calling step finished), "done" (final answer), or undefined
+// (stopped because the event loop finished first or the request was aborted).
+const POLL_INTERVAL_MS = 300
+
+async function pollAgentTurn(client, sessionID, ctx) {
+  while (!ctx.state.finished) {
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
+    if (ctx.state.finished || ctx.signal?.aborted) return undefined
+    let list
+    try {
+      const result = await client.session.messages({ path: { id: sessionID }, signal: ctx.signal })
+      list = result.data ?? []
+    } catch {
+      continue
+    }
+    if (ctx.state.finished) return undefined
+    const assistants = list.filter((entry) => entry.info?.role === "assistant")
+    if (assistants.length === 0) continue
+
+    const failed = assistants.find((entry) => entry.info?.error)
+    if (failed) {
+      const error = failed.info.error
+      ctx.onError(error?.data?.message ?? error?.message ?? "Model call failed.")
+      return "done"
+    }
+
+    if (ctx.toolIDSet) {
+      // Only the first assistant message carrying bridge tool calls counts; anything after
+      // it is OpenCode reacting to the placeholder results and must not leak through.
+      const toolEntry = assistants.find((entry) =>
+        (entry.parts ?? []).some((part) => part.type === "tool" && ctx.toolIDSet.has(part.tool)),
+      )
+      if (toolEntry) {
+        for (const part of toolEntry.parts ?? []) {
+          if (part.type === "tool" && ctx.toolIDSet.has(part.tool)) ctx.recordToolPart(part)
+        }
+        const stepDone =
+          (toolEntry.parts ?? []).some((part) => part.type === "step-finish") ||
+          toolEntry.info?.finish === "tool-calls" ||
+          Boolean(toolEntry.info?.time?.completed)
+        if (stepDone) return "tool"
+        continue
+      }
+    }
+
+    const text = assistants
+      .flatMap((entry) => entry.parts ?? [])
+      .filter((part) => part.type === "text" && typeof part.text === "string" && !part.synthetic)
+      .map((part) => part.text)
+      .join("")
+    if (text) ctx.onText(text)
+
+    const last = assistants.at(-1)
+    if (last.info?.time?.completed && last.info?.finish && last.info.finish !== "tool-calls") return "done"
+  }
+  return undefined
+}
+
 async function runAgentTurn(client, model, messages, system, callerTools, onChunk, options = {}) {
   const baseTools = await getDisabledTools(client)
   let toolsMap = baseTools
@@ -1205,6 +1266,9 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   // tool parts (and the terminating step-finish) from this same message, so a follow-up
   // agent step can never leak spurious calls into the result.
   let toolMessageID = null
+  // Shared between the event-stream reader and the session poller; whichever sees the
+  // end of the turn first marks it finished so the other stops.
+  let turnState = null
 
   const recordToolPart = (part) => {
     const callID = part.callID
@@ -1250,7 +1314,10 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         ...(options.variant ? { variant: options.variant } : {}),
       },
     })
+    turnState = { finished: false }
+    const eventLoop = (async () => {
     for await (const event of stream) {
+      if (turnState.finished) break
       if (event.type === "message.part.delta") {
         // Real incremental token deltas arrive here, as flat properties (sessionID,
         // partID, field, delta) - NOT nested under event.properties.part like
@@ -1308,13 +1375,57 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         }
       }
     }
+    })()
+
+    const pollLoop = pollAgentTurn(client, sessionID, {
+      state: turnState,
+      signal: options.signal,
+      toolIDSet,
+      recordToolPart,
+      onError: (message) => {
+        errorMessage = message
+      },
+      onText: (fullText) => {
+        // Emit only what the event stream hasn't already delivered.
+        if (fullText.length > content.length && fullText.startsWith(content)) {
+          const delta = fullText.slice(content.length)
+          content = fullText
+          Promise.resolve(onChunk?.(delta)).catch(() => {})
+        }
+      },
+    })
+
+    // If the poller ends the turn first, a later failure of the abandoned event loop
+    // must not surface as an unhandled rejection.
+    eventLoop.catch(() => {})
+    const winner = await Promise.race([
+      eventLoop.then(() => "events"),
+      pollLoop.then((outcome) => outcome ?? "aborted"),
+    ])
+    turnState.finished = true
+    if (winner === "tool") {
+      // Same reasoning as the step-finish branch above: stop OpenCode before it runs a
+      // follow-up step on the placeholder bridge results.
+      try {
+        await client.session.abort({ path: { id: sessionID } })
+      } catch {
+        // Best effort.
+      }
+    }
+    if (options.signal?.aborted) throw options.signal.reason ?? new Error("Request was cancelled.")
   } catch (error) {
     await deleteSession(client, sessionID, options.keepSessions)
     throw error
   } finally {
+    if (turnState) turnState.finished = true
     removeAbortListener()
+    // Don't block on iterator disposal: when the turn was ended by the poller, the event
+    // iterator may be suspended on a next() that never settles.
     try {
-      await eventStream?.return?.()
+      const disposal = eventStream?.return?.()
+      if (disposal && typeof disposal.then === "function") {
+        await Promise.race([disposal.catch(() => {}), new Promise((resolve) => setTimeout(resolve, 250))])
+      }
     } catch {
       // Signal and session cleanup remain authoritative if iterator disposal fails.
     }
