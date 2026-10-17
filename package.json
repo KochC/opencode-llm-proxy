@@ -13,6 +13,7 @@
     "canonical-messages.js",
     "metrics.js",
     "remote-media.js",
+    "opencode-v2.js",
     "dist/llm-proxy.js",
     "mcp-tool-bridge.js",
     "README.md",
@@ -64,7 +65,16 @@
     "url": "https://github.com/KochC/opencode-llm-proxy.git"
   },
   "peerDependencies": {
+    "@opencode/plugin": ">=2.0.0",
     "opencode-ai": ">=1.0.0 <2"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    },
+    "opencode-ai": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

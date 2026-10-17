@@ -3594,15 +3594,16 @@ describe("OpenAIProxyPlugin", () => {
 })
 
 // ---------------------------------------------------------------------------
-// V1 plugin descriptor (default export)
+// Plugin descriptor (default export)
 // ---------------------------------------------------------------------------
 
-describe("V1 plugin default export", () => {
-  it("exposes a { id, server } descriptor so opencode's loader skips the legacy fallback", async () => {
+describe("plugin default export", () => {
+  it("exposes an { id, server, setup } descriptor so opencode's loader skips the legacy fallback", async () => {
     assert.ok(mod.default, "index.js must have a default export")
-    assert.equal(typeof mod.default, "object", "default export must be a V1 descriptor object")
+    assert.equal(typeof mod.default, "object", "default export must be a plugin descriptor object")
     assert.equal(mod.default.id, "opencode-llm-proxy")
-    assert.equal(typeof mod.default.server, "function", "descriptor.server must be the plugin factory")
+    assert.equal(typeof mod.default.server, "function", "descriptor.server must be the V1 plugin factory")
+    assert.equal(typeof mod.default.setup, "function", "descriptor.setup must be the V2 entry point")
   })
 
   it("descriptor.server starts the proxy when invoked, like the loader would", async () => {

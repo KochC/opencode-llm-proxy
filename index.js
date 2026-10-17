@@ -10,6 +10,7 @@ import {
 } from "./canonical-messages.js"
 import { getMetrics } from "./metrics.js"
 import { MediaError, prepareMedia } from "./remote-media.js"
+import { createV2Backend } from "./opencode-v2.js"
 
 const STATE_KEY = "__opencodeOpenAIProxyState"
 const BRIDGE_SCRIPT_PATH = fileURLToPath(new URL("./mcp-tool-bridge.js", import.meta.url))
@@ -641,7 +642,36 @@ function clearGenerationControls(sessionID) {
   getState().generationControls?.delete(sessionID)
 }
 
+function v2TurnInput(model, messages, system, callerTools, options, onChunk) {
+  const [prompt, ...media] = promptParts(messages, options.media, model, options.maxRequestBytes ?? DEFAULTS.maxRequestBytes)
+  return {
+    model,
+    system,
+    text: prompt.text,
+    media,
+    tools: Array.isArray(callerTools) ? callerTools : [],
+    format: options.format,
+    variant: options.variant,
+    controls: options.controls,
+    onChunk,
+    signal: options.signal,
+    keepSessions: options.keepSessions,
+  }
+}
+
 async function executePrompt(client, _request, model, messages, system, callerTools = [], options = {}) {
+  if (client.v2) {
+    const result = await client.runTurn(v2TurnInput(model, messages, system, callerTools, options))
+    return {
+      content: result.content,
+      structured: result.structured,
+      toolCalls: result.toolCalls,
+      request: _request,
+      sessionID: result.sessionID,
+      completion: { data: { info: { finish: result.finish, tokens: result.tokens } } },
+    }
+  }
+
   if (Array.isArray(callerTools) && callerTools.length > 0) {
     // Tool-aware path: must watch the event stream (via runAgentTurn) rather than
     // block on session.prompt, so we can intercept a proposed tool call instead of
@@ -695,6 +725,7 @@ async function executePrompt(client, _request, model, messages, system, callerTo
 }
 
 async function executePromptStreaming(client, model, messages, system, onChunk, callerTools = [], options = {}) {
+  if (client.v2) return client.runTurn(v2TurnInput(model, messages, system, callerTools, options, onChunk))
   const result = await runAgentTurn(client, model, messages, system, callerTools, onChunk, options)
   return {
     sessionID: result.sessionID,
@@ -822,6 +853,7 @@ export function mapFinishReason(finish) {
 }
 
 async function safeLog(client, level, message, extra) {
+  if (client.v2) return client.log(level, message, extra)
   try {
     await client.app.log({
       body: {
@@ -1335,6 +1367,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
 }
 
 async function listModels(client) {
+  if (client.v2) return client.listModels()
   const result = await client.config.providers()
   const payload = result.data
   const all = Array.isArray(payload?.providers) ? payload.providers : []
@@ -2710,10 +2743,10 @@ export function createProxyFetchHandler(client) {
   }
 }
 
-export const OpenAIProxyPlugin = async ({ client }) => {
+async function startProxyServer(client) {
   const state = getState()
   if (state.started) {
-    return {}
+    return null
   }
 
   const hostname = process.env.OPENCODE_LLM_PROXY_HOST ?? "127.0.0.1"
@@ -2731,7 +2764,7 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     await safeLog(client, "warn", "OpenAI proxy configuration is invalid", {
       error: error instanceof Error ? error.message : String(error),
     })
-    return {}
+    return null
   }
 
   let server
@@ -2748,7 +2781,7 @@ export const OpenAIProxyPlugin = async ({ client }) => {
       port,
       error: error instanceof Error ? error.message : String(error),
     })
-    return {}
+    return null
   }
 
   state.started = true
@@ -2759,6 +2792,14 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     port,
     protected: Boolean(process.env.OPENCODE_LLM_PROXY_TOKEN),
   })
+  return server
+}
+
+export const OpenAIProxyPlugin = async ({ client }) => {
+  const server = await startProxyServer(client)
+  if (!server) {
+    return {}
+  }
 
   return {
     "chat.params": async (input, output) => {
@@ -2771,7 +2812,45 @@ export const OpenAIProxyPlugin = async ({ client }) => {
   }
 }
 
-// V1 plugin descriptor. opencode's plugin loader (readV1Plugin in
+// OpenCode V2 loads one plugin instance per location, all in the same process. The proxy server is
+// shared: it serves requests through the first live instance and moves on to another one when that
+// instance unloads, stopping only when the last one is gone.
+export async function setupV2(ctx) {
+  const state = getState()
+  const backend = createV2Backend(ctx)
+  await backend.install()
+
+  state.v2Backends ??= []
+  state.v2Backends.push(backend)
+  if (!state.v2Client) {
+    const current = () => state.v2Backends[0]
+    state.v2Client = {
+      v2: true,
+      listModels: (...args) => current().listModels(...args),
+      runTurn: (...args) => current().runTurn(...args),
+      log: (...args) => current().log(...args),
+    }
+  }
+
+  const server = await startProxyServer(state.v2Client)
+  if (server) state.v2Server = server
+
+  return async () => {
+    state.v2Backends = state.v2Backends.filter((entry) => entry !== backend)
+    if (state.v2Backends.length > 0 || !state.v2Server) return
+    const owned = state.v2Server
+    state.v2Server = undefined
+    state.v2Client = undefined
+    state.started = false
+    state.server = undefined
+    await owned.stop(true)
+  }
+}
+
+// One default export serves both OpenCode generations: V1 invokes `server`,
+// V2 invokes `setup` (https://opencode.ai/v2/docs/build/plugins/migrate-v1).
+//
+// V1: opencode's plugin loader (readV1Plugin in
 // packages/opencode/src/plugin/shared.ts) prefers a default export of this
 // shape and invokes only `server`. Without it, the loader falls back to the
 // legacy path, which invokes EVERY function-typed export as if it were the
@@ -2779,4 +2858,4 @@ export const OpenAIProxyPlugin = async ({ client }) => {
 // the plugin-init argument and every worker logs "failed to load plugin"
 // (see issue #86). Exporting the descriptor keeps all named exports intact
 // for direct imports and tests.
-export default { id: "opencode-llm-proxy", server: OpenAIProxyPlugin }
+export default { id: "opencode-llm-proxy", setup: setupV2, server: OpenAIProxyPlugin }
