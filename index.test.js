@@ -3632,3 +3632,207 @@ describe("plugin default export", () => {
   })
 })
 
+
+// ---------------------------------------------------------------------------
+// Regression: OpenCode event stream delivers nothing (agent-turn hang)
+// ---------------------------------------------------------------------------
+//
+// Some OpenCode builds never deliver message/session events to the plugin's
+// client.event.subscribe() stream. The read loop in runAgentTurn then waited
+// forever even though the turn had finished, so every tool-calling and every
+// streaming request hung. These clients model that: the event stream yields
+// nothing and never ends, and the outcome is only visible via session.messages().
+
+function silentEventStream() {
+  // An async iterator whose next() never settles: no events, and the stream never ends.
+  return {
+    [Symbol.asyncIterator]() {
+      return this
+    },
+    next: () => new Promise(() => {}),
+    return: async () => ({ done: true, value: undefined }),
+  }
+}
+
+function createSilentEventClient({ assistants, withBridge = false }) {
+  let capturedSlotName = null
+  let aborted = false
+  const resolveAssistants = () => (typeof assistants === "function" ? assistants(capturedSlotName) : assistants)
+  return {
+    get aborted() {
+      return aborted
+    },
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: { providers: [{ id: "openai", models: { "gpt-4o": { id: "gpt-4o", name: "GPT-4o" } } }] },
+      }),
+    },
+    mcp: withBridge
+      ? {
+          disconnect: async () => {
+            throw new Error("not connected")
+          },
+          add: async ({ body }) => {
+            capturedSlotName = body.name
+            return { data: {} }
+          },
+        }
+      : undefined,
+    session: {
+      create: async () => ({ data: { id: "sess-silent" } }),
+      // Non-tool, non-streaming requests use session.prompt; give it the same answer.
+      prompt: async () => {
+        const last = resolveAssistants().at(-1)
+        return { data: { info: last.info, parts: last.parts } }
+      },
+      promptAsync: async () => {},
+      abort: async () => {
+        aborted = true
+        return { data: true }
+      },
+      delete: async () => ({ data: true }),
+      messages: async () => ({
+        data: [{ info: { role: "user" }, parts: [{ type: "text", text: "hi" }] }, ...resolveAssistants()],
+      }),
+    },
+    event: { subscribe: async () => ({ stream: silentEventStream() }) },
+  }
+}
+
+const doneTokens = { input: 3, output: 2, reasoning: 0, cache: { read: 0, write: 0 } }
+
+function withTimeout(promise, ms = 5000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms}ms (hang)`)), ms)),
+  ])
+}
+
+describe("agent turn completes when the OpenCode event stream is silent", () => {
+  const toolCallClient = () =>
+    createSilentEventClient({
+      withBridge: true,
+      assistants: (slot) => [
+        {
+          info: { role: "assistant", finish: "tool-calls", time: { completed: 1 }, tokens: doneTokens },
+          parts: [
+            { type: "step-start" },
+            {
+              type: "tool",
+              tool: `${slot}_get_weather`,
+              callID: "call_silent",
+              state: { status: "completed", input: { city: "Berlin" } },
+            },
+            { type: "step-finish" },
+          ],
+        },
+        // OpenCode's follow-up step on the placeholder result must not leak through.
+        {
+          info: { role: "assistant", finish: "stop", time: { completed: 2 }, tokens: doneTokens },
+          parts: [{ type: "text", text: "The tool result will come from the caller." }],
+        },
+      ],
+    })
+
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "get_weather",
+        description: "Get the weather",
+        parameters: { type: "object", properties: { city: { type: "string" } } },
+      },
+    },
+  ]
+
+  it("returns tool_calls for a non-streaming tool request", async () => {
+    const client = toolCallClient()
+    const handler = createProxyFetchHandler(client)
+    const response = await withTimeout(
+      handler(
+        new Request("http://127.0.0.1:4010/v1/chat/completions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "Weather in Berlin?" }], tools }),
+        }),
+      ),
+    )
+    const body = await response.json()
+    assert.equal(response.status, 200)
+    assert.equal(body.choices[0].finish_reason, "tool_calls")
+    assert.equal(body.choices[0].message.content, null)
+    assert.equal(body.choices[0].message.tool_calls.length, 1)
+    assert.equal(body.choices[0].message.tool_calls[0].id, "call_silent")
+    assert.equal(body.choices[0].message.tool_calls[0].function.name, "get_weather")
+    assert.deepEqual(JSON.parse(body.choices[0].message.tool_calls[0].function.arguments), { city: "Berlin" })
+    assert.equal(client.aborted, true, "the follow-up step is aborted")
+  })
+
+  it("streams tool_calls and terminates the SSE stream", async () => {
+    const handler = createProxyFetchHandler(toolCallClient())
+    const response = await handler(
+      new Request("http://127.0.0.1:4010/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-4o",
+          stream: true,
+          messages: [{ role: "user", content: "Weather in Berlin?" }],
+          tools,
+        }),
+      }),
+    )
+    const text = await withTimeout(response.text())
+    assert.match(text, /"name":"get_weather"/)
+    assert.match(text, /"finish_reason":"tool_calls"/)
+    assert.match(text, /data: \[DONE\]/)
+    assert.doesNotMatch(text, /will come from the caller/)
+  })
+
+  it("streams the final text for a plain request and terminates the SSE stream", async () => {
+    const client = createSilentEventClient({
+      assistants: [
+        {
+          info: { role: "assistant", finish: "stop", time: { completed: 1 }, tokens: doneTokens },
+          parts: [{ type: "text", text: "pong" }],
+        },
+      ],
+    })
+    const handler = createProxyFetchHandler(client)
+    const response = await handler(
+      new Request("http://127.0.0.1:4010/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o", stream: true, messages: [{ role: "user", content: "Say pong" }] }),
+      }),
+    )
+    const text = await withTimeout(response.text())
+    assert.match(text, /"content":"pong"/)
+    assert.match(text, /"finish_reason":"stop"/)
+    assert.match(text, /data: \[DONE\]/)
+  })
+
+  it("surfaces a model error recorded on the session instead of hanging", async () => {
+    const client = createSilentEventClient({
+      assistants: [
+        {
+          info: { role: "assistant", error: { data: { message: "provider exploded" } }, time: { completed: 1 } },
+          parts: [],
+        },
+      ],
+    })
+    const handler = createProxyFetchHandler(client)
+    const response = await handler(
+      new Request("http://127.0.0.1:4010/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o", stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+    )
+    const text = await withTimeout(response.text())
+    assert.match(text, /error/i)
+    assert.doesNotMatch(text, /"finish_reason":"stop"/)
+  })
+})
