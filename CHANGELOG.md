@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.11.1](https://github.com/KochC/opencode-llm-proxy/compare/v1.11.0...v1.11.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* complete V2 turns when the OpenCode event stream is silent ([61695e5](https://github.com/KochC/opencode-llm-proxy/commit/61695e5e56fcad06bb3ce153066af384fc517330))
+* complete V2 turns when the OpenCode event stream is silent ([8450c5b](https://github.com/KochC/opencode-llm-proxy/commit/8450c5b45f7c831bc46f9c65b7d760797d5756a3))
+* stop agent turns hanging when the OpenCode event stream is silent ([83a506b](https://github.com/KochC/opencode-llm-proxy/commit/83a506b611ee571197cf01a96776d4a2ba14ce6b))
+* stop agent turns hanging when the OpenCode event stream is silent ([2f945ae](https://github.com/KochC/opencode-llm-proxy/commit/2f945aee3cc68b9b945b860f1ff280b417e0aa3a))
+
 ## [1.11.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.10.0...v1.11.0) (2026-10-17)
 
 
