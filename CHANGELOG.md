@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.2](https://github.com/KochC/opencode-llm-proxy/compare/v1.11.1...v1.11.2) (2026-10-18)
+
+
+### Bug Fixes
+
+* normalize the package repository URL ([a61ebb7](https://github.com/KochC/opencode-llm-proxy/commit/a61ebb79958cd5346d24e473632458e5a40d5fa0))
+
 ## [1.11.1](https://github.com/KochC/opencode-llm-proxy/compare/v1.11.0...v1.11.1) (2026-10-18)
 
 
