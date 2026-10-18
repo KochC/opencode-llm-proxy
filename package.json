@@ -62,7 +62,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/KochC/opencode-llm-proxy.git"
+    "url": "git+https://github.com/KochC/opencode-llm-proxy.git"
   },
   "peerDependencies": {
     "@opencode/plugin": ">=2.0.0",
