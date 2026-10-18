@@ -544,7 +544,7 @@ Each request:
 7. Sends the single rendered prompt to that session (V2: `ctx.session.prompt`; V1: `client.session.prompt` / `client.session.promptAsync`)
 8. Returns the response in the same format as the request
 
-Streaming uses OpenCode's event stream (V2: `ctx.event.subscribe()`; V1: `client.event.subscribe()`). Text deltas are forwarded in real time, and the upstream async iterator is explicitly closed on completion, error, cancellation, or early tool-call termination.
+Streaming uses OpenCode's event stream (V2: `ctx.event.subscribe()`; V1: `client.event.subscribe()`). Text deltas are forwarded in real time, and the upstream async iterator is explicitly closed on completion, error, cancellation, or early tool-call termination. If the event stream stops delivering, the turn still completes from the session's stored messages, and any text the stream missed is sent to streaming clients.
 
 On OpenCode V2 the proxy session receives only your request: your system prompt replaces OpenCode's coding-agent prompt and instructions, and the session gets no OpenCode tools.
 

@@ -1034,6 +1034,9 @@ var MEDIA_KINDS = ["text", "image", "audio", "video", "pdf"];
 var TOOL_PLACEHOLDER_TIMEOUT_MS = 6e4;
 var SUBSCRIBE_READY_TIMEOUT_MS = 2e3;
 var USAGE_GRACE_MS = 3e3;
+var TRANSCRIPT_POLL_MS = 250;
+var NEVER = new Promise(() => {
+});
 var EMPTY_TOKENS = Object.freeze({ input: 0, output: 0, reasoning: 0, cache: Object.freeze({ read: 0, write: 0 }) });
 function delay(ms) {
   return new Promise((resolve) => {
@@ -1109,8 +1112,50 @@ function parseStructured(text2) {
   }
 }
 function assistantText(messages) {
+  return assistantRawText(messages).trim();
+}
+function assistantRawText(messages) {
   const assistant = (messages ?? []).filter((message) => message.type === "assistant").at(-1);
-  return (assistant?.content ?? []).filter((part) => part.type === "text" && typeof part.text === "string").map((part) => part.text).join("").trim();
+  return (assistant?.content ?? []).filter((part) => part.type === "text" && typeof part.text === "string").map((part) => part.text).join("");
+}
+function transcriptTokens(messages) {
+  return (messages ?? []).filter((message) => message.type === "assistant").reduce((total, message) => addTokens(total, message.tokens), EMPTY_TOKENS);
+}
+function toolInput(input) {
+  if (input && typeof input === "object" && !Array.isArray(input)) return input;
+  if (typeof input === "string") {
+    try {
+      const parsed = JSON.parse(input);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {
+    }
+  }
+  return {};
+}
+function transcriptOutcome(messages) {
+  const idle = (messages ?? []).findLast((message) => message.type === "idle");
+  if (!idle) return null;
+  const last = messages.filter((message) => message.type === "assistant").at(-1);
+  return {
+    kind: "done",
+    text: assistantRawText(messages),
+    finish: last?.finish,
+    tokens: transcriptTokens(messages),
+    error: idle.outcome === "failed" ? idle.error?.message ?? last?.error?.message ?? "Model call failed." : null
+  };
+}
+function transcriptToolCalls(messages, bridge) {
+  for (const message of messages ?? []) {
+    if (message.type !== "assistant") continue;
+    const parts = (message.content ?? []).filter((part) => part.type === "tool" && bridge.toolNames.has(part.name));
+    if (parts.length === 0) continue;
+    if (!message.time?.streamed) return null;
+    return {
+      kind: "tools",
+      calls: parts.map((part) => ({ id: part.id, name: bridge.nameMap.get(part.name), arguments: toolInput(part.state?.input) }))
+    };
+  }
+  return null;
 }
 function waitForAbort(signal, timeoutMs) {
   return new Promise((resolve) => {
@@ -1165,13 +1210,37 @@ function createV2Backend(ctx, options = {}) {
         input: tool.parameters,
         // Direct tools only: Code Mode tools are reachable solely through OpenCode's `execute` tool.
         options: { codemode: false },
-        execute: (_input, context) => waitForAbort(context?.signal, placeholderTimeoutMs)
+        execute: (_input, context) => {
+          turns.get(context?.sessionID)?.onToolCall?.();
+          return waitForAbort(context?.signal, placeholderTimeoutMs);
+        }
       };
     });
     const registration = await ctx.tool.transform((editor) => {
       for (const definition of definitions) editor.add(definition);
     });
     return { registration, nameMap, toolNames: new Set(nameMap.keys()) };
+  }
+  function watchTranscript(sessionID, bridge, toolCalled, stop) {
+    const read = () => ctx.session.context({ sessionID }, { signal: stop });
+    const untilDone = async () => {
+      while (!stop.aborted) {
+        await ctx.session.wait({ sessionID }, { signal: stop });
+        const outcome = transcriptOutcome(await read());
+        if (outcome) return outcome;
+        await delay(TRANSCRIPT_POLL_MS);
+      }
+    };
+    const untilToolCalls = async () => {
+      await toolCalled;
+      while (!stop.aborted) {
+        const found = transcriptToolCalls(await read(), bridge);
+        if (found) return found;
+        await delay(TRANSCRIPT_POLL_MS);
+      }
+    };
+    const settle = (promise) => promise.then((result) => result ?? NEVER, () => NEVER);
+    return Promise.race([settle(untilDone()), ...bridge ? [settle(untilToolCalls())] : []]);
   }
   async function runTurn(input) {
     const { model, system, text: text2, media = [], tools = [], format, variant, controls, onChunk, signal, keepSessions } = input;
@@ -1180,6 +1249,10 @@ function createV2Backend(ctx, options = {}) {
     const subscription = new AbortController();
     const abortSubscription = () => subscription.abort();
     signal?.addEventListener("abort", abortSubscription, { once: true });
+    let onToolCall;
+    const toolCalled = new Promise((resolve) => {
+      onToolCall = resolve;
+    });
     let sessionID;
     let content = "";
     let tokens = EMPTY_TOKENS;
@@ -1189,6 +1262,31 @@ function createV2Backend(ctx, options = {}) {
     const calls = /* @__PURE__ */ new Map();
     const interrupt = () => ctx.session.interrupt({ sessionID }).catch(() => {
     });
+    const applyTranscript = async (result) => {
+      if (result.kind === "tools") {
+        for (const call of result.calls) {
+          const seen = calls.get(call.id);
+          calls.set(call.id, seen && Object.keys(seen.arguments).length > 0 ? seen : call);
+        }
+        finish = "tool-calls";
+        await interrupt();
+        await Promise.race([ctx.session.wait({ sessionID }).catch(() => {
+        }), delay(USAGE_GRACE_MS)]);
+        try {
+          tokens = transcriptTokens(await ctx.session.context({ sessionID }));
+        } catch {
+        }
+        return;
+      }
+      if (result.text.length > content.length && result.text.startsWith(content)) {
+        const rest = result.text.slice(content.length);
+        content = result.text;
+        await onChunk?.(rest);
+      }
+      finish = result.finish;
+      tokens = result.tokens;
+      errorMessage = result.error ?? errorMessage;
+    };
     try {
       const session = await ctx.session.create({
         title: `Proxy: ${model.id}`,
@@ -1198,7 +1296,8 @@ function createV2Backend(ctx, options = {}) {
       turns.set(sessionID, {
         system: [system, format ? structuredInstruction(format) : ""].filter(Boolean).join("\n\n"),
         toolNames: bridge?.toolNames ?? /* @__PURE__ */ new Set(),
-        controls
+        controls,
+        onToolCall
       });
       signal?.addEventListener("abort", interrupt, { once: true });
       const events = ctx.event.subscribe({ signal: subscription.signal })[Symbol.asyncIterator]();
@@ -1210,10 +1309,20 @@ function createV2Backend(ctx, options = {}) {
         text: text2,
         ...media.length > 0 ? { files: media.map((part) => ({ uri: part.url, ...part.filename ? { name: part.filename } : {} })) } : {}
       });
+      const fallback = watchTranscript(sessionID, bridge, toolCalled, subscription.signal).then((result) => ({ fallback: result }));
       let captured = false;
       while (true) {
-        const next = await (captured ? Promise.race([pending ?? events.next(), delay(USAGE_GRACE_MS)]) : pending ?? events.next());
+        pending ??= events.next();
+        const raced = await Promise.race([
+          pending.then((next2) => ({ next: next2 })),
+          captured ? delay(USAGE_GRACE_MS).then(() => ({ next: null })) : fallback
+        ]);
+        if (raced.fallback) {
+          await applyTranscript(raced.fallback);
+          break;
+        }
         pending = null;
+        const next = raced.next;
         if (!next || next.done) break;
         const event = next.value;
         const data = event?.data;

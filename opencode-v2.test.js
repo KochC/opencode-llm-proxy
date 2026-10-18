@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 
 import * as mod from "./index.js"
 import { createProxyFetchHandler } from "./index.js"
-import { createV2Backend, normalizeV2Model, parseStructured, toolName } from "./opencode-v2.js"
+import { createV2Backend, normalizeV2Model, parseStructured, toolName, transcriptOutcome, transcriptToolCalls } from "./opencode-v2.js"
 import { resetMetrics } from "./metrics.js"
 
 const PROXY_STATE_KEY = "__opencodeOpenAIProxyState"
@@ -33,7 +33,7 @@ const MODEL = normalizeV2Model(MODEL_INFO)
 // Minimal stand-in for the OpenCode V2 plugin context. `onPrompt` scripts the
 // events a session emits after a prompt; `emit` sends one event to every live
 // subscription, the way OpenCode's public event stream does.
-function createCtx({ models = [MODEL_INFO], onPrompt = () => {}, context = [] } = {}) {
+function createCtx({ models = [MODEL_INFO], onPrompt = () => {}, context = [], wait, silent = false } = {}) {
   const subscribers = new Set()
   const ctx = {
     hooks: {},
@@ -43,7 +43,9 @@ function createCtx({ models = [MODEL_INFO], onPrompt = () => {}, context = [] } 
     prompts: [],
     removed: [],
     interrupted: [],
+    waitSignals: [],
     emit(type, data) {
+      if (silent) return
       for (const subscriber of subscribers) subscriber.push({ type, data })
     },
     model: { list: async () => ({ location: {}, data: models }) },
@@ -63,12 +65,21 @@ function createCtx({ models = [MODEL_INFO], onPrompt = () => {}, context = [] } 
       },
       interrupt: async ({ sessionID }) => {
         ctx.interrupted.push(sessionID)
+        ctx.onInterrupt?.(sessionID)
         return { interrupted: true }
       },
       remove: async ({ sessionID }) => {
         ctx.removed.push(sessionID)
       },
-      context: async () => context,
+      context: async () => (typeof context === "function" ? context() : context),
+      ...(wait
+        ? {
+            wait: (input, options) => {
+              ctx.waitSignals.push(options?.signal)
+              return wait(input, options)
+            },
+          }
+        : {}),
     },
     tool: {
       transform: async (callback) => {
@@ -163,6 +174,43 @@ describe("V2 helpers", () => {
     assert.deepEqual(parseStructured('{"a":1}'), { a: 1 })
     assert.deepEqual(parseStructured('```json\n{"a":1}\n```'), { a: 1 })
     assert.equal(parseStructured("not json"), undefined)
+  })
+
+  it("reads the finished turn from the transcript only once the session is idle", () => {
+    const assistant = { type: "assistant", content: [{ type: "text", text: " Hi" }], finish: "stop", tokens: usage }
+    assert.equal(transcriptOutcome([{ type: "user", text: "x" }, assistant]), null)
+    assert.deepEqual(transcriptOutcome([{ type: "user", text: "x" }, assistant, { type: "idle", outcome: "succeeded" }]), {
+      kind: "done",
+      text: " Hi",
+      finish: "stop",
+      tokens: usage,
+      error: null,
+    })
+    assert.equal(
+      transcriptOutcome([assistant, { type: "idle", outcome: "failed", error: { type: "api", message: "boom" } }]).error,
+      "boom",
+    )
+  })
+
+  it("reads proxy tool calls from the transcript once the model finished streaming them", () => {
+    const bridge = { toolNames: new Set(["px0_w"]), nameMap: new Map([["px0_w", "weather"]]) }
+    const message = (streamed) => ({
+      type: "assistant",
+      time: { created: 1, ...(streamed ? { streamed: 2 } : {}) },
+      content: [
+        { type: "tool", id: "c1", name: "px0_w", state: { status: "running", input: { city: "Paris" } } },
+        { type: "tool", id: "c2", name: "px0_w", state: { status: "streaming", input: '{"city":"Berlin"}' } },
+        { type: "tool", id: "c3", name: "read", state: { status: "running", input: {} } },
+      ],
+    })
+    assert.equal(transcriptToolCalls([message(false)], bridge), null)
+    assert.deepEqual(transcriptToolCalls([message(true)], bridge), {
+      kind: "tools",
+      calls: [
+        { id: "c1", name: "weather", arguments: { city: "Paris" } },
+        { id: "c2", name: "weather", arguments: { city: "Berlin" } },
+      ],
+    })
   })
 })
 
@@ -348,6 +396,130 @@ describe("V2 backend", () => {
     assert.deepEqual(ctx.removed, ["ses_1"])
   })
 })
+
+describe("V2 turn when the event stream is silent", () => {
+  // A session whose outcome is only visible through session.wait() and the transcript.
+  function quietSession() {
+    let release
+    const finished = new Promise((resolve) => { release = resolve })
+    const messages = [{ type: "user", text: "x" }]
+    return { messages, finished, finish: () => release(), wait: () => finished }
+  }
+
+  it("completes a text turn from the transcript", async () => {
+    const session = quietSession()
+    const ctx = createCtx({
+      silent: true,
+      wait: session.wait,
+      context: () => session.messages,
+      onPrompt: () => {
+        session.messages.push(
+          { type: "assistant", content: [{ type: "text", text: "Hello there" }], finish: "stop", tokens: usage },
+          { type: "idle", outcome: "succeeded" },
+        )
+        session.finish()
+      },
+    })
+    const backend = createV2Backend(ctx)
+    await backend.install()
+    const result = await backend.runTurn({ model: MODEL, text: "x" })
+    assert.equal(result.content, "Hello there")
+    assert.equal(result.finish, "stop")
+    assert.deepEqual(result.tokens, usage)
+    assert.deepEqual(ctx.removed, ["ses_1"])
+  })
+
+  it("streams only the text the event stream did not deliver", async () => {
+    const session = quietSession()
+    const ctx = createCtx({
+      wait: session.wait,
+      context: () => session.messages,
+      onPrompt: (sessionID, c) => {
+        c.emit("session.text.delta", { sessionID, assistantMessageID: "m", ordinal: 0, delta: "Hel" })
+        setTimeout(() => {
+          session.messages.push(
+            { type: "assistant", content: [{ type: "text", text: "Hello there" }], finish: "stop", tokens: usage },
+            { type: "idle", outcome: "succeeded" },
+          )
+          session.finish()
+        }, 10)
+      },
+    })
+    const backend = createV2Backend(ctx)
+    await backend.install()
+    const chunks = []
+    const result = await backend.runTurn({ model: MODEL, text: "x", onChunk: (delta) => chunks.push(delta) })
+    assert.deepEqual(chunks, ["Hel", "lo there"])
+    assert.equal(result.content, "Hello there")
+  })
+
+  it("captures tool calls through the tool executors and the transcript", async () => {
+    const session = quietSession()
+    const executor = new AbortController()
+    let executed
+    const ctx = createCtx({
+      silent: true,
+      wait: session.wait,
+      context: () => session.messages,
+      onPrompt: (sessionID, c) => {
+        const { name, execute } = c.registrations[0].tools[0]
+        session.messages.push({
+          type: "assistant",
+          time: { created: 1, streamed: 2 },
+          content: [{ type: "tool", id: "call_1", name, state: { status: "running", input: { city: "Paris" } } }],
+        })
+        executed = execute({ city: "Paris" }, { sessionID, id: "call_1", signal: executor.signal })
+      },
+    })
+    ctx.onInterrupt = () => {
+      executor.abort()
+      session.messages[1].tokens = usage
+      session.messages.push({ type: "idle", outcome: "interrupted" })
+      session.finish()
+    }
+    const backend = createV2Backend(ctx)
+    await backend.install()
+    const result = await backend.runTurn({
+      model: MODEL,
+      text: "weather?",
+      tools: [{ name: "get-weather", description: "Weather", parameters: { type: "object" } }],
+    })
+    assert.deepEqual(result.toolCalls, [{ id: "call_1", name: "get-weather", arguments: { city: "Paris" } }])
+    assert.equal(result.finish, "tool_calls")
+    assert.deepEqual(result.tokens, usage)
+    assert.deepEqual(ctx.interrupted, ["ses_1"])
+    assert.deepEqual(await executed, { content: "The tool call was forwarded to the API caller." })
+    assert.equal(ctx.registrations[0].disposed, true)
+  })
+
+  it("surfaces a failed turn recorded in the transcript", async () => {
+    const session = quietSession()
+    const ctx = createCtx({
+      silent: true,
+      wait: session.wait,
+      context: () => session.messages,
+      onPrompt: () => {
+        session.messages.push({ type: "idle", outcome: "failed", error: { type: "api", message: "rate limited" } })
+        session.finish()
+      },
+    })
+    const backend = createV2Backend(ctx)
+    await backend.install()
+    await assert.rejects(backend.runTurn({ model: MODEL, text: "x" }), /rate limited/)
+    assert.deepEqual(ctx.removed, ["ses_1"])
+  })
+
+  it("stops waiting on the session once the event stream finished the turn", async () => {
+    const ctx = createCtx({ onPrompt: textReply("ok"), wait: () => NEVER_SETTLES })
+    const backend = createV2Backend(ctx)
+    await backend.install()
+    assert.equal((await backend.runTurn({ model: MODEL, text: "x" })).content, "ok")
+    assert.equal(ctx.waitSignals.length, 1)
+    assert.equal(ctx.waitSignals[0].aborted, true)
+  })
+})
+
+const NEVER_SETTLES = new Promise(() => {})
 
 describe("V2 through the HTTP handler", () => {
   it("serves /v1/models and chat completions from the V2 backend", async () => {
