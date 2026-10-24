@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.11.3](https://github.com/KochC/opencode-llm-proxy/compare/v1.11.2...v1.11.3) (2026-10-24)
+
+
+### Bug Fixes
+
+* stop Bun closing slow requests with "socket connection was closed unexpectedly" ([63495d1](https://github.com/KochC/opencode-llm-proxy/commit/63495d1daffe76b70e944b051e9c697fc71b4408))
+* stop Bun closing slow requests with "socket connection was closed unexpectedly" ([2ad71ca](https://github.com/KochC/opencode-llm-proxy/commit/2ad71caab748b7d1747d3a757ef2e934b0032bce))
+
 ## [1.11.2](https://github.com/KochC/opencode-llm-proxy/compare/v1.11.1...v1.11.2) (2026-10-18)
 
 
