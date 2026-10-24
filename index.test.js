@@ -845,9 +845,13 @@ describe("mapFinishReason", () => {
     assert.equal(mapFinishReason("length"), "length")
   })
 
-  it("returns 'tool_calls' when finish includes 'tool'", () => {
-    assert.equal(mapFinishReason("tool_use"), "tool_calls")
-    assert.equal(mapFinishReason("tool"), "tool_calls")
+  it("returns 'stop' when finish includes 'tool' (StructuredOutput); real tools use toolCalls.length", () => {
+    // Opencode json_schema ends on the internal StructuredOutput tool. Mapping
+    // that finish to tool_calls breaks AI SDK Output.object. Callers force
+    // tool_calls when proxy-level toolCalls.length > 0.
+    assert.equal(mapFinishReason("tool_use"), "stop")
+    assert.equal(mapFinishReason("tool"), "stop")
+    assert.equal(mapFinishReason("tool-calls"), "stop")
   })
 
   it("returns 'stop' for unrecognised values", () => {
@@ -1580,8 +1584,9 @@ describe("mapFinishReasonToAnthropic", () => {
     assert.equal(mapFinishReasonToAnthropic("max_length"), "max_tokens")
   })
 
-  it("returns tool_use when finish includes tool", () => {
-    assert.equal(mapFinishReasonToAnthropic("tool_use"), "tool_use")
+  it("returns end_turn when finish includes tool (StructuredOutput); real tools use toolCalls.length", () => {
+    assert.equal(mapFinishReasonToAnthropic("tool_use"), "end_turn")
+    assert.equal(mapFinishReasonToAnthropic("tool"), "end_turn")
   })
 
   it("returns end_turn for unrecognised values", () => {

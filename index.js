@@ -866,7 +866,12 @@ function createResponsesApiResponse(result, model) {
 export function mapFinishReason(finish) {
   if (!finish) return "stop"
   if (finish.includes("length")) return "length"
-  if (finish.includes("tool")) return "tool_calls"
+  // Opencode ends json_schema / StructuredOutput turns with a finish string that
+  // contains "tool". Callers already set finish_reason to "tool_calls" when
+  // proxy-level toolCalls.length > 0. Mapping the internal structured finish to
+  // tool_calls here leaves message.content JSON with finish_reason tool_calls
+  // and an empty tool_calls array — Vercel AI SDK Output.object then throws
+  // AI_NoOutputGeneratedError. Keep "stop" for content-only completions.
   return "stop"
 }
 
@@ -1789,7 +1794,9 @@ export function normalizeAnthropicSystem(system) {
 export function mapFinishReasonToAnthropic(finish) {
   if (!finish) return "end_turn"
   if (finish.includes("length")) return "max_tokens"
-  if (finish.includes("tool")) return "tool_use"
+  // Same as mapFinishReason: do not map Opencode StructuredOutput finish to
+  // tool_use when the proxy already flattened schema JSON into text content.
+  // Real tool_use is still set by createAnthropicResponse when toolCalls.length > 0.
   return "end_turn"
 }
 
