@@ -1725,6 +1725,50 @@ test("POST /v1/messages returns a well-formed Anthropic response", async () => {
   assert.equal(body.usage.output_tokens, 10)
 })
 
+describe("unenforcedControls", () => {
+  it("reports every maximum-token field present", () => {
+    assert.deepEqual(mod.unenforcedControls({ max_tokens: 1, max_completion_tokens: 2 }), [
+      "max_tokens",
+      "max_completion_tokens",
+    ])
+    assert.deepEqual(mod.unenforcedControls({ max_output_tokens: 5 }), ["max_output_tokens"])
+    assert.deepEqual(mod.unenforcedControls({ generationConfig: { maxOutputTokens: 100 } }), ["maxOutputTokens"])
+  })
+
+  it("returns nothing when no maximum-token field is set", () => {
+    assert.deepEqual(mod.unenforcedControls({ temperature: 0 }), [])
+    assert.deepEqual(mod.unenforcedControls({ generationConfig: null }), [])
+  })
+})
+
+test("max-token fields log a single 'not enforced' warning per field", async () => {
+  delete globalThis.__opencodeOpenAIProxyState?.warnedUnenforcedControls
+  const logs = []
+  const client = createAnthropicClient("Hi there!")
+  client.app.log = async ({ body }) => {
+    logs.push(body)
+  }
+  const handler = createProxyFetchHandler(client)
+  const send = () =>
+    handler(new Request("http://127.0.0.1:4010/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "anthropic/claude-3-5-sonnet",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: "Say hello." }],
+      }),
+    }))
+
+  assert.equal((await send()).status, 200)
+  assert.equal((await send()).status, 200)
+  await delay(0)
+
+  const warnings = logs.filter((entry) => entry.level === "warn" && /not enforced/.test(entry.message))
+  assert.equal(warnings.length, 1)
+  assert.deepEqual(warnings[0].extra.fields, ["max_tokens"])
+})
+
 test("POST /v1/messages system string is included in prompt", async () => {
   let capturedSystem = null
   const client = {

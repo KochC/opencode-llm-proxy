@@ -2937,6 +2937,24 @@ function generationControls(body) {
   }
   return controls;
 }
+var UNENFORCED_TOKEN_FIELDS = ["max_tokens", "max_completion_tokens", "max_output_tokens", "maxOutputTokens"];
+function unenforcedControls(body) {
+  const sources = [body, body?.generationConfig].filter(isPlainObject);
+  return UNENFORCED_TOKEN_FIELDS.filter((name) => sources.some((source) => source[name] !== void 0));
+}
+function warnUnenforcedControls(client, body) {
+  const state = getState();
+  state.warnedUnenforcedControls ??= /* @__PURE__ */ new Set();
+  const fresh = unenforcedControls(body).filter((name) => !state.warnedUnenforcedControls.has(name));
+  if (fresh.length === 0) return;
+  for (const name of fresh) state.warnedUnenforcedControls.add(name);
+  Promise.resolve().then(
+    () => safeLog(client, "warn", "Maximum-token controls are accepted but not enforced by OpenCode", {
+      fields: fresh
+    })
+  ).catch(() => {
+  });
+}
 function extractGeminiSystemInstruction(systemInstruction) {
   if (!systemInstruction) return null;
   if (typeof systemInstruction === "string") return systemInstruction.trim();
@@ -3069,6 +3087,7 @@ function createProxyFetchHandler(client) {
           format = structuredFormat(body);
           if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request");
           controls = generationControls(body);
+          warnUnenforcedControls(client, body);
         } catch (error) {
           return badRequest(error.message, error.status ?? 400, request);
         }
@@ -3241,6 +3260,7 @@ data: [DONE]
           format = structuredFormat(body);
           if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request");
           controls = generationControls(body);
+          warnUnenforcedControls(client, body);
         } catch (error) {
           return badRequest(error.message, error.status ?? 400, request);
         }
@@ -3520,6 +3540,7 @@ data: ${JSON.stringify(data)}
         try {
           validateUnsupportedControls(body);
           controls = generationControls(body);
+          warnUnenforcedControls(client, body);
         } catch (error) {
           return anthropicBadRequest(error.message, error.status ?? 400, request);
         }
@@ -3694,6 +3715,7 @@ data: ${JSON.stringify(data)}
         try {
           format = structuredFormat(body);
           controls = generationControls(body);
+          warnUnenforcedControls(client, body);
         } catch (error) {
           return badRequest(error.message, error.status ?? 400, request);
         }
@@ -3953,5 +3975,6 @@ export {
   resolveModel,
   sanitizeToolName,
   setupV2,
-  toTextContent
+  toTextContent,
+  unenforcedControls
 };
