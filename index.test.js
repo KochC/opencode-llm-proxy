@@ -3836,3 +3836,24 @@ describe("agent turn completes when the OpenCode event stream is silent", () => 
     assert.doesNotMatch(text, /"finish_reason":"stop"/)
   })
 })
+
+describe("resolveIdleTimeoutSeconds", () => {
+  it("outlives the default request timeout instead of using Bun's 10 s default", () => {
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 120000 }), 125)
+  })
+
+  it("rounds sub-second request timeouts up", () => {
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 1500 }), 7)
+  })
+
+  it("disables the idle timer when the request timeout exceeds Bun's 255 s limit", () => {
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 600000 }), 0)
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 251000 }), 0)
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 250000 }), mod.BUN_MAX_IDLE_TIMEOUT_SECONDS)
+  })
+
+  it("honours an explicit override, including 0", () => {
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 120000, idleTimeoutSeconds: 30 }), 30)
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 120000, idleTimeoutSeconds: 0 }), 0)
+  })
+})

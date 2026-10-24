@@ -1421,6 +1421,12 @@ var DEFAULTS = Object.freeze({
   bridgeAcquireTimeoutMs: 1e4,
   bridgeMaxQueue: 32
 });
+var BUN_MAX_IDLE_TIMEOUT_SECONDS = 255;
+function resolveIdleTimeoutSeconds(config) {
+  if (config.idleTimeoutSeconds !== void 0) return config.idleTimeoutSeconds;
+  const needed = Math.ceil(config.requestTimeoutMs / 1e3) + 5;
+  return needed > BUN_MAX_IDLE_TIMEOUT_SECONDS ? 0 : needed;
+}
 var ProxyError = class extends Error {
   constructor(message, status = 500, code = "server_error") {
     super(message);
@@ -1481,6 +1487,7 @@ function loadConfig() {
     corsOrigins: [...new Set(origins)],
     allowPrivateNetwork: process.env.OPENCODE_LLM_PROXY_ALLOW_PRIVATE_NETWORK === "true",
     requestTimeoutMs: integerEnv("OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS", DEFAULTS.requestTimeoutMs, { min: 1, max: 36e5 }),
+    idleTimeoutSeconds: process.env.OPENCODE_LLM_PROXY_IDLE_TIMEOUT_SECONDS?.trim() ? integerEnv("OPENCODE_LLM_PROXY_IDLE_TIMEOUT_SECONDS", 0, { min: 0, max: BUN_MAX_IDLE_TIMEOUT_SECONDS }) : void 0,
     maxRequestBytes,
     maxConcurrentRequests: integerEnv("OPENCODE_LLM_PROXY_MAX_CONCURRENT_REQUESTS", DEFAULTS.maxConcurrentRequests, { min: 1, max: 1e3 }),
     maxQueuedRequests: integerEnv("OPENCODE_LLM_PROXY_MAX_QUEUED_REQUESTS", DEFAULTS.maxQueuedRequests, { min: 0, max: 1e4 }),
@@ -3851,6 +3858,7 @@ async function startProxyServer(client) {
     server = Bun.serve({
       hostname,
       port,
+      idleTimeout: resolveIdleTimeoutSeconds(config),
       fetch: createProxyFetchHandler(client)
     });
   } catch (error) {
@@ -3915,6 +3923,7 @@ async function setupV2(ctx) {
 }
 var index_default = { id: "opencode-llm-proxy", setup: setupV2, server: OpenAIProxyPlugin };
 export {
+  BUN_MAX_IDLE_TIMEOUT_SECONDS,
   OpenAIProxyPlugin,
   applyAnthropicToolChoice,
   applyGeminiToolChoice,
@@ -3940,6 +3949,7 @@ export {
   parseOpenAITools,
   registerToolBridge,
   releaseToolBridge,
+  resolveIdleTimeoutSeconds,
   resolveModel,
   sanitizeToolName,
   setupV2,
