@@ -56,6 +56,16 @@ function openAIContent(content) {
     return text2 ? [text2] : media ? [media] : [];
   });
 }
+function openAIToolResultContent(content) {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (content === void 0 || content === null) return [];
+  if (!Array.isArray(content)) return [jsonValue(content)];
+  return content.flatMap((part) => {
+    if (part === void 0 || part === null) return [];
+    if (typeof part === "string") return [{ type: "text", text: part }];
+    return [textPart(part.text ?? part.input_text ?? part.output_text) ?? openAIMediaPart(part) ?? jsonValue(part)];
+  });
+}
 function mediaFromAnthropic(block) {
   if (!block || !["image", "document"].includes(block.type)) return null;
   const source = block.source;
@@ -81,9 +91,9 @@ function anthropicResultContent(content) {
   if (typeof content === "string") return [{ type: "text", text: content }];
   if (!Array.isArray(content)) return content === void 0 ? [] : [jsonValue(content)];
   return content.flatMap((block) => {
-    const text2 = block?.type === "text" ? textPart(block.text) : null;
-    const media = mediaFromAnthropic(block);
-    return text2 ? [text2] : media ? [media] : [];
+    if (block === void 0 || block === null) return [];
+    const text2 = block.type === "text" ? textPart(block.text) : null;
+    return [text2 ?? mediaFromAnthropic(block) ?? jsonValue(block)];
   });
 }
 function geminiMediaPart(part) {
@@ -132,7 +142,7 @@ function adaptOpenAIChat(input) {
           type: "tool_result",
           ...message.tool_call_id ? { id: message.tool_call_id } : {},
           ...message.name ? { name: message.name } : {},
-          content
+          content: openAIToolResultContent(message.content)
         }]
       }];
     }
@@ -157,11 +167,10 @@ function adaptOpenAIResponses(input) {
         arguments: argumentsValue(item.arguments ?? "")
       }] });
     } else if (item.type === "function_call_output") {
-      const output = typeof item.output === "string" ? [{ type: "text", text: item.output }] : [jsonValue(item.output)];
       messages.push({ role: "tool", content: [{
         type: "tool_result",
         ...item.call_id ? { id: item.call_id } : {},
-        content: output
+        content: openAIToolResultContent(item.output)
       }] });
     } else {
       messages.push({ role: item.role ?? (item.type === "message" ? "user" : item.type ?? "user"), content: openAIContent(item.content ?? item.input) });
@@ -2308,6 +2317,38 @@ function applyAnthropicToolChoice(tools, toolChoice) {
   }
   return tools;
 }
+var GEMINI_SCHEMA_CHILD_MAPS = ["properties", "patternProperties", "$defs", "definitions"];
+var GEMINI_SCHEMA_CHILD_LISTS = ["anyOf", "oneOf", "allOf", "prefixItems"];
+function geminiSchemaToJsonSchema(schema) {
+  if (Array.isArray(schema)) return schema.map(geminiSchemaToJsonSchema);
+  if (!isPlainObject(schema)) return schema;
+  const out = { ...schema };
+  if (typeof out.type === "string") {
+    if (out.type.toUpperCase() === "TYPE_UNSPECIFIED") delete out.type;
+    else out.type = out.type.toLowerCase();
+  } else if (Array.isArray(out.type)) {
+    out.type = out.type.map((type) => typeof type === "string" ? type.toLowerCase() : type);
+  }
+  for (const key of GEMINI_SCHEMA_CHILD_MAPS) {
+    if (isPlainObject(out[key])) {
+      out[key] = Object.fromEntries(
+        Object.entries(out[key]).map(([name, child]) => [name, geminiSchemaToJsonSchema(child)])
+      );
+    }
+  }
+  for (const key of GEMINI_SCHEMA_CHILD_LISTS) {
+    if (Array.isArray(out[key])) out[key] = out[key].map(geminiSchemaToJsonSchema);
+  }
+  for (const key of ["items", "additionalProperties", "not"]) {
+    if (isPlainObject(out[key]) || Array.isArray(out[key])) out[key] = geminiSchemaToJsonSchema(out[key]);
+  }
+  return out;
+}
+function geminiDeclarationParameters(decl) {
+  const jsonSchema = decl.parametersJsonSchema ?? decl.parameters_json_schema;
+  if (isPlainObject(jsonSchema)) return jsonSchema;
+  return normalizeParameters(geminiSchemaToJsonSchema(decl.parameters));
+}
 function parseGeminiTools(body) {
   const list = [];
   if (Array.isArray(body?.tools)) {
@@ -2318,7 +2359,7 @@ function parseGeminiTools(body) {
           list.push({
             name: decl.name,
             description: typeof decl.description === "string" ? decl.description : "",
-            parameters: normalizeParameters(decl.parameters)
+            parameters: geminiDeclarationParameters(decl)
           });
         }
       }
@@ -3936,6 +3977,7 @@ export {
   index_default as default,
   extractAssistantText,
   extractGeminiSystemInstruction,
+  geminiSchemaToJsonSchema,
   mapFinishReason,
   mapFinishReasonToAnthropic,
   mapFinishReasonToGemini,

@@ -303,6 +303,7 @@ OpenCode's own agent loop always executes tools itself, server-side, so there's 
 
 - Parallel tool calls in a single turn are fully supported across all four API formats (streaming and non-streaming).
 - `tool_choice: "none"` (OpenAI/Gemini `mode: "NONE"`/Anthropic `type: "none"`) disables tool calling for that request; forcing a specific named tool is supported.
+- Structured tool payloads are preserved verbatim across formats: tool schemas (including nesting and `additionalProperties`), tool-call arguments, and tool results keep their structure and key order. Tool results that aren't plain text (JSON objects, unrecognised content blocks) are forwarded to the model as JSON rather than dropped. Gemini OpenAPI-style schemas (`type: "OBJECT"`) are converted to JSON Schema, and `parametersJsonSchema` is used as-is when present.
 - The remaining notes apply to OpenCode V1 only, which uses the MCP bridge:
   - Bridge servers are reused from a small fixed-size pool (`px_tools_0`, `px_tools_1`, ...) rather than registered fresh per request, since OpenCode's server API has no endpoint to deregister an MCP server once added. Configure the pool size with `OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE` (default `8`) if you expect more than 8 concurrent in-flight tool-calling requests.
   - At most `OPENCODE_LLM_PROXY_TOOL_BRIDGE_MAX_QUEUE` requests wait for a bridge slot. A request arriving when that queue is full receives `429`; a queued request that exceeds the bridge acquisition timeout receives `503`.
