@@ -1889,6 +1889,31 @@ function generationControls(body) {
   return controls
 }
 
+// Maximum-token fields are accepted for client compatibility (Anthropic requires
+// max_tokens) but the OpenCode SDK has no way to enforce them. Warn once per field
+// per process so operators learn the limit is ignored without flooding the log.
+const UNENFORCED_TOKEN_FIELDS = ["max_tokens", "max_completion_tokens", "max_output_tokens", "maxOutputTokens"]
+
+export function unenforcedControls(body) {
+  const sources = [body, body?.generationConfig].filter(isPlainObject)
+  return UNENFORCED_TOKEN_FIELDS.filter((name) => sources.some((source) => source[name] !== undefined))
+}
+
+function warnUnenforcedControls(client, body) {
+  const state = getState()
+  state.warnedUnenforcedControls ??= new Set()
+  const fresh = unenforcedControls(body).filter((name) => !state.warnedUnenforcedControls.has(name))
+  if (fresh.length === 0) return
+  for (const name of fresh) state.warnedUnenforcedControls.add(name)
+  Promise.resolve()
+    .then(() =>
+      safeLog(client, "warn", "Maximum-token controls are accepted but not enforced by OpenCode", {
+        fields: fresh,
+      }),
+    )
+    .catch(() => {})
+}
+
 export function extractGeminiSystemInstruction(systemInstruction) {
   if (!systemInstruction) return null
   if (typeof systemInstruction === "string") return systemInstruction.trim()
@@ -2046,6 +2071,7 @@ export function createProxyFetchHandler(client) {
         format = structuredFormat(body)
         if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request")
         controls = generationControls(body)
+        warnUnenforcedControls(client, body)
       } catch (error) {
         return badRequest(error.message, error.status ?? 400, request)
       }
@@ -2221,6 +2247,7 @@ export function createProxyFetchHandler(client) {
         format = structuredFormat(body)
         if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request")
         controls = generationControls(body)
+        warnUnenforcedControls(client, body)
       } catch (error) {
         return badRequest(error.message, error.status ?? 400, request)
       }
@@ -2525,6 +2552,7 @@ export function createProxyFetchHandler(client) {
       try {
         validateUnsupportedControls(body)
         controls = generationControls(body)
+        warnUnenforcedControls(client, body)
       } catch (error) {
         return anthropicBadRequest(error.message, error.status ?? 400, request)
       }
@@ -2722,6 +2750,7 @@ export function createProxyFetchHandler(client) {
       try {
         format = structuredFormat(body)
         controls = generationControls(body)
+        warnUnenforcedControls(client, body)
       } catch (error) {
         return badRequest(error.message, error.status ?? 400, request)
       }
