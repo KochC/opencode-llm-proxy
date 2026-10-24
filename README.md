@@ -189,6 +189,7 @@ curl -o .opencode/plugins/llm-proxy.js \
 | `OPENCODE_LLM_PROXY_CORS_ORIGIN` | _(unset)_ | Legacy single origin appended to the CORS allowlist. |
 | `OPENCODE_LLM_PROXY_ALLOW_PRIVATE_NETWORK` | `false` | Set to `true` to allow browser Private Network Access preflights. |
 | `OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS` | `120000` | Total request timeout, from 1 to 3,600,000 ms. |
+| `OPENCODE_LLM_PROXY_IDLE_TIMEOUT_SECONDS` | request timeout + 5 s | Seconds a connection may stay silent before the server closes it, from 0 (disabled) to 255. Defaults to the request timeout plus 5 s, or 0 when that exceeds 255 s. |
 | `OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES` | `1048576` | Maximum JSON request body and embedded data-URL size, up to 100 MiB. |
 | `OPENCODE_LLM_PROXY_MAX_CONCURRENT_REQUESTS` | `8` | Maximum active POST requests. |
 | `OPENCODE_LLM_PROXY_MAX_QUEUED_REQUESTS` | `32` | Maximum POST requests waiting for capacity; excess requests receive `503`. |

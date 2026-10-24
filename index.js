@@ -31,6 +31,21 @@ const DEFAULTS = Object.freeze({
   bridgeMaxQueue: 32,
 })
 
+// Bun.serve() closes any connection that has not written a byte for `idleTimeout` seconds
+// (default 10, maximum 255, 0 = disabled). A non-streaming completion - or a stream that pauses
+// while the model thinks or a tool runs - easily exceeds 10 s, and clients then fail with
+// "The socket connection was closed unexpectedly". Derive the idle timeout from the request
+// timeout so a request can never be cut off by the socket before its own deadline.
+export const BUN_MAX_IDLE_TIMEOUT_SECONDS = 255
+
+export function resolveIdleTimeoutSeconds(config) {
+  if (config.idleTimeoutSeconds !== undefined) return config.idleTimeoutSeconds
+  const needed = Math.ceil(config.requestTimeoutMs / 1000) + 5
+  // Bun cannot express anything above 255 s, so disable the idle timer; the per-request
+  // timeout (OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS) still bounds every request.
+  return needed > BUN_MAX_IDLE_TIMEOUT_SECONDS ? 0 : needed
+}
+
 class ProxyError extends Error {
   constructor(message, status = 500, code = "server_error") {
     super(message)
@@ -97,6 +112,9 @@ function loadConfig() {
     corsOrigins: [...new Set(origins)],
     allowPrivateNetwork: process.env.OPENCODE_LLM_PROXY_ALLOW_PRIVATE_NETWORK === "true",
     requestTimeoutMs: integerEnv("OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS", DEFAULTS.requestTimeoutMs, { min: 1, max: 3600000 }),
+    idleTimeoutSeconds: process.env.OPENCODE_LLM_PROXY_IDLE_TIMEOUT_SECONDS?.trim()
+      ? integerEnv("OPENCODE_LLM_PROXY_IDLE_TIMEOUT_SECONDS", 0, { min: 0, max: BUN_MAX_IDLE_TIMEOUT_SECONDS })
+      : undefined,
     maxRequestBytes,
     maxConcurrentRequests: integerEnv("OPENCODE_LLM_PROXY_MAX_CONCURRENT_REQUESTS", DEFAULTS.maxConcurrentRequests, { min: 1, max: 1000 }),
     maxQueuedRequests: integerEnv("OPENCODE_LLM_PROXY_MAX_QUEUED_REQUESTS", DEFAULTS.maxQueuedRequests, { min: 0, max: 10000 }),
@@ -2883,6 +2901,7 @@ async function startProxyServer(client) {
     server = Bun.serve({
       hostname,
       port,
+      idleTimeout: resolveIdleTimeoutSeconds(config),
       fetch: createProxyFetchHandler(client),
     })
   } catch (error) {
