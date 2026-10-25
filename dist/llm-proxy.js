@@ -1174,6 +1174,7 @@ function createV2Backend(ctx, options = {}) {
   const turns = /* @__PURE__ */ new Map();
   let nextTurn = 0;
   const placeholderTimeoutMs = options.toolPlaceholderTimeoutMs ?? TOOL_PLACEHOLDER_TIMEOUT_MS;
+  const nativePassthrough = options.nativeToolPassthrough ?? process.env.OPENCODE_LLM_PROXY_NATIVE_PASSTHROUGH === "1";
   const proxyToolPattern = new RegExp(`^${TOOL_PREFIX}\\d+_`);
   async function install() {
     await ctx.session.hook("context", (event) => {
@@ -1185,7 +1186,7 @@ function createV2Backend(ctx, options = {}) {
         return;
       }
       event.system = turn.system ? [{ type: "text", text: turn.system }] : [];
-      event.tools = Object.fromEntries(Object.entries(event.tools).filter(([name]) => turn.toolNames.has(name)));
+      event.tools = nativePassthrough ? { ...event.tools } : Object.fromEntries(Object.entries(event.tools).filter(([name]) => turn.toolNames.has(name)));
       const controls = turn.controls ?? {};
       if (controls.temperature !== void 0) event.options.temperature = controls.temperature;
       if (controls.topP !== void 0) event.options.topP = controls.topP;
@@ -1202,7 +1203,7 @@ function createV2Backend(ctx, options = {}) {
     const seen = /* @__PURE__ */ new Set();
     const nameMap = /* @__PURE__ */ new Map();
     const definitions = tools.map((tool) => {
-      const name = toolName(prefix, tool.name, seen);
+      const name = toolName(nativePassthrough ? "" : prefix, tool.name, seen);
       nameMap.set(name, tool.name);
       return {
         name,

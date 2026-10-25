@@ -306,6 +306,38 @@ describe("V2 backend", () => {
     assert.deepEqual(ctx.removed, ["ses_1"])
   })
 
+  it("keeps exact tool names and the native tool map with native passthrough", async () => {
+    process.env.OPENCODE_LLM_PROXY_NATIVE_PASSTHROUGH = "1"
+    let hooked
+    const ctx = createCtx({
+      onPrompt: (sessionID, c) => {
+        const name = c.registrations[0].tools[0].name
+        hooked = contextEvent(sessionID, { [name]: { description: "w", input: {} } })
+        c.hooks.context(hooked)
+        const base = { sessionID, assistantMessageID: "msg_a" }
+        c.emit("session.tool.input.started", { ...base, id: "call_1", name })
+        c.emit("session.tool.called", { ...base, id: "call_1", input: { city: "Paris" }, executed: false })
+        c.emit("session.step.streamed", base)
+        c.emit("session.step.ended", { ...base, finish: "tool-calls", tokens: usage, cost: 0 })
+        c.emit("session.execution.interrupted", { sessionID, reason: "user" })
+      },
+    })
+    const backend = createV2Backend(ctx)
+    await backend.install()
+    const result = await backend.runTurn({
+      model: MODEL,
+      text: "weather?",
+      tools: [{ name: "get-weather", description: "Weather", parameters: { type: "object", properties: { city: { type: "string" } } } }],
+    })
+
+    const registered = ctx.registrations[0].tools[0]
+    assert.equal(registered.name, "get_weather")
+    assert.deepEqual(Object.keys(hooked.tools).sort(), ["get_weather", "read", "shell"])
+    assert.deepEqual(result.toolCalls, [
+      { id: "call_1", name: "get-weather", arguments: { city: "Paris" } },
+    ])
+  })
+
   it("tool executors wait for the turn to be interrupted", async () => {
     const ctx = createCtx()
     const backend = createV2Backend(ctx, { toolPlaceholderTimeoutMs: 1000 })

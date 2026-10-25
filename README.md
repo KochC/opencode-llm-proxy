@@ -206,6 +206,7 @@ curl -o .opencode/plugins/llm-proxy.js \
 | `OPENCODE_LLM_PROXY_MAX_MEDIA_ITEMS` | `64` | Maximum total embedded and remote media items in one request. |
 | `OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_REDIRECTS` | `3` | Maximum redirects per remote media download, from 0 to 100. |
 | `OPENCODE_LLM_PROXY_REMOTE_MEDIA_TIMEOUT_MS` | `10000` | Total remote-media preparation timeout, including DNS and all items, from 1 to 3,600,000 ms. |
+| `OPENCODE_LLM_PROXY_NATIVE_PASSTHROUGH` | `false` | OpenCode V2 only. Keep the caller's tool names and schemas 1:1 instead of adding the `pxN_` prefix and filtering tools against the caller's list. For clients that already send the native OpenCode system and tools (for example a free-tier native lane). |
 
 Use `x-opencode-variant` to select an OpenCode model variant for a request. The proxy accepts multimodal image, document, and file inputs in each API's native content shape, using embedded data URLs and validating model capabilities. Remote URLs are rejected unless the SSRF-safe remote-media fetcher is explicitly enabled; fetched content is converted to a data URL before it reaches OpenCode. Structured JSON output is supported through OpenAI `response_format.json_schema`, Responses API `text.format.schema`, and Gemini `generationConfig.responseSchema`.
 
@@ -216,6 +217,38 @@ OPENCODE_LLM_PROXY_HOST=0.0.0.0 \
 OPENCODE_LLM_PROXY_TOKEN=my-secret \
 opencode
 ```
+
+### Native tool passthrough (1:1)
+
+By default, OpenCode V2 registers caller tools under a per-turn `pxN_` prefix,
+filters the session tool set down to those names, and replaces the session
+system with the caller's system. That is the right shape for an external client
+that does not know OpenCode's native tools.
+
+Some clients already send a native OpenCode request: the full OpenCode system
+prompt and the native tool schemas. The OpenCode free-tier gate
+accepts that request shape and rejects the filtered/prefixed one with
+`429 Free usage limit reached`. For those clients, enable native passthrough:
+
+```bash
+OPENCODE_LLM_PROXY_NATIVE_PASSTHROUGH=1 opencode
+```
+
+With the flag on, the V2 backend:
+
+- registers each caller tool under its exact name (no `pxN_` prefix);
+- keeps the session's tool map intact instead of filtering it to the caller's
+  names;
+- still returns captured calls to the client, which executes them itself.
+
+The flag is off by default, so existing clients keep the prefixed/isolated
+behaviour. It is intended for a dedicated OpenCode process: `ctx.tool.transform`
+is global, and exact names can collide with OpenCode's own tools. `execute` is a
+reserved CodeMode tool name; OpenCode skips that registration and keeps the
+remaining tools. Tested with OpenCode 2.0.23 against
+`opencode/deepseek-v4.1-flash-free`: a full native request returned
+`finish_reason: "tool_calls"` with `read`, and a following `role: "tool"`
+message with `CLIENT_SIDE` was used in the final answer.
 
 ---
 
@@ -290,7 +323,7 @@ OpenCode's own agent loop always executes tools itself, server-side, so there's 
 **OpenCode V2**
 
 1. The proxy registers your declared tool schemas as plugin tools for the duration of that one turn (under a short per-turn prefix such as `px0_`, so they never collide with OpenCode's own tools). Their executors run nothing.
-2. A session hook gives the proxy's session exactly those tools — no built-in OpenCode tool — and keeps them out of every other session.
+2. A session hook gives the proxy's session exactly those tools — no built-in OpenCode tool — and keeps them out of every other session. With `OPENCODE_LLM_PROXY_NATIVE_PASSTHROUGH=1`, names are registered 1:1 and the session's existing tool map is kept instead.
 3. The proxy watches OpenCode's event stream, captures every tool call the model proposes in that turn with its arguments, and interrupts the session as soon as the model finishes the step, before OpenCode starts a follow-up step. The captured calls are translated into your API's tool-call shape.
 
 **OpenCode V1**
@@ -547,7 +580,7 @@ Each request:
 
 Streaming uses OpenCode's event stream (V2: `ctx.event.subscribe()`; V1: `client.event.subscribe()`). Text deltas are forwarded in real time, and the upstream async iterator is explicitly closed on completion, error, cancellation, or early tool-call termination. If the event stream stops delivering, the turn still completes from the session's stored messages, and any text the stream missed is sent to streaming clients.
 
-On OpenCode V2 the proxy session receives only your request: your system prompt replaces OpenCode's coding-agent prompt and instructions, and the session gets no OpenCode tools.
+On OpenCode V2 the proxy session receives only your request: your system prompt replaces OpenCode's coding-agent prompt and instructions, and the session gets no OpenCode tools. With `OPENCODE_LLM_PROXY_NATIVE_PASSTHROUGH=1`, the caller's exact tool names and the existing OpenCode tool map are preserved instead.
 
 ---
 
