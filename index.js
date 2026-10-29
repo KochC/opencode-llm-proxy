@@ -10,7 +10,7 @@ import {
 } from "./canonical-messages.js"
 import { getMetrics } from "./metrics.js"
 import { MediaError, prepareMedia } from "./remote-media.js"
-import { createV2Backend } from "./opencode-v2.js"
+import { capMaxTokens, createV2Backend } from "./opencode-v2.js"
 
 const STATE_KEY = "__opencodeOpenAIProxyState"
 const BRIDGE_SCRIPT_PATH = fileURLToPath(new URL("./mcp-tool-bridge.js", import.meta.url))
@@ -1886,6 +1886,17 @@ function generationControls(body) {
     if (!Number.isInteger(topK) || topK < 1) throw new ProxyError("'topK' must be a positive integer.", 400, "invalid_parameter")
     controls.topK = topK
   }
+  // max_completion_tokens supersedes the deprecated max_tokens in OpenAI Chat Completions.
+  const maxTokensField = ["max_completion_tokens", "max_output_tokens", "max_tokens", "maxOutputTokens"].find(
+    (name) => source[name] != null,
+  )
+  if (maxTokensField) {
+    const maxTokens = source[maxTokensField]
+    if (!Number.isInteger(maxTokens) || maxTokens < 1) {
+      throw new ProxyError(`'${maxTokensField}' must be a positive integer.`, 400, "invalid_parameter")
+    }
+    controls.maxTokens = maxTokens
+  }
   return controls
 }
 
@@ -2938,6 +2949,9 @@ export const OpenAIProxyPlugin = async ({ client }) => {
       if (controls.temperature !== undefined) output.temperature = controls.temperature
       if (controls.topP !== undefined) output.topP = controls.topP
       if (controls.topK !== undefined) output.topK = controls.topK
+      if (controls.maxTokens !== undefined) {
+        output.maxOutputTokens = capMaxTokens(controls.maxTokens, output.maxOutputTokens, input.model?.limit?.output)
+      }
     },
   }
 }

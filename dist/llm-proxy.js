@@ -1061,6 +1061,9 @@ function toolName(prefix, name, seen) {
   seen.add(candidate);
   return candidate;
 }
+function capMaxTokens(requested, ...limits) {
+  return Math.min(requested, ...limits.filter((limit) => typeof limit === "number" && limit > 0));
+}
 function normalizeV2Model(model) {
   const input = Array.isArray(model.capabilities?.input) ? model.capabilities.input : [];
   const capabilities = {
@@ -1190,6 +1193,9 @@ function createV2Backend(ctx, options = {}) {
       if (controls.temperature !== void 0) event.options.temperature = controls.temperature;
       if (controls.topP !== void 0) event.options.topP = controls.topP;
       if (controls.topK !== void 0) event.options.topK = controls.topK;
+      if (controls.maxTokens !== void 0) {
+        event.options.maxTokens = capMaxTokens(controls.maxTokens, event.options.maxTokens, turn.outputLimit);
+      }
     });
   }
   async function listModels2() {
@@ -1297,6 +1303,7 @@ function createV2Backend(ctx, options = {}) {
         system: [system, format ? structuredInstruction(format) : ""].filter(Boolean).join("\n\n"),
         toolNames: bridge?.toolNames ?? /* @__PURE__ */ new Set(),
         controls,
+        outputLimit: model.limit?.output,
         onToolCall
       });
       signal?.addEventListener("abort", interrupt, { once: true });
@@ -2935,6 +2942,16 @@ function generationControls(body) {
     if (!Number.isInteger(topK) || topK < 1) throw new ProxyError("'topK' must be a positive integer.", 400, "invalid_parameter");
     controls.topK = topK;
   }
+  const maxTokensField = ["max_completion_tokens", "max_output_tokens", "max_tokens", "maxOutputTokens"].find(
+    (name) => source[name] != null
+  );
+  if (maxTokensField) {
+    const maxTokens = source[maxTokensField];
+    if (!Number.isInteger(maxTokens) || maxTokens < 1) {
+      throw new ProxyError(`'${maxTokensField}' must be a positive integer.`, 400, "invalid_parameter");
+    }
+    controls.maxTokens = maxTokens;
+  }
   return controls;
 }
 function extractGeminiSystemInstruction(systemInstruction) {
@@ -3890,6 +3907,9 @@ var OpenAIProxyPlugin = async ({ client }) => {
       if (controls.temperature !== void 0) output.temperature = controls.temperature;
       if (controls.topP !== void 0) output.topP = controls.topP;
       if (controls.topK !== void 0) output.topK = controls.topK;
+      if (controls.maxTokens !== void 0) {
+        output.maxOutputTokens = capMaxTokens(controls.maxTokens, output.maxOutputTokens, input.model?.limit?.output);
+      }
     }
   };
 };
