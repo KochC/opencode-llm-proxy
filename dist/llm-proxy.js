@@ -1061,6 +1061,9 @@ function toolName(prefix, name, seen) {
   seen.add(candidate);
   return candidate;
 }
+function capMaxTokens(requested, ...limits) {
+  return Math.min(requested, ...limits.filter((limit) => typeof limit === "number" && limit > 0));
+}
 function normalizeV2Model(model) {
   const input = Array.isArray(model.capabilities?.input) ? model.capabilities.input : [];
   const capabilities = {
@@ -1190,6 +1193,9 @@ function createV2Backend(ctx, options = {}) {
       if (controls.temperature !== void 0) event.options.temperature = controls.temperature;
       if (controls.topP !== void 0) event.options.topP = controls.topP;
       if (controls.topK !== void 0) event.options.topK = controls.topK;
+      if (controls.maxTokens !== void 0) {
+        event.options.maxTokens = capMaxTokens(controls.maxTokens, event.options.maxTokens, turn.outputLimit);
+      }
     });
   }
   async function listModels2() {
@@ -1297,6 +1303,7 @@ function createV2Backend(ctx, options = {}) {
         system: [system, format ? structuredInstruction(format) : ""].filter(Boolean).join("\n\n"),
         toolNames: bridge?.toolNames ?? /* @__PURE__ */ new Set(),
         controls,
+        outputLimit: model.limit?.output,
         onToolCall
       });
       signal?.addEventListener("abort", interrupt, { once: true });
@@ -2935,25 +2942,17 @@ function generationControls(body) {
     if (!Number.isInteger(topK) || topK < 1) throw new ProxyError("'topK' must be a positive integer.", 400, "invalid_parameter");
     controls.topK = topK;
   }
+  const maxTokensField = ["max_completion_tokens", "max_output_tokens", "max_tokens", "maxOutputTokens"].find(
+    (name) => source[name] != null
+  );
+  if (maxTokensField) {
+    const maxTokens = source[maxTokensField];
+    if (!Number.isInteger(maxTokens) || maxTokens < 1) {
+      throw new ProxyError(`'${maxTokensField}' must be a positive integer.`, 400, "invalid_parameter");
+    }
+    controls.maxTokens = maxTokens;
+  }
   return controls;
-}
-var UNENFORCED_TOKEN_FIELDS = ["max_tokens", "max_completion_tokens", "max_output_tokens", "maxOutputTokens"];
-function unenforcedControls(body) {
-  const sources = [body, body?.generationConfig].filter(isPlainObject);
-  return UNENFORCED_TOKEN_FIELDS.filter((name) => sources.some((source) => source[name] !== void 0));
-}
-function warnUnenforcedControls(client, body) {
-  const state = getState();
-  state.warnedUnenforcedControls ??= /* @__PURE__ */ new Set();
-  const fresh = unenforcedControls(body).filter((name) => !state.warnedUnenforcedControls.has(name));
-  if (fresh.length === 0) return;
-  for (const name of fresh) state.warnedUnenforcedControls.add(name);
-  Promise.resolve().then(
-    () => safeLog(client, "warn", "Maximum-token controls are accepted but not enforced by OpenCode", {
-      fields: fresh
-    })
-  ).catch(() => {
-  });
 }
 function extractGeminiSystemInstruction(systemInstruction) {
   if (!systemInstruction) return null;
@@ -3087,7 +3086,6 @@ function createProxyFetchHandler(client) {
           format = structuredFormat(body);
           if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request");
           controls = generationControls(body);
-          warnUnenforcedControls(client, body);
         } catch (error) {
           return badRequest(error.message, error.status ?? 400, request);
         }
@@ -3260,7 +3258,6 @@ data: [DONE]
           format = structuredFormat(body);
           if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request");
           controls = generationControls(body);
-          warnUnenforcedControls(client, body);
         } catch (error) {
           return badRequest(error.message, error.status ?? 400, request);
         }
@@ -3540,7 +3537,6 @@ data: ${JSON.stringify(data)}
         try {
           validateUnsupportedControls(body);
           controls = generationControls(body);
-          warnUnenforcedControls(client, body);
         } catch (error) {
           return anthropicBadRequest(error.message, error.status ?? 400, request);
         }
@@ -3715,7 +3711,6 @@ data: ${JSON.stringify(data)}
         try {
           format = structuredFormat(body);
           controls = generationControls(body);
-          warnUnenforcedControls(client, body);
         } catch (error) {
           return badRequest(error.message, error.status ?? 400, request);
         }
@@ -3912,6 +3907,9 @@ var OpenAIProxyPlugin = async ({ client }) => {
       if (controls.temperature !== void 0) output.temperature = controls.temperature;
       if (controls.topP !== void 0) output.topP = controls.topP;
       if (controls.topK !== void 0) output.topK = controls.topK;
+      if (controls.maxTokens !== void 0) {
+        output.maxOutputTokens = capMaxTokens(controls.maxTokens, output.maxOutputTokens, input.model?.limit?.output);
+      }
     }
   };
 };
@@ -3975,6 +3973,5 @@ export {
   resolveModel,
   sanitizeToolName,
   setupV2,
-  toTextContent,
-  unenforcedControls
+  toTextContent
 };

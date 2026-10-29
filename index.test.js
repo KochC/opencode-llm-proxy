@@ -1725,48 +1725,33 @@ test("POST /v1/messages returns a well-formed Anthropic response", async () => {
   assert.equal(body.usage.output_tokens, 10)
 })
 
-describe("unenforcedControls", () => {
-  it("reports every maximum-token field present", () => {
-    assert.deepEqual(mod.unenforcedControls({ max_tokens: 1, max_completion_tokens: 2 }), [
-      "max_tokens",
-      "max_completion_tokens",
-    ])
-    assert.deepEqual(mod.unenforcedControls({ max_output_tokens: 5 }), ["max_output_tokens"])
-    assert.deepEqual(mod.unenforcedControls({ generationConfig: { maxOutputTokens: 100 } }), ["maxOutputTokens"])
-  })
-
-  it("returns nothing when no maximum-token field is set", () => {
-    assert.deepEqual(mod.unenforcedControls({ temperature: 0 }), [])
-    assert.deepEqual(mod.unenforcedControls({ generationConfig: null }), [])
-  })
-})
-
-test("max-token fields log a single 'not enforced' warning per field", async () => {
-  delete globalThis.__opencodeOpenAIProxyState?.warnedUnenforcedControls
-  const logs = []
-  const client = createAnthropicClient("Hi there!")
-  client.app.log = async ({ body }) => {
-    logs.push(body)
-  }
-  const handler = createProxyFetchHandler(client)
-  const send = () =>
-    handler(new Request("http://127.0.0.1:4010/v1/messages", {
+describe("maximum-token controls", () => {
+  const post = (path, body) =>
+    createProxyFetchHandler(createAnthropicClient("Hi there!"))(new Request(`http://127.0.0.1:4010${path}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: "anthropic/claude-3-5-sonnet",
-        max_tokens: 1024,
-        messages: [{ role: "user", content: "Say hello." }],
-      }),
+      body: JSON.stringify(body),
     }))
 
-  assert.equal((await send()).status, 200)
-  assert.equal((await send()).status, 200)
-  await delay(0)
+  it("rejects values that are not positive integers", async () => {
+    const messages = [{ role: "user", content: "Say hello." }]
+    const zero = await post("/v1/messages", { model: "anthropic/claude-3-5-sonnet", max_tokens: 0, messages })
+    assert.equal(zero.status, 400)
+    assert.match((await zero.json()).error.message, /'max_tokens' must be a positive integer/)
 
-  const warnings = logs.filter((entry) => entry.level === "warn" && /not enforced/.test(entry.message))
-  assert.equal(warnings.length, 1)
-  assert.deepEqual(warnings[0].extra.fields, ["max_tokens"])
+    const fractional = await post("/v1/chat/completions", { model: "anthropic/claude-3-5-sonnet", max_completion_tokens: 1.5, messages })
+    assert.equal(fractional.status, 400)
+    assert.match((await fractional.json()).error.message, /'max_completion_tokens' must be a positive integer/)
+  })
+
+  it("accepts a null value as unset", async () => {
+    const response = await post("/v1/chat/completions", {
+      model: "anthropic/claude-3-5-sonnet",
+      max_tokens: null,
+      messages: [{ role: "user", content: "Say hello." }],
+    })
+    assert.equal(response.status, 200)
+  })
 })
 
 test("POST /v1/messages system string is included in prompt", async () => {
@@ -3557,12 +3542,16 @@ describe("OpenAIProxyPlugin", () => {
             input: "hi",
             temperature: 0.4,
             top_p: 0.8,
+            max_output_tokens: 500,
           }),
         }))
         await promptStarted
-        const output = {}
-        await hooks["chat.params"]({ sessionID: "sess-resp-1" }, output)
-        assert.deepEqual(output, { temperature: 0.4, topP: 0.8 })
+        const output = { maxOutputTokens: 32000 }
+        await hooks["chat.params"]({ sessionID: "sess-resp-1", model: { limit: { output: 64000 } } }, output)
+        assert.deepEqual(output, { temperature: 0.4, topP: 0.8, maxOutputTokens: 500 })
+        const capped = { maxOutputTokens: 32000 }
+        await hooks["chat.params"]({ sessionID: "sess-resp-1", model: { limit: { output: 256 } } }, capped)
+        assert.equal(capped.maxOutputTokens, 256)
         await responsePromise
       },
     )

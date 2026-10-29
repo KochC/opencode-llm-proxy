@@ -10,7 +10,7 @@ import {
 } from "./canonical-messages.js"
 import { getMetrics } from "./metrics.js"
 import { MediaError, prepareMedia } from "./remote-media.js"
-import { createV2Backend } from "./opencode-v2.js"
+import { capMaxTokens, createV2Backend } from "./opencode-v2.js"
 
 const STATE_KEY = "__opencodeOpenAIProxyState"
 const BRIDGE_SCRIPT_PATH = fileURLToPath(new URL("./mcp-tool-bridge.js", import.meta.url))
@@ -1886,32 +1886,18 @@ function generationControls(body) {
     if (!Number.isInteger(topK) || topK < 1) throw new ProxyError("'topK' must be a positive integer.", 400, "invalid_parameter")
     controls.topK = topK
   }
+  // max_completion_tokens supersedes the deprecated max_tokens in OpenAI Chat Completions.
+  const maxTokensField = ["max_completion_tokens", "max_output_tokens", "max_tokens", "maxOutputTokens"].find(
+    (name) => source[name] != null,
+  )
+  if (maxTokensField) {
+    const maxTokens = source[maxTokensField]
+    if (!Number.isInteger(maxTokens) || maxTokens < 1) {
+      throw new ProxyError(`'${maxTokensField}' must be a positive integer.`, 400, "invalid_parameter")
+    }
+    controls.maxTokens = maxTokens
+  }
   return controls
-}
-
-// Maximum-token fields are accepted for client compatibility (Anthropic requires
-// max_tokens) but the OpenCode SDK has no way to enforce them. Warn once per field
-// per process so operators learn the limit is ignored without flooding the log.
-const UNENFORCED_TOKEN_FIELDS = ["max_tokens", "max_completion_tokens", "max_output_tokens", "maxOutputTokens"]
-
-export function unenforcedControls(body) {
-  const sources = [body, body?.generationConfig].filter(isPlainObject)
-  return UNENFORCED_TOKEN_FIELDS.filter((name) => sources.some((source) => source[name] !== undefined))
-}
-
-function warnUnenforcedControls(client, body) {
-  const state = getState()
-  state.warnedUnenforcedControls ??= new Set()
-  const fresh = unenforcedControls(body).filter((name) => !state.warnedUnenforcedControls.has(name))
-  if (fresh.length === 0) return
-  for (const name of fresh) state.warnedUnenforcedControls.add(name)
-  Promise.resolve()
-    .then(() =>
-      safeLog(client, "warn", "Maximum-token controls are accepted but not enforced by OpenCode", {
-        fields: fresh,
-      }),
-    )
-    .catch(() => {})
 }
 
 export function extractGeminiSystemInstruction(systemInstruction) {
@@ -2071,7 +2057,6 @@ export function createProxyFetchHandler(client) {
         format = structuredFormat(body)
         if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request")
         controls = generationControls(body)
-        warnUnenforcedControls(client, body)
       } catch (error) {
         return badRequest(error.message, error.status ?? 400, request)
       }
@@ -2247,7 +2232,6 @@ export function createProxyFetchHandler(client) {
         format = structuredFormat(body)
         if (format && callerTools.length > 0) throw new ProxyError("Structured output cannot be combined with tools.", 400, "invalid_request")
         controls = generationControls(body)
-        warnUnenforcedControls(client, body)
       } catch (error) {
         return badRequest(error.message, error.status ?? 400, request)
       }
@@ -2552,7 +2536,6 @@ export function createProxyFetchHandler(client) {
       try {
         validateUnsupportedControls(body)
         controls = generationControls(body)
-        warnUnenforcedControls(client, body)
       } catch (error) {
         return anthropicBadRequest(error.message, error.status ?? 400, request)
       }
@@ -2750,7 +2733,6 @@ export function createProxyFetchHandler(client) {
       try {
         format = structuredFormat(body)
         controls = generationControls(body)
-        warnUnenforcedControls(client, body)
       } catch (error) {
         return badRequest(error.message, error.status ?? 400, request)
       }
@@ -2967,6 +2949,9 @@ export const OpenAIProxyPlugin = async ({ client }) => {
       if (controls.temperature !== undefined) output.temperature = controls.temperature
       if (controls.topP !== undefined) output.topP = controls.topP
       if (controls.topK !== undefined) output.topK = controls.topK
+      if (controls.maxTokens !== undefined) {
+        output.maxOutputTokens = capMaxTokens(controls.maxTokens, output.maxOutputTokens, input.model?.limit?.output)
+      }
     },
   }
 }

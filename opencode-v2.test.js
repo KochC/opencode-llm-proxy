@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 
 import * as mod from "./index.js"
 import { createProxyFetchHandler } from "./index.js"
-import { createV2Backend, normalizeV2Model, parseStructured, toolName, transcriptOutcome, transcriptToolCalls } from "./opencode-v2.js"
+import { capMaxTokens, createV2Backend, normalizeV2Model, parseStructured, toolName, transcriptOutcome, transcriptToolCalls } from "./opencode-v2.js"
 import { resetMetrics } from "./metrics.js"
 
 const PROXY_STATE_KEY = "__opencodeOpenAIProxyState"
@@ -143,6 +143,13 @@ function textReply(text) {
 }
 
 describe("V2 helpers", () => {
+  it("caps a requested token limit at the existing and model limits", () => {
+    assert.equal(capMaxTokens(500), 500)
+    assert.equal(capMaxTokens(500, undefined, 32000), 500)
+    assert.equal(capMaxTokens(500, 200, 32000), 200)
+    assert.equal(capMaxTokens(500, 0, null, 300), 300)
+  })
+
   it("normalizes V2 model info to the proxy's model shape", () => {
     assert.deepEqual(MODEL, {
       id: "acme/gpt-x",
@@ -237,7 +244,7 @@ describe("V2 backend", () => {
       system: "Be brief.",
       text: "hello",
       variant: "high",
-      controls: { temperature: 0.3, topP: 0.9, topK: 4 },
+      controls: { temperature: 0.3, topP: 0.9, topK: 4, maxTokens: 50 },
       onChunk: (delta) => chunks.push(delta),
     })
 
@@ -250,7 +257,7 @@ describe("V2 backend", () => {
     assert.deepEqual(ctx.prompts[0], { sessionID: "ses_1", text: "hello" })
     assert.deepEqual(hooked.system, [{ type: "text", text: "Be brief." }])
     assert.deepEqual(hooked.tools, {})
-    assert.deepEqual(hooked.options, { temperature: 0.3, topP: 0.9, topK: 4 })
+    assert.deepEqual(hooked.options, { temperature: 0.3, topP: 0.9, topK: 4, maxTokens: 50 })
     assert.deepEqual(ctx.removed, ["ses_1"])
   })
 

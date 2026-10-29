@@ -209,7 +209,7 @@ curl -o .opencode/plugins/llm-proxy.js \
 
 Use `x-opencode-variant` to select an OpenCode model variant for a request. The proxy accepts multimodal image, document, and file inputs in each API's native content shape, using embedded data URLs and validating model capabilities. Remote URLs are rejected unless the SSRF-safe remote-media fetcher is explicitly enabled; fetched content is converted to a data URL before it reaches OpenCode. Structured JSON output is supported through OpenAI `response_format.json_schema`, Responses API `text.format.schema`, and Gemini `generationConfig.responseSchema`.
 
-Generation `temperature`, top-p (`top_p`/`topP`), and top-k (`topK`) values are validated and applied through the plugin's `chat.params` hook. Maximum-token fields (`max_tokens`, `max_completion_tokens`, `max_output_tokens`, and Gemini `maxOutputTokens`) are accepted where clients require them, but the current OpenCode SDK cannot enforce them; the proxy logs a one-time `warn` per field the first time each is received. OpenAI and Anthropic requests reject unsupported controls (`stop`, `seed`, `frequency_penalty`, `presence_penalty`, `logprobs`, and `n`) with `400` instead of silently ignoring them.
+Generation `temperature`, top-p (`top_p`/`topP`), top-k (`topK`), and maximum output tokens (`max_tokens`, `max_completion_tokens`, `max_output_tokens`, and Gemini `maxOutputTokens`) are validated and applied to the underlying model call. A requested token limit can lower OpenCode's output limit but never raise it above the model's maximum; responses that hit it finish with `length` (`max_tokens` for Anthropic, `MAX_TOKENS` for Gemini). Enforcing token limits requires OpenCode 1.4 or later; older versions ignore them. OpenAI and Anthropic requests reject unsupported controls (`stop`, `seed`, `frequency_penalty`, `presence_penalty`, `logprobs`, and `n`) with `400` instead of silently ignoring them.
 
 ```bash
 OPENCODE_LLM_PROXY_HOST=0.0.0.0 \
@@ -514,18 +514,18 @@ When `OPENCODE_LLM_PROXY_METRICS_ENABLED=true`, returns Prometheus text expositi
 Metrics cover HTTP request counts and duration by bounded method/route/status labels, active and queued requests, upstream attempt outcomes, input/output token totals, and remote-media request outcomes, bytes, redirects, in-flight fetches, and duration. Streaming HTTP duration is recorded when the stream finishes, errors, or is cancelled.
 
 ### POST /v1/chat/completions
-OpenAI Chat Completions. Required: `model`, `messages`. Supported optional fields include `stream`, `temperature`, `top_p`, `topK`, `max_tokens`, `max_completion_tokens`, `tools`, `tool_choice`, `response_format.json_schema`, and compatible multimodal content parts. Maximum-token fields are accepted for client compatibility but are not enforceable.
+OpenAI Chat Completions. Required: `model`, `messages`. Supported optional fields include `stream`, `temperature`, `top_p`, `topK`, `max_tokens`, `max_completion_tokens`, `tools`, `tool_choice`, `response_format.json_schema`, and compatible multimodal content parts.
 
 ### POST /v1/responses
-OpenAI Responses API. Required: `model`, `input`. Supported optional fields include `instructions`, `stream`, `temperature`, `top_p`, `topK`, `max_output_tokens`, `tools`, `tool_choice`, `text.format.schema`, and compatible multimodal input items. `max_output_tokens` is accepted for client compatibility but is not enforceable.
+OpenAI Responses API. Required: `model`, `input`. Supported optional fields include `instructions`, `stream`, `temperature`, `top_p`, `topK`, `max_output_tokens`, `tools`, `tool_choice`, `text.format.schema`, and compatible multimodal input items.
 
 ### POST /v1/messages
-Anthropic Messages API. Required: `model`, `messages`. Supported optional fields include `system` (string or an array of `{type: "text", text: string}` blocks), `max_tokens`, `stream`, `temperature`, `top_p`, `topK`, `tools`, `tool_choice`, and native image/document blocks. `max_tokens` is accepted for required Anthropic client compatibility but is not enforceable.
+Anthropic Messages API. Required: `model`, `messages`. Supported optional fields include `system` (string or an array of `{type: "text", text: string}` blocks), `max_tokens`, `stream`, `temperature`, `top_p`, `topK`, `tools`, `tool_choice`, and native image/document blocks.
 
 Errors are returned in Anthropic format: `{ "type": "error", "error": { "type": "...", "message": "..." } }`.
 
 ### POST /v1beta/models/:model:generateContent
-Google Gemini non-streaming. Model name in URL path. Required: `contents`. Supported optional fields include `systemInstruction`, `generationConfig` (`temperature`, `topP`, `topK`, `maxOutputTokens`, and `responseSchema`), `tools`, `toolConfig`, and native inline/file media parts. `maxOutputTokens` is accepted but is not enforceable.
+Google Gemini non-streaming. Model name in URL path. Required: `contents`. Supported optional fields include `systemInstruction`, `generationConfig` (`temperature`, `topP`, `topK`, `maxOutputTokens`, and `responseSchema`), `tools`, `toolConfig`, and native inline/file media parts.
 
 ### POST /v1beta/models/:model:streamGenerateContent
 Same as above, returning a newline-delimited JSON stream. A tool-using turn may emit intermediate text chunks followed by a final chunk containing one or more `functionCall` parts.
@@ -565,7 +565,7 @@ The package supports OpenCode V2 and V1 from one default export, `{ id, setup, s
 - Media support depends on the selected model's advertised image, audio, video, and PDF/file capabilities
 - Remote media fetching is disabled by default and should remain disabled unless URL inputs are required; see [Security](docs/security.md)
 - No cross-request session state — send full conversation history on every request
-- `temperature`, top-p (`top_p`/`topP`), and top-k (`topK`) are applied through OpenCode's plugin hook. Maximum-token controls are accepted for client compatibility but are not enforced.
+- `temperature`, top-p (`top_p`/`topP`), top-k (`topK`), and maximum-token controls are applied through OpenCode's plugin hook. Token limits need OpenCode 1.4+ and are capped at the model's output limit.
 - On OpenCode V2, structured output (`response_format` / `text.format` / `responseSchema`) is requested through an instruction with the JSON Schema, and the reply is parsed as JSON; V2 has no native structured-output setting for sessions.
 - Tool calling supports parallel calls in a single turn — see [Tool calling](#tool-calling) above
 
