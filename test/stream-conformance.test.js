@@ -1,8 +1,16 @@
 import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
-import test from "node:test"
+import test, { beforeEach } from "node:test"
 
 import { createProxyFetchHandler } from "../index.js"
+
+// Keep the suite hermetic: OPENCODE_LLM_PROXY_* variables from the developer's
+// shell or CI (e.g. a token) must not change outcomes.
+beforeEach(() => {
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("OPENCODE_LLM_PROXY_")) delete process.env[name]
+  }
+})
 
 const ROOT = "http://127.0.0.1:4010"
 const TOKENS = { input: 11, output: 4, reasoning: 0, cache: { read: 0, write: 0 } }

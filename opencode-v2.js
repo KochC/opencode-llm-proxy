@@ -51,6 +51,11 @@ export function toolName(prefix, name, seen) {
   return candidate
 }
 
+// A requested token limit may only lower the limit OpenCode already applies, never exceed the model's maximum.
+export function capMaxTokens(requested, ...limits) {
+  return Math.min(requested, ...limits.filter((limit) => typeof limit === "number" && limit > 0))
+}
+
 export function normalizeV2Model(model) {
   const input = Array.isArray(model.capabilities?.input) ? model.capabilities.input : []
   const capabilities = {
@@ -203,6 +208,9 @@ export function createV2Backend(ctx, options = {}) {
       if (controls.temperature !== undefined) event.options.temperature = controls.temperature
       if (controls.topP !== undefined) event.options.topP = controls.topP
       if (controls.topK !== undefined) event.options.topK = controls.topK
+      if (controls.maxTokens !== undefined) {
+        event.options.maxTokens = capMaxTokens(controls.maxTokens, event.options.maxTokens, turn.outputLimit)
+      }
     })
   }
 
@@ -322,6 +330,7 @@ export function createV2Backend(ctx, options = {}) {
         system: [system, format ? structuredInstruction(format) : ""].filter(Boolean).join("\n\n"),
         toolNames: bridge?.toolNames ?? new Set(),
         controls,
+        outputLimit: model.limit?.output,
         onToolCall,
       })
       signal?.addEventListener("abort", interrupt, { once: true })
