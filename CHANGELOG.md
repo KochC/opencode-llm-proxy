@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.12.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.11.2...v1.12.0) (2026-11-10)
+
+
+### Features
+
+* add opt-in native tool passthrough for native OpenCode clients ([92ee68c](https://github.com/KochC/opencode-llm-proxy/commit/92ee68c14752bdaefe40e08b57e97a526d2958d7))
+* opt-in native tool passthrough for native OpenCode clients ([38c3168](https://github.com/KochC/opencode-llm-proxy/commit/38c31681b1cb8d24c1d7cc99e8579d5336818f54))
+
+
+### Bug Fixes
+
+* delete throwaway sessions only after the turn settles (FOREIGN KEY race on aborted turns) ([070c42a](https://github.com/KochC/opencode-llm-proxy/commit/070c42a0c128145b63abed02366a90640c5e6d93))
+* **deps:** override minimatch to 11.0.7 to clear the audit advisory ([cf113fa](https://github.com/KochC/opencode-llm-proxy/commit/cf113fa1c525f1a2e1db55ed05605f1332e01bc1))
+* **deps:** override minimatch to 11.0.7 to clear the audit advisory ([7bcc116](https://github.com/KochC/opencode-llm-proxy/commit/7bcc116a929388fa8c309651f5223cb0a1394ded))
+* enforce maximum-token controls (closes [#75](https://github.com/KochC/opencode-llm-proxy/issues/75)) ([0faebc8](https://github.com/KochC/opencode-llm-proxy/commit/0faebc849ab314e3d929a9504ebfed12ad08e2be))
+* enforce maximum-token controls instead of only warning ([be1a338](https://github.com/KochC/opencode-llm-proxy/commit/be1a33854d11c22998b3fc2296ff3e2dade621d5))
+* **lint:** satisfy current eslint config and document delete timeout ([b879d51](https://github.com/KochC/opencode-llm-proxy/commit/b879d51ae50da73b7a75eebcb8f0ac006bc557e4))
+* map StructuredOutput finish to stop, not tool_calls ([38d742e](https://github.com/KochC/opencode-llm-proxy/commit/38d742e82806f85f6d163d40ea6cb6b9b6788d48))
+* preserve structured tool payloads across API formats ([7ded05c](https://github.com/KochC/opencode-llm-proxy/commit/7ded05c271fd08237d95c2174251896b4d3860cf))
+* preserve structured tool payloads across API formats ([09242fe](https://github.com/KochC/opencode-llm-proxy/commit/09242fedd94cde3a3ec332b4007fd83325a0d869)), closes [#93](https://github.com/KochC/opencode-llm-proxy/issues/93)
+* stop Bun closing slow requests with "socket connection was closed unexpectedly" ([63495d1](https://github.com/KochC/opencode-llm-proxy/commit/63495d1daffe76b70e944b051e9c697fc71b4408))
+* stop Bun closing slow requests with "socket connection was closed unexpectedly" ([2ad71ca](https://github.com/KochC/opencode-llm-proxy/commit/2ad71caab748b7d1747d3a757ef2e934b0032bce))
+* warn once when unenforceable max-token controls are requested ([6e5516a](https://github.com/KochC/opencode-llm-proxy/commit/6e5516a6c61d5b061aa8cac998bdd7b9cd30e6cd)), closes [#75](https://github.com/KochC/opencode-llm-proxy/issues/75)
+
 ## [1.11.2](https://github.com/KochC/opencode-llm-proxy/compare/v1.11.1...v1.11.2) (2026-10-18)
 
 
