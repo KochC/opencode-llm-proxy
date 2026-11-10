@@ -845,9 +845,13 @@ describe("mapFinishReason", () => {
     assert.equal(mapFinishReason("length"), "length")
   })
 
-  it("returns 'tool_calls' when finish includes 'tool'", () => {
-    assert.equal(mapFinishReason("tool_use"), "tool_calls")
-    assert.equal(mapFinishReason("tool"), "tool_calls")
+  it("returns 'stop' when finish includes 'tool' (StructuredOutput); real tools use toolCalls.length", () => {
+    // Opencode json_schema ends on the internal StructuredOutput tool. Mapping
+    // that finish to tool_calls breaks AI SDK Output.object. Callers force
+    // tool_calls when proxy-level toolCalls.length > 0.
+    assert.equal(mapFinishReason("tool_use"), "stop")
+    assert.equal(mapFinishReason("tool"), "stop")
+    assert.equal(mapFinishReason("tool-calls"), "stop")
   })
 
   it("returns 'stop' for unrecognised values", () => {
@@ -1582,8 +1586,9 @@ describe("mapFinishReasonToAnthropic", () => {
     assert.equal(mapFinishReasonToAnthropic("max_length"), "max_tokens")
   })
 
-  it("returns tool_use when finish includes tool", () => {
-    assert.equal(mapFinishReasonToAnthropic("tool_use"), "tool_use")
+  it("returns end_turn when finish includes tool (StructuredOutput); real tools use toolCalls.length", () => {
+    assert.equal(mapFinishReasonToAnthropic("tool_use"), "end_turn")
+    assert.equal(mapFinishReasonToAnthropic("tool"), "end_turn")
   })
 
   it("returns end_turn for unrecognised values", () => {
@@ -1725,6 +1730,35 @@ test("POST /v1/messages returns a well-formed Anthropic response", async () => {
   assert.equal(body.stop_reason, "end_turn")
   assert.equal(body.usage.input_tokens, 15)
   assert.equal(body.usage.output_tokens, 10)
+})
+
+describe("maximum-token controls", () => {
+  const post = (path, body) =>
+    createProxyFetchHandler(createAnthropicClient("Hi there!"))(new Request(`http://127.0.0.1:4010${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }))
+
+  it("rejects values that are not positive integers", async () => {
+    const messages = [{ role: "user", content: "Say hello." }]
+    const zero = await post("/v1/messages", { model: "anthropic/claude-3-5-sonnet", max_tokens: 0, messages })
+    assert.equal(zero.status, 400)
+    assert.match((await zero.json()).error.message, /'max_tokens' must be a positive integer/)
+
+    const fractional = await post("/v1/chat/completions", { model: "anthropic/claude-3-5-sonnet", max_completion_tokens: 1.5, messages })
+    assert.equal(fractional.status, 400)
+    assert.match((await fractional.json()).error.message, /'max_completion_tokens' must be a positive integer/)
+  })
+
+  it("accepts a null value as unset", async () => {
+    const response = await post("/v1/chat/completions", {
+      model: "anthropic/claude-3-5-sonnet",
+      max_tokens: null,
+      messages: [{ role: "user", content: "Say hello." }],
+    })
+    assert.equal(response.status, 200)
+  })
 })
 
 test("POST /v1/messages system string is included in prompt", async () => {
@@ -2277,6 +2311,48 @@ test("parseGeminiTools flattens functionDeclarations across tool groups", () => 
   assert.equal(tools.length, 2)
   assert.equal(tools[0].name, "get_weather")
   assert.equal(tools[1].name, "get_time")
+})
+
+test("parseGeminiTools converts OpenAPI-subset schemas to JSON Schema for the MCP bridge", () => {
+  const [tool] = parseGeminiTools({
+    tools: [{
+      functionDeclarations: [{
+        name: "classify",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            // A property literally named "type" must keep its name; only its schema's type changes.
+            type: { type: "STRING", enum: ["A", "B"], nullable: true },
+            items: { type: "ARRAY", items: { type: "OBJECT", properties: { score: { type: "NUMBER" } } } },
+            choice: { anyOf: [{ type: "INTEGER" }, { type: "BOOLEAN" }] },
+            loose: { type: "TYPE_UNSPECIFIED", description: "anything" },
+          },
+          required: ["type"],
+        },
+      }],
+    }],
+  })
+  assert.deepEqual(tool.parameters, {
+    type: "object",
+    properties: {
+      type: { type: "string", enum: ["A", "B"], nullable: true },
+      items: { type: "array", items: { type: "object", properties: { score: { type: "number" } } } },
+      choice: { anyOf: [{ type: "integer" }, { type: "boolean" }] },
+      loose: { description: "anything" },
+    },
+    required: ["type"],
+  })
+})
+
+test("parseGeminiTools prefers parametersJsonSchema verbatim and does not mutate input", () => {
+  const jsonSchema = { type: "object", properties: { a: { type: "string" } }, additionalProperties: false }
+  const parameters = { type: "OBJECT", properties: { b: { type: "STRING" } } }
+  const snapshot = JSON.parse(JSON.stringify(parameters))
+  const [preferred] = parseGeminiTools({ tools: [{ functionDeclarations: [{ name: "f", parametersJsonSchema: jsonSchema, parameters }] }] })
+  assert.equal(preferred.parameters, jsonSchema)
+  const [converted] = parseGeminiTools({ tools: [{ functionDeclarations: [{ name: "g", parameters }] }] })
+  assert.equal(converted.parameters.type, "object")
+  assert.deepEqual(parameters, snapshot)
 })
 
 test("applyGeminiToolChoice supports NONE mode and allowedFunctionNames", () => {
@@ -3515,12 +3591,16 @@ describe("OpenAIProxyPlugin", () => {
             input: "hi",
             temperature: 0.4,
             top_p: 0.8,
+            max_output_tokens: 500,
           }),
         }))
         await promptStarted
-        const output = {}
-        await hooks["chat.params"]({ sessionID: "sess-resp-1" }, output)
-        assert.deepEqual(output, { temperature: 0.4, topP: 0.8 })
+        const output = { maxOutputTokens: 32000 }
+        await hooks["chat.params"]({ sessionID: "sess-resp-1", model: { limit: { output: 64000 } } }, output)
+        assert.deepEqual(output, { temperature: 0.4, topP: 0.8, maxOutputTokens: 500 })
+        const capped = { maxOutputTokens: 32000 }
+        await hooks["chat.params"]({ sessionID: "sess-resp-1", model: { limit: { output: 256 } } }, capped)
+        assert.equal(capped.maxOutputTokens, 256)
         await responsePromise
       },
     )
@@ -3596,15 +3676,16 @@ describe("OpenAIProxyPlugin", () => {
 })
 
 // ---------------------------------------------------------------------------
-// V1 plugin descriptor (default export)
+// Plugin descriptor (default export)
 // ---------------------------------------------------------------------------
 
-describe("V1 plugin default export", () => {
-  it("exposes a { id, server } descriptor so opencode's loader skips the legacy fallback", async () => {
+describe("plugin default export", () => {
+  it("exposes an { id, server, setup } descriptor so opencode's loader skips the legacy fallback", async () => {
     assert.ok(mod.default, "index.js must have a default export")
-    assert.equal(typeof mod.default, "object", "default export must be a V1 descriptor object")
+    assert.equal(typeof mod.default, "object", "default export must be a plugin descriptor object")
     assert.equal(mod.default.id, "opencode-llm-proxy")
-    assert.equal(typeof mod.default.server, "function", "descriptor.server must be the plugin factory")
+    assert.equal(typeof mod.default.server, "function", "descriptor.server must be the V1 plugin factory")
+    assert.equal(typeof mod.default.setup, "function", "descriptor.setup must be the V2 entry point")
   })
 
   it("descriptor.server starts the proxy when invoked, like the loader would", async () => {
@@ -3633,3 +3714,228 @@ describe("V1 plugin default export", () => {
   })
 })
 
+
+// ---------------------------------------------------------------------------
+// Regression: OpenCode event stream delivers nothing (agent-turn hang)
+// ---------------------------------------------------------------------------
+//
+// Some OpenCode builds never deliver message/session events to the plugin's
+// client.event.subscribe() stream. The read loop in runAgentTurn then waited
+// forever even though the turn had finished, so every tool-calling and every
+// streaming request hung. These clients model that: the event stream yields
+// nothing and never ends, and the outcome is only visible via session.messages().
+
+function silentEventStream() {
+  // An async iterator whose next() never settles: no events, and the stream never ends.
+  return {
+    [Symbol.asyncIterator]() {
+      return this
+    },
+    next: () => new Promise(() => {}),
+    return: async () => ({ done: true, value: undefined }),
+  }
+}
+
+function createSilentEventClient({ assistants, withBridge = false }) {
+  let capturedSlotName = null
+  let aborted = false
+  const resolveAssistants = () => (typeof assistants === "function" ? assistants(capturedSlotName) : assistants)
+  return {
+    get aborted() {
+      return aborted
+    },
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({
+        data: { providers: [{ id: "openai", models: { "gpt-4o": { id: "gpt-4o", name: "GPT-4o" } } }] },
+      }),
+    },
+    mcp: withBridge
+      ? {
+          disconnect: async () => {
+            throw new Error("not connected")
+          },
+          add: async ({ body }) => {
+            capturedSlotName = body.name
+            return { data: {} }
+          },
+        }
+      : undefined,
+    session: {
+      create: async () => ({ data: { id: "sess-silent" } }),
+      // Non-tool, non-streaming requests use session.prompt; give it the same answer.
+      prompt: async () => {
+        const last = resolveAssistants().at(-1)
+        return { data: { info: last.info, parts: last.parts } }
+      },
+      promptAsync: async () => {},
+      abort: async () => {
+        aborted = true
+        return { data: true }
+      },
+      delete: async () => ({ data: true }),
+      messages: async () => ({
+        data: [{ info: { role: "user" }, parts: [{ type: "text", text: "hi" }] }, ...resolveAssistants()],
+      }),
+    },
+    event: { subscribe: async () => ({ stream: silentEventStream() }) },
+  }
+}
+
+const doneTokens = { input: 3, output: 2, reasoning: 0, cache: { read: 0, write: 0 } }
+
+function withTimeout(promise, ms = 5000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms}ms (hang)`)), ms)),
+  ])
+}
+
+describe("agent turn completes when the OpenCode event stream is silent", () => {
+  const toolCallClient = () =>
+    createSilentEventClient({
+      withBridge: true,
+      assistants: (slot) => [
+        {
+          info: { role: "assistant", finish: "tool-calls", time: { completed: 1 }, tokens: doneTokens },
+          parts: [
+            { type: "step-start" },
+            {
+              type: "tool",
+              tool: `${slot}_get_weather`,
+              callID: "call_silent",
+              state: { status: "completed", input: { city: "Berlin" } },
+            },
+            { type: "step-finish" },
+          ],
+        },
+        // OpenCode's follow-up step on the placeholder result must not leak through.
+        {
+          info: { role: "assistant", finish: "stop", time: { completed: 2 }, tokens: doneTokens },
+          parts: [{ type: "text", text: "The tool result will come from the caller." }],
+        },
+      ],
+    })
+
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "get_weather",
+        description: "Get the weather",
+        parameters: { type: "object", properties: { city: { type: "string" } } },
+      },
+    },
+  ]
+
+  it("returns tool_calls for a non-streaming tool request", async () => {
+    const client = toolCallClient()
+    const handler = createProxyFetchHandler(client)
+    const response = await withTimeout(
+      handler(
+        new Request("http://127.0.0.1:4010/v1/chat/completions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "Weather in Berlin?" }], tools }),
+        }),
+      ),
+    )
+    const body = await response.json()
+    assert.equal(response.status, 200)
+    assert.equal(body.choices[0].finish_reason, "tool_calls")
+    assert.equal(body.choices[0].message.content, null)
+    assert.equal(body.choices[0].message.tool_calls.length, 1)
+    assert.equal(body.choices[0].message.tool_calls[0].id, "call_silent")
+    assert.equal(body.choices[0].message.tool_calls[0].function.name, "get_weather")
+    assert.deepEqual(JSON.parse(body.choices[0].message.tool_calls[0].function.arguments), { city: "Berlin" })
+    assert.equal(client.aborted, true, "the follow-up step is aborted")
+  })
+
+  it("streams tool_calls and terminates the SSE stream", async () => {
+    const handler = createProxyFetchHandler(toolCallClient())
+    const response = await handler(
+      new Request("http://127.0.0.1:4010/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-4o",
+          stream: true,
+          messages: [{ role: "user", content: "Weather in Berlin?" }],
+          tools,
+        }),
+      }),
+    )
+    const text = await withTimeout(response.text())
+    assert.match(text, /"name":"get_weather"/)
+    assert.match(text, /"finish_reason":"tool_calls"/)
+    assert.match(text, /data: \[DONE\]/)
+    assert.doesNotMatch(text, /will come from the caller/)
+  })
+
+  it("streams the final text for a plain request and terminates the SSE stream", async () => {
+    const client = createSilentEventClient({
+      assistants: [
+        {
+          info: { role: "assistant", finish: "stop", time: { completed: 1 }, tokens: doneTokens },
+          parts: [{ type: "text", text: "pong" }],
+        },
+      ],
+    })
+    const handler = createProxyFetchHandler(client)
+    const response = await handler(
+      new Request("http://127.0.0.1:4010/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o", stream: true, messages: [{ role: "user", content: "Say pong" }] }),
+      }),
+    )
+    const text = await withTimeout(response.text())
+    assert.match(text, /"content":"pong"/)
+    assert.match(text, /"finish_reason":"stop"/)
+    assert.match(text, /data: \[DONE\]/)
+  })
+
+  it("surfaces a model error recorded on the session instead of hanging", async () => {
+    const client = createSilentEventClient({
+      assistants: [
+        {
+          info: { role: "assistant", error: { data: { message: "provider exploded" } }, time: { completed: 1 } },
+          parts: [],
+        },
+      ],
+    })
+    const handler = createProxyFetchHandler(client)
+    const response = await handler(
+      new Request("http://127.0.0.1:4010/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-4o", stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+    )
+    const text = await withTimeout(response.text())
+    assert.match(text, /error/i)
+    assert.doesNotMatch(text, /"finish_reason":"stop"/)
+  })
+})
+
+describe("resolveIdleTimeoutSeconds", () => {
+  it("outlives the default request timeout instead of using Bun's 10 s default", () => {
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 120000 }), 125)
+  })
+
+  it("rounds sub-second request timeouts up", () => {
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 1500 }), 7)
+  })
+
+  it("disables the idle timer when the request timeout exceeds Bun's 255 s limit", () => {
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 600000 }), 0)
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 251000 }), 0)
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 250000 }), mod.BUN_MAX_IDLE_TIMEOUT_SECONDS)
+  })
+
+  it("honours an explicit override, including 0", () => {
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 120000, idleTimeoutSeconds: 30 }), 30)
+    assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 120000, idleTimeoutSeconds: 0 }), 0)
+  })
+})

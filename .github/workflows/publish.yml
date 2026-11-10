@@ -74,8 +74,21 @@ jobs:
         if: steps.check.outputs.skip == 'false'
         uses: actions/setup-node@v6
         with:
-          node-version: "22"
+          # Trusted publishing (OIDC) needs Node >= 22.14 and npm >= 11.5.1.
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Check npm supports trusted publishing
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          node -e '
+            const [major, minor, patch] = process.argv[1].split(".").map(Number)
+            if (major < 11 || (major === 11 && (minor < 5 || (minor === 5 && patch < 1)))) {
+              console.error(`npm ${process.argv[1]} is too old for trusted publishing (needs >= 11.5.1)`)
+              process.exit(1)
+            }
+          ' "$(npm --version)"
 
       - name: Install dependencies
         if: steps.check.outputs.skip == 'false'
@@ -89,8 +102,8 @@ jobs:
         if: steps.check.outputs.skip == 'false'
         run: npm pack --dry-run
 
+      # Authenticates through npm trusted publishing (OIDC, `id-token: write`); no npm token is used.
+      # Provenance is generated automatically.
       - name: Publish
         if: steps.check.outputs.skip == 'false'
-        run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

@@ -23,6 +23,8 @@ export default [
         AbortController: "readonly",
         setTimeout: "readonly",
         clearTimeout: "readonly",
+        // Logging sink for OpenCode V2 plugins (opencode-v2.js)
+        console: "readonly",
       },
     },
     rules: {

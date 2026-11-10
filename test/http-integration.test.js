@@ -1,9 +1,18 @@
 import assert from "node:assert/strict"
 import { Buffer } from "node:buffer"
 import http from "node:http"
-import test from "node:test"
+import test, { beforeEach } from "node:test"
 
 import { createProxyFetchHandler } from "../index.js"
+
+// Keep the suite hermetic: OPENCODE_LLM_PROXY_* variables from the developer's
+// shell or CI (e.g. a token) must not change outcomes. Tests that need them set
+// them explicitly.
+beforeEach(() => {
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("OPENCODE_LLM_PROXY_")) delete process.env[name]
+  }
+})
 
 const TOKENS = { input: 2, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }
 

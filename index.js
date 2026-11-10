@@ -10,6 +10,7 @@ import {
 } from "./canonical-messages.js"
 import { getMetrics } from "./metrics.js"
 import { MediaError, prepareMedia } from "./remote-media.js"
+import { capMaxTokens, createV2Backend } from "./opencode-v2.js"
 
 const STATE_KEY = "__opencodeOpenAIProxyState"
 const BRIDGE_SCRIPT_PATH = fileURLToPath(new URL("./mcp-tool-bridge.js", import.meta.url))
@@ -29,6 +30,21 @@ const DEFAULTS = Object.freeze({
   bridgeAcquireTimeoutMs: 10000,
   bridgeMaxQueue: 32,
 })
+
+// Bun.serve() closes any connection that has not written a byte for `idleTimeout` seconds
+// (default 10, maximum 255, 0 = disabled). A non-streaming completion - or a stream that pauses
+// while the model thinks or a tool runs - easily exceeds 10 s, and clients then fail with
+// "The socket connection was closed unexpectedly". Derive the idle timeout from the request
+// timeout so a request can never be cut off by the socket before its own deadline.
+export const BUN_MAX_IDLE_TIMEOUT_SECONDS = 255
+
+export function resolveIdleTimeoutSeconds(config) {
+  if (config.idleTimeoutSeconds !== undefined) return config.idleTimeoutSeconds
+  const needed = Math.ceil(config.requestTimeoutMs / 1000) + 5
+  // Bun cannot express anything above 255 s, so disable the idle timer; the per-request
+  // timeout (OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS) still bounds every request.
+  return needed > BUN_MAX_IDLE_TIMEOUT_SECONDS ? 0 : needed
+}
 
 class ProxyError extends Error {
   constructor(message, status = 500, code = "server_error") {
@@ -96,6 +112,9 @@ function loadConfig() {
     corsOrigins: [...new Set(origins)],
     allowPrivateNetwork: process.env.OPENCODE_LLM_PROXY_ALLOW_PRIVATE_NETWORK === "true",
     requestTimeoutMs: integerEnv("OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS", DEFAULTS.requestTimeoutMs, { min: 1, max: 3600000 }),
+    idleTimeoutSeconds: process.env.OPENCODE_LLM_PROXY_IDLE_TIMEOUT_SECONDS?.trim()
+      ? integerEnv("OPENCODE_LLM_PROXY_IDLE_TIMEOUT_SECONDS", 0, { min: 0, max: BUN_MAX_IDLE_TIMEOUT_SECONDS })
+      : undefined,
     maxRequestBytes,
     maxConcurrentRequests: integerEnv("OPENCODE_LLM_PROXY_MAX_CONCURRENT_REQUESTS", DEFAULTS.maxConcurrentRequests, { min: 1, max: 1000 }),
     maxQueuedRequests: integerEnv("OPENCODE_LLM_PROXY_MAX_QUEUED_REQUESTS", DEFAULTS.maxQueuedRequests, { min: 0, max: 10000 }),
@@ -725,7 +744,36 @@ function clearGenerationControls(sessionID) {
   getState().generationControls?.delete(sessionID)
 }
 
+function v2TurnInput(model, messages, system, callerTools, options, onChunk) {
+  const [prompt, ...media] = promptParts(messages, options.media, model, options.maxRequestBytes ?? DEFAULTS.maxRequestBytes)
+  return {
+    model,
+    system,
+    text: prompt.text,
+    media,
+    tools: Array.isArray(callerTools) ? callerTools : [],
+    format: options.format,
+    variant: options.variant,
+    controls: options.controls,
+    onChunk,
+    signal: options.signal,
+    keepSessions: options.keepSessions,
+  }
+}
+
 async function executePrompt(client, _request, model, messages, system, callerTools = [], options = {}) {
+  if (client.v2) {
+    const result = await client.runTurn(v2TurnInput(model, messages, system, callerTools, options))
+    return {
+      content: result.content,
+      structured: result.structured,
+      toolCalls: result.toolCalls,
+      request: _request,
+      sessionID: result.sessionID,
+      completion: { data: { info: { finish: result.finish, tokens: result.tokens } } },
+    }
+  }
+
   if (Array.isArray(callerTools) && callerTools.length > 0) {
     // Tool-aware path: must watch the event stream (via runAgentTurn) rather than
     // block on session.prompt, so we can intercept a proposed tool call instead of
@@ -784,6 +832,7 @@ async function executePrompt(client, _request, model, messages, system, callerTo
 }
 
 async function executePromptStreaming(client, model, messages, system, onChunk, callerTools = [], options = {}) {
+  if (client.v2) return client.runTurn(v2TurnInput(model, messages, system, callerTools, options, onChunk))
   const result = await runAgentTurn(client, model, messages, system, callerTools, onChunk, options)
   return {
     sessionID: result.sessionID,
@@ -906,11 +955,17 @@ function createResponsesApiResponse(result, model) {
 export function mapFinishReason(finish) {
   if (!finish) return "stop"
   if (finish.includes("length")) return "length"
-  if (finish.includes("tool")) return "tool_calls"
+  // Opencode ends json_schema / StructuredOutput turns with a finish string that
+  // contains "tool". Callers already set finish_reason to "tool_calls" when
+  // proxy-level toolCalls.length > 0. Mapping the internal structured finish to
+  // tool_calls here leaves message.content JSON with finish_reason tool_calls
+  // and an empty tool_calls array — Vercel AI SDK Output.object then throws
+  // AI_NoOutputGeneratedError. Keep "stop" for content-only completions.
   return "stop"
 }
 
 async function safeLog(client, level, message, extra) {
+  if (client.v2) return client.log(level, message, extra)
   try {
     await client.app.log({
       body: {
@@ -1123,6 +1178,48 @@ export function applyAnthropicToolChoice(tools, toolChoice) {
   return tools
 }
 
+// Gemini `parameters` use an OpenAPI-subset Schema whose `type` is an uppercase enum
+// ("OBJECT", "STRING", ...). The bridge exposes tools over MCP, which requires JSON
+// Schema (`inputSchema.type` must be "object"), so lowercase the type enums
+// recursively. Everything else - property names, `required`, `enum`, `nullable`,
+// `additionalProperties`, descriptions, key order - is preserved verbatim.
+const GEMINI_SCHEMA_CHILD_MAPS = ["properties", "patternProperties", "$defs", "definitions"]
+const GEMINI_SCHEMA_CHILD_LISTS = ["anyOf", "oneOf", "allOf", "prefixItems"]
+
+export function geminiSchemaToJsonSchema(schema) {
+  if (Array.isArray(schema)) return schema.map(geminiSchemaToJsonSchema)
+  if (!isPlainObject(schema)) return schema
+  const out = { ...schema }
+  if (typeof out.type === "string") {
+    if (out.type.toUpperCase() === "TYPE_UNSPECIFIED") delete out.type
+    else out.type = out.type.toLowerCase()
+  } else if (Array.isArray(out.type)) {
+    out.type = out.type.map((type) => (typeof type === "string" ? type.toLowerCase() : type))
+  }
+  for (const key of GEMINI_SCHEMA_CHILD_MAPS) {
+    if (isPlainObject(out[key])) {
+      out[key] = Object.fromEntries(
+        Object.entries(out[key]).map(([name, child]) => [name, geminiSchemaToJsonSchema(child)]),
+      )
+    }
+  }
+  for (const key of GEMINI_SCHEMA_CHILD_LISTS) {
+    if (Array.isArray(out[key])) out[key] = out[key].map(geminiSchemaToJsonSchema)
+  }
+  for (const key of ["items", "additionalProperties", "not"]) {
+    if (isPlainObject(out[key]) || Array.isArray(out[key])) out[key] = geminiSchemaToJsonSchema(out[key])
+  }
+  return out
+}
+
+function geminiDeclarationParameters(decl) {
+  // `parametersJsonSchema` (newer Gemini API / google-genai SDK) is already JSON
+  // Schema and takes precedence over the OpenAPI-subset `parameters`.
+  const jsonSchema = decl.parametersJsonSchema ?? decl.parameters_json_schema
+  if (isPlainObject(jsonSchema)) return jsonSchema
+  return normalizeParameters(geminiSchemaToJsonSchema(decl.parameters))
+}
+
 export function parseGeminiTools(body) {
   const list = []
   if (Array.isArray(body?.tools)) {
@@ -1133,7 +1230,7 @@ export function parseGeminiTools(body) {
           list.push({
             name: decl.name,
             description: typeof decl.description === "string" ? decl.description : "",
-            parameters: normalizeParameters(decl.parameters),
+            parameters: geminiDeclarationParameters(decl),
           })
         }
       }
@@ -1232,6 +1329,67 @@ export function buildToolsMap(baseTools, bridge) {
   return toolsMap
 }
 
+// Polls the session's persisted messages and resolves when the turn is over. This is the
+// fallback for OpenCode builds whose event stream (client.event.subscribe) never delivers
+// message/session events to the plugin, which otherwise leaves the read loop waiting forever.
+// Returns "tool" (bridge tool-calling step finished), "done" (final answer), or undefined
+// (stopped because the event loop finished first or the request was aborted).
+const POLL_INTERVAL_MS = 300
+
+async function pollAgentTurn(client, sessionID, ctx) {
+  while (!ctx.state.finished) {
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
+    if (ctx.state.finished || ctx.signal?.aborted) return undefined
+    let list
+    try {
+      const result = await client.session.messages({ path: { id: sessionID }, signal: ctx.signal })
+      list = result.data ?? []
+    } catch {
+      continue
+    }
+    if (ctx.state.finished) return undefined
+    const assistants = list.filter((entry) => entry.info?.role === "assistant")
+    if (assistants.length === 0) continue
+
+    const failed = assistants.find((entry) => entry.info?.error)
+    if (failed) {
+      const error = failed.info.error
+      ctx.onError(error?.data?.message ?? error?.message ?? "Model call failed.")
+      return "done"
+    }
+
+    if (ctx.toolIDSet) {
+      // Only the first assistant message carrying bridge tool calls counts; anything after
+      // it is OpenCode reacting to the placeholder results and must not leak through.
+      const toolEntry = assistants.find((entry) =>
+        (entry.parts ?? []).some((part) => part.type === "tool" && ctx.toolIDSet.has(part.tool)),
+      )
+      if (toolEntry) {
+        for (const part of toolEntry.parts ?? []) {
+          if (part.type === "tool" && ctx.toolIDSet.has(part.tool)) ctx.recordToolPart(part)
+        }
+        const stepDone =
+          (toolEntry.parts ?? []).some((part) => part.type === "step-finish") ||
+          toolEntry.info?.finish === "tool-calls" ||
+          Boolean(toolEntry.info?.time?.completed)
+        if (stepDone) return "tool"
+        continue
+      }
+    }
+
+    const text = assistants
+      .flatMap((entry) => entry.parts ?? [])
+      .filter((part) => part.type === "text" && typeof part.text === "string" && !part.synthetic)
+      .map((part) => part.text)
+      .join("")
+    if (text) ctx.onText(text)
+
+    const last = assistants.at(-1)
+    if (last.info?.time?.completed && last.info?.finish && last.info.finish !== "tool-calls") return "done"
+  }
+  return undefined
+}
+
 async function runAgentTurn(client, model, messages, system, callerTools, onChunk, options = {}) {
   const baseTools = await getDisabledTools(client)
   let toolsMap = baseTools
@@ -1262,6 +1420,9 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   // tool parts (and the terminating step-finish) from this same message, so a follow-up
   // agent step can never leak spurious calls into the result.
   let toolMessageID = null
+  // Shared between the event-stream reader and the session poller; whichever sees the
+  // end of the turn first marks it finished so the other stops.
+  let turnState = null
 
   const recordToolPart = (part) => {
     const callID = part.callID
@@ -1307,7 +1468,10 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         ...(options.variant ? { variant: options.variant } : {}),
       },
     })
+    turnState = { finished: false }
+    const eventLoop = (async () => {
     for await (const event of stream) {
+      if (turnState.finished) break
       if (event.type === "message.part.delta") {
         // Real incremental token deltas arrive here, as flat properties (sessionID,
         // partID, field, delta) - NOT nested under event.properties.part like
@@ -1365,15 +1529,59 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         }
       }
     }
+    })()
+
+    const pollLoop = pollAgentTurn(client, sessionID, {
+      state: turnState,
+      signal: options.signal,
+      toolIDSet,
+      recordToolPart,
+      onError: (message) => {
+        errorMessage = message
+      },
+      onText: (fullText) => {
+        // Emit only what the event stream hasn't already delivered.
+        if (fullText.length > content.length && fullText.startsWith(content)) {
+          const delta = fullText.slice(content.length)
+          content = fullText
+          Promise.resolve(onChunk?.(delta)).catch(() => {})
+        }
+      },
+    })
+
+    // If the poller ends the turn first, a later failure of the abandoned event loop
+    // must not surface as an unhandled rejection.
+    eventLoop.catch(() => {})
+    const winner = await Promise.race([
+      eventLoop.then(() => "events"),
+      pollLoop.then((outcome) => outcome ?? "aborted"),
+    ])
+    turnState.finished = true
+    if (winner === "tool") {
+      // Same reasoning as the step-finish branch above: stop OpenCode before it runs a
+      // follow-up step on the placeholder bridge results.
+      try {
+        await client.session.abort({ path: { id: sessionID } })
+      } catch {
+        // Best effort.
+      }
+    }
+    if (options.signal?.aborted) throw options.signal.reason ?? new Error("Request was cancelled.")
   } catch (error) {
     // Safe teardown: no delete on abort/error — it races the server's final
     // persist of the aborted turn (FOREIGN KEY failures under bulk cancels).
     // The session leaks inert; sweepStaleProxySessions reaps it once long idle.
     throw error
   } finally {
+    if (turnState) turnState.finished = true
     removeAbortListener()
+    // Don't block on iterator disposal: when the turn was ended by the poller, the event
+    // iterator may be suspended on a next() that never settles.
     try {
-      await eventStream?.return?.()
+      const disposal = eventStream?.return?.()
+      if (disposal && typeof disposal.then === "function") {
+        await Promise.race([disposal.catch(() => {}), new Promise((resolve) => setTimeout(resolve, 250))])
+      }
     } catch {
       // Signal and session cleanup remain authoritative if iterator disposal fails.
     }
@@ -1429,6 +1637,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
 }
 
 async function listModels(client) {
+  if (client.v2) return client.listModels()
   const result = await client.config.providers()
   const payload = result.data
   const all = Array.isArray(payload?.providers) ? payload.providers : []
@@ -1721,7 +1930,9 @@ export function normalizeAnthropicSystem(system) {
 export function mapFinishReasonToAnthropic(finish) {
   if (!finish) return "end_turn"
   if (finish.includes("length")) return "max_tokens"
-  if (finish.includes("tool")) return "tool_use"
+  // Same as mapFinishReason: do not map Opencode StructuredOutput finish to
+  // tool_use when the proxy already flattened schema JSON into text content.
+  // Real tool_use is still set by createAnthropicResponse when toolCalls.length > 0.
   return "end_turn"
 }
 
@@ -1817,6 +2028,17 @@ function generationControls(body) {
   if (topK !== undefined) {
     if (!Number.isInteger(topK) || topK < 1) throw new ProxyError("'topK' must be a positive integer.", 400, "invalid_parameter")
     controls.topK = topK
+  }
+  // max_completion_tokens supersedes the deprecated max_tokens in OpenAI Chat Completions.
+  const maxTokensField = ["max_completion_tokens", "max_output_tokens", "max_tokens", "maxOutputTokens"].find(
+    (name) => source[name] != null,
+  )
+  if (maxTokensField) {
+    const maxTokens = source[maxTokensField]
+    if (!Number.isInteger(maxTokens) || maxTokens < 1) {
+      throw new ProxyError(`'${maxTokensField}' must be a positive integer.`, 400, "invalid_parameter")
+    }
+    controls.maxTokens = maxTokens
   }
   return controls
 }
@@ -2804,10 +3026,10 @@ export function createProxyFetchHandler(client) {
   }
 }
 
-export const OpenAIProxyPlugin = async ({ client }) => {
+async function startProxyServer(client) {
   const state = getState()
   if (state.started) {
-    return {}
+    return null
   }
 
   const hostname = process.env.OPENCODE_LLM_PROXY_HOST ?? "127.0.0.1"
@@ -2825,7 +3047,7 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     await safeLog(client, "warn", "OpenAI proxy configuration is invalid", {
       error: error instanceof Error ? error.message : String(error),
     })
-    return {}
+    return null
   }
 
   let server
@@ -2833,6 +3055,7 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     server = Bun.serve({
       hostname,
       port,
+      idleTimeout: resolveIdleTimeoutSeconds(config),
       fetch: createProxyFetchHandler(client),
     })
   } catch (error) {
@@ -2842,7 +3065,7 @@ export const OpenAIProxyPlugin = async ({ client }) => {
       port,
       error: error instanceof Error ? error.message : String(error),
     })
-    return {}
+    return null
   }
 
   state.started = true
@@ -2857,6 +3080,14 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     port,
     protected: Boolean(process.env.OPENCODE_LLM_PROXY_TOKEN),
   })
+  return server
+}
+
+export const OpenAIProxyPlugin = async ({ client }) => {
+  const server = await startProxyServer(client)
+  if (!server) {
+    return {}
+  }
 
   return {
     "chat.params": async (input, output) => {
@@ -2865,11 +3096,52 @@ export const OpenAIProxyPlugin = async ({ client }) => {
       if (controls.temperature !== undefined) output.temperature = controls.temperature
       if (controls.topP !== undefined) output.topP = controls.topP
       if (controls.topK !== undefined) output.topK = controls.topK
+      if (controls.maxTokens !== undefined) {
+        output.maxOutputTokens = capMaxTokens(controls.maxTokens, output.maxOutputTokens, input.model?.limit?.output)
+      }
     },
   }
 }
 
-// V1 plugin descriptor. opencode's plugin loader (readV1Plugin in
+// OpenCode V2 loads one plugin instance per location, all in the same process. The proxy server is
+// shared: it serves requests through the first live instance and moves on to another one when that
+// instance unloads, stopping only when the last one is gone.
+export async function setupV2(ctx) {
+  const state = getState()
+  const backend = createV2Backend(ctx)
+  await backend.install()
+
+  state.v2Backends ??= []
+  state.v2Backends.push(backend)
+  if (!state.v2Client) {
+    const current = () => state.v2Backends[0]
+    state.v2Client = {
+      v2: true,
+      listModels: (...args) => current().listModels(...args),
+      runTurn: (...args) => current().runTurn(...args),
+      log: (...args) => current().log(...args),
+    }
+  }
+
+  const server = await startProxyServer(state.v2Client)
+  if (server) state.v2Server = server
+
+  return async () => {
+    state.v2Backends = state.v2Backends.filter((entry) => entry !== backend)
+    if (state.v2Backends.length > 0 || !state.v2Server) return
+    const owned = state.v2Server
+    state.v2Server = undefined
+    state.v2Client = undefined
+    state.started = false
+    state.server = undefined
+    await owned.stop(true)
+  }
+}
+
+// One default export serves both OpenCode generations: V1 invokes `server`,
+// V2 invokes `setup` (https://opencode.ai/v2/docs/build/plugins/migrate-v1).
+//
+// V1: opencode's plugin loader (readV1Plugin in
 // packages/opencode/src/plugin/shared.ts) prefers a default export of this
 // shape and invokes only `server`. Without it, the loader falls back to the
 // legacy path, which invokes EVERY function-typed export as if it were the
@@ -2877,4 +3149,4 @@ export const OpenAIProxyPlugin = async ({ client }) => {
 // the plugin-init argument and every worker logs "failed to load plugin"
 // (see issue #86). Exporting the descriptor keeps all named exports intact
 // for direct imports and tests.
-export default { id: "opencode-llm-proxy", server: OpenAIProxyPlugin }
+export default { id: "opencode-llm-proxy", setup: setupV2, server: OpenAIProxyPlugin }

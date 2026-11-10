@@ -111,9 +111,11 @@ Add to `opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-llm-proxy"]
+  "plugins": ["opencode-llm-proxy"]
 }
 ```
+
+This is the OpenCode V2 format. OpenCode V1 uses the singular key: `"plugin": ["opencode-llm-proxy"]`. See [Compatibility](#compatibility).
 
 Start OpenCode — the proxy starts automatically:
 
@@ -148,9 +150,11 @@ Add to your global `~/.config/opencode/opencode.json` (works everywhere) or a pr
 
 ```json
 {
-  "plugin": ["opencode-llm-proxy"]
+  "plugins": ["opencode-llm-proxy"]
 }
 ```
+
+On OpenCode V1, use `"plugin"` instead of `"plugins"`.
 
 ### Copy the file
 
@@ -169,7 +173,7 @@ curl -o .opencode/plugins/llm-proxy.js \
   https://raw.githubusercontent.com/KochC/opencode-llm-proxy/main/dist/llm-proxy.js
 ```
 
-> The bundled file contains all proxy runtime modules. [Tool calling](#tool-calling) also needs `mcp-tool-bridge.js` alongside it, so use the npm install method for tool-using clients.
+> The bundled file contains all proxy runtime modules. On OpenCode V1, [tool calling](#tool-calling) also needs `mcp-tool-bridge.js` alongside it, so use the npm install method for tool-using clients there. On OpenCode V2 the bundled file supports tool calling on its own.
 
 ---
 
@@ -185,6 +189,7 @@ curl -o .opencode/plugins/llm-proxy.js \
 | `OPENCODE_LLM_PROXY_CORS_ORIGIN` | _(unset)_ | Legacy single origin appended to the CORS allowlist. |
 | `OPENCODE_LLM_PROXY_ALLOW_PRIVATE_NETWORK` | `false` | Set to `true` to allow browser Private Network Access preflights. |
 | `OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS` | `120000` | Total request timeout, from 1 to 3,600,000 ms. |
+| `OPENCODE_LLM_PROXY_IDLE_TIMEOUT_SECONDS` | request timeout + 5 s | Seconds a connection may stay silent before the server closes it, from 0 (disabled) to 255. Defaults to the request timeout plus 5 s, or 0 when that exceeds 255 s. |
 | `OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES` | `1048576` | Maximum JSON request body and embedded data-URL size, up to 100 MiB. |
 | `OPENCODE_LLM_PROXY_MAX_CONCURRENT_REQUESTS` | `8` | Maximum active POST requests. |
 | `OPENCODE_LLM_PROXY_MAX_QUEUED_REQUESTS` | `32` | Maximum POST requests waiting for capacity; excess requests receive `503`. |
@@ -204,7 +209,7 @@ curl -o .opencode/plugins/llm-proxy.js \
 
 Use `x-opencode-variant` to select an OpenCode model variant for a request. The proxy accepts multimodal image, document, and file inputs in each API's native content shape, using embedded data URLs and validating model capabilities. Remote URLs are rejected unless the SSRF-safe remote-media fetcher is explicitly enabled; fetched content is converted to a data URL before it reaches OpenCode. Structured JSON output is supported through OpenAI `response_format.json_schema`, Responses API `text.format.schema`, and Gemini `generationConfig.responseSchema`.
 
-Generation `temperature`, top-p (`top_p`/`topP`), and top-k (`topK`) values are validated and applied through the plugin's `chat.params` hook. Maximum-token fields (`max_tokens`, `max_completion_tokens`, `max_output_tokens`, and Gemini `maxOutputTokens`) are accepted where clients require them, but the current OpenCode SDK cannot enforce them. OpenAI and Anthropic requests reject unsupported controls (`stop`, `seed`, `frequency_penalty`, `presence_penalty`, `logprobs`, and `n`) with `400` instead of silently ignoring them.
+Generation `temperature`, top-p (`top_p`/`topP`), top-k (`topK`), and maximum output tokens (`max_tokens`, `max_completion_tokens`, `max_output_tokens`, and Gemini `maxOutputTokens`) are validated and applied to the underlying model call. A requested token limit can lower OpenCode's output limit but never raise it above the model's maximum; responses that hit it finish with `length` (`max_tokens` for Anthropic, `MAX_TOKENS` for Gemini). Enforcing token limits requires OpenCode 1.4 or later; older versions ignore them. OpenAI and Anthropic requests reject unsupported controls (`stop`, `seed`, `frequency_penalty`, `presence_penalty`, `logprobs`, and `n`) with `400` instead of silently ignoring them.
 
 ### Session lifecycle (safe teardown)
 
@@ -291,6 +296,14 @@ When the model decides to call several tools at once, you get **all of them back
 
 OpenCode's own agent loop always executes tools itself, server-side, so there's no native concept of a "client-executed" tool call to hand off to. To bridge that gap, when a request includes `tools`:
 
+**OpenCode V2**
+
+1. The proxy registers your declared tool schemas as plugin tools for the duration of that one turn (under a short per-turn prefix such as `px0_`, so they never collide with OpenCode's own tools). Their executors run nothing.
+2. A session hook gives the proxy's session exactly those tools — no built-in OpenCode tool — and keeps them out of every other session.
+3. The proxy watches OpenCode's event stream, captures every tool call the model proposes in that turn with its arguments, and interrupts the session as soon as the model finishes the step, before OpenCode starts a follow-up step. The captured calls are translated into your API's tool-call shape.
+
+**OpenCode V1**
+
 1. The proxy dynamically registers a small local [MCP](https://opencode.ai/docs/mcp-servers/) server whose tool list is exactly your declared tool schemas (see `mcp-tool-bridge.js`).
 2. Only those tools are enabled for that one prompt call — every built-in OpenCode tool stays disabled, same as always.
 3. The proxy watches OpenCode's live event stream and captures every tool call the model proposes in that turn — with its fully-populated arguments — then aborts the session the moment the tool-calling step finishes, before OpenCode acts on the bridge's no-op results. The captured calls are translated into your API's tool-call shape — `tool_calls` (OpenAI), `tool_use` (Anthropic), or `functionCall` parts (Gemini) — instead of a text answer.
@@ -299,9 +312,11 @@ OpenCode's own agent loop always executes tools itself, server-side, so there's 
 
 - Parallel tool calls in a single turn are fully supported across all four API formats (streaming and non-streaming).
 - `tool_choice: "none"` (OpenAI/Gemini `mode: "NONE"`/Anthropic `type: "none"`) disables tool calling for that request; forcing a specific named tool is supported.
-- Bridge servers are reused from a small fixed-size pool (`px_tools_0`, `px_tools_1`, ...) rather than registered fresh per request, since OpenCode's server API has no endpoint to deregister an MCP server once added. Configure the pool size with `OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE` (default `8`) if you expect more than 8 concurrent in-flight tool-calling requests.
-- At most `OPENCODE_LLM_PROXY_TOOL_BRIDGE_MAX_QUEUE` requests wait for a bridge slot. A request arriving when that queue is full receives `429`; a queued request that exceeds the bridge acquisition timeout receives `503`.
-- The bridge process is spawned with `node`, so `node` must be on `PATH` wherever OpenCode is running.
+- Structured tool payloads are preserved verbatim across formats: tool schemas (including nesting and `additionalProperties`), tool-call arguments, and tool results keep their structure and key order. Tool results that aren't plain text (JSON objects, unrecognised content blocks) are forwarded to the model as JSON rather than dropped. Gemini OpenAPI-style schemas (`type: "OBJECT"`) are converted to JSON Schema, and `parametersJsonSchema` is used as-is when present.
+- The remaining notes apply to OpenCode V1 only, which uses the MCP bridge:
+  - Bridge servers are reused from a small fixed-size pool (`px_tools_0`, `px_tools_1`, ...) rather than registered fresh per request, since OpenCode's server API has no endpoint to deregister an MCP server once added. Configure the pool size with `OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE` (default `8`) if you expect more than 8 concurrent in-flight tool-calling requests.
+  - At most `OPENCODE_LLM_PROXY_TOOL_BRIDGE_MAX_QUEUE` requests wait for a bridge slot. A request arriving when that queue is full receives `429`; a queued request that exceeds the bridge acquisition timeout receives `503`.
+  - The bridge process is spawned with `node`, so `node` must be on `PATH` wherever OpenCode is running.
 
 ---
 
@@ -509,18 +524,18 @@ When `OPENCODE_LLM_PROXY_METRICS_ENABLED=true`, returns Prometheus text expositi
 Metrics cover HTTP request counts and duration by bounded method/route/status labels, active and queued requests, upstream attempt outcomes, input/output token totals, and remote-media request outcomes, bytes, redirects, in-flight fetches, and duration. Streaming HTTP duration is recorded when the stream finishes, errors, or is cancelled.
 
 ### POST /v1/chat/completions
-OpenAI Chat Completions. Required: `model`, `messages`. Supported optional fields include `stream`, `temperature`, `top_p`, `topK`, `max_tokens`, `max_completion_tokens`, `tools`, `tool_choice`, `response_format.json_schema`, and compatible multimodal content parts. Maximum-token fields are accepted for client compatibility but are not enforceable.
+OpenAI Chat Completions. Required: `model`, `messages`. Supported optional fields include `stream`, `temperature`, `top_p`, `topK`, `max_tokens`, `max_completion_tokens`, `tools`, `tool_choice`, `response_format.json_schema`, and compatible multimodal content parts.
 
 ### POST /v1/responses
-OpenAI Responses API. Required: `model`, `input`. Supported optional fields include `instructions`, `stream`, `temperature`, `top_p`, `topK`, `max_output_tokens`, `tools`, `tool_choice`, `text.format.schema`, and compatible multimodal input items. `max_output_tokens` is accepted for client compatibility but is not enforceable.
+OpenAI Responses API. Required: `model`, `input`. Supported optional fields include `instructions`, `stream`, `temperature`, `top_p`, `topK`, `max_output_tokens`, `tools`, `tool_choice`, `text.format.schema`, and compatible multimodal input items.
 
 ### POST /v1/messages
-Anthropic Messages API. Required: `model`, `messages`. Supported optional fields include `system` (string or an array of `{type: "text", text: string}` blocks), `max_tokens`, `stream`, `temperature`, `top_p`, `topK`, `tools`, `tool_choice`, and native image/document blocks. `max_tokens` is accepted for required Anthropic client compatibility but is not enforceable.
+Anthropic Messages API. Required: `model`, `messages`. Supported optional fields include `system` (string or an array of `{type: "text", text: string}` blocks), `max_tokens`, `stream`, `temperature`, `top_p`, `topK`, `tools`, `tool_choice`, and native image/document blocks.
 
 Errors are returned in Anthropic format: `{ "type": "error", "error": { "type": "...", "message": "..." } }`.
 
 ### POST /v1beta/models/:model:generateContent
-Google Gemini non-streaming. Model name in URL path. Required: `contents`. Supported optional fields include `systemInstruction`, `generationConfig` (`temperature`, `topP`, `topK`, `maxOutputTokens`, and `responseSchema`), `tools`, `toolConfig`, and native inline/file media parts. `maxOutputTokens` is accepted but is not enforceable.
+Google Gemini non-streaming. Model name in URL path. Required: `contents`. Supported optional fields include `systemInstruction`, `generationConfig` (`temperature`, `topP`, `topK`, `maxOutputTokens`, and `responseSchema`), `tools`, `toolConfig`, and native inline/file media parts.
 
 ### POST /v1beta/models/:model:streamGenerateContent
 Same as above, returning a newline-delimited JSON stream. A tool-using turn may emit intermediate text chunks followed by a final chunk containing one or more `functionCall` parts.
@@ -537,16 +552,21 @@ Each request:
 4. Renders complex history as deterministic JSON Lines because OpenCode accepts one user prompt, keeping each original message as a structured JSON object rather than flattening or relabeling it; a lone user text remains plain text
 5. Associates every attached file with its exact position in that JSON Lines history through a zero-based `fileIndex`, including media nested in tool results
 6. Creates a temporary OpenCode session and deletes it after use unless `OPENCODE_LLM_PROXY_KEEP_SESSIONS=true`
-7. Sends the single rendered prompt via `client.session.prompt` / `client.session.promptAsync`
+7. Sends the single rendered prompt to that session (V2: `ctx.session.prompt`; V1: `client.session.prompt` / `client.session.promptAsync`)
 8. Returns the response in the same format as the request
 
-Streaming uses OpenCode's `client.event.subscribe()` SSE stream. Text deltas are forwarded in real time, and the upstream async iterator is explicitly closed on completion, error, cancellation, or early tool-call termination.
+Streaming uses OpenCode's event stream (V2: `ctx.event.subscribe()`; V1: `client.event.subscribe()`). Text deltas are forwarded in real time, and the upstream async iterator is explicitly closed on completion, error, cancellation, or early tool-call termination. If the event stream stops delivering, the turn still completes from the session's stored messages, and any text the stream missed is sent to streaming clients.
+
+On OpenCode V2 the proxy session receives only your request: your system prompt replaces OpenCode's coding-agent prompt and instructions, and the session gets no OpenCode tools.
 
 ---
 
 ## Compatibility
 
-The plugin ships a V1 plugin descriptor (`export default { id, server }`). OpenCode detects it (present in every release checked back to 1.15) and loads the plugin cleanly. On older builds the legacy loader probes every exported function, so you may see a harmless `failed to load plugin ... is not a function` line per worker in the startup log — the proxy still starts and serves normally.
+The package supports OpenCode V2 and V1 from one default export, `{ id, setup, server }`: V2 calls `setup` (see the [V2 plugin guide](https://opencode.ai/v2/docs/build/plugins)), V1 calls `server`.
+
+- **V2:** load it through `"plugins"` in `opencode.json` (or the bundled file under `.opencode/plugins/`). OpenCode V2 runs one plugin instance per project location in a single process; they share one proxy server, which keeps running until the last instance unloads.
+- **V1:** load it through `"plugin"`. OpenCode V1 detects the descriptor (present in every release checked back to 1.15) and loads the plugin cleanly. On older builds the legacy loader probes every exported function, so you may see a harmless `failed to load plugin ... is not a function` line per worker in the startup log — the proxy still starts and serves normally.
 
 ---
 
@@ -555,7 +575,8 @@ The plugin ships a V1 plugin descriptor (`export default { id, server }`). OpenC
 - Media support depends on the selected model's advertised image, audio, video, and PDF/file capabilities
 - Remote media fetching is disabled by default and should remain disabled unless URL inputs are required; see [Security](docs/security.md)
 - No cross-request session state — send full conversation history on every request
-- `temperature`, top-p (`top_p`/`topP`), and top-k (`topK`) are applied through OpenCode's plugin hook. Maximum-token controls are accepted for client compatibility but cannot be enforced by the current OpenCode SDK.
+- `temperature`, top-p (`top_p`/`topP`), top-k (`topK`), and maximum-token controls are applied through OpenCode's plugin hook. Token limits need OpenCode 1.4+ and are capped at the model's output limit.
+- On OpenCode V2, structured output (`response_format` / `text.format` / `responseSchema`) is requested through an instruction with the JSON Schema, and the reply is parsed as JSON; V2 has no native structured-output setting for sessions.
 - Tool calling supports parallel calls in a single turn — see [Tool calling](#tool-calling) above
 
 ---

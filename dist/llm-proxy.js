@@ -56,6 +56,16 @@ function openAIContent(content) {
     return text2 ? [text2] : media ? [media] : [];
   });
 }
+function openAIToolResultContent(content) {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (content === void 0 || content === null) return [];
+  if (!Array.isArray(content)) return [jsonValue(content)];
+  return content.flatMap((part) => {
+    if (part === void 0 || part === null) return [];
+    if (typeof part === "string") return [{ type: "text", text: part }];
+    return [textPart(part.text ?? part.input_text ?? part.output_text) ?? openAIMediaPart(part) ?? jsonValue(part)];
+  });
+}
 function mediaFromAnthropic(block) {
   if (!block || !["image", "document"].includes(block.type)) return null;
   const source = block.source;
@@ -81,9 +91,9 @@ function anthropicResultContent(content) {
   if (typeof content === "string") return [{ type: "text", text: content }];
   if (!Array.isArray(content)) return content === void 0 ? [] : [jsonValue(content)];
   return content.flatMap((block) => {
-    const text2 = block?.type === "text" ? textPart(block.text) : null;
-    const media = mediaFromAnthropic(block);
-    return text2 ? [text2] : media ? [media] : [];
+    if (block === void 0 || block === null) return [];
+    const text2 = block.type === "text" ? textPart(block.text) : null;
+    return [text2 ?? mediaFromAnthropic(block) ?? jsonValue(block)];
   });
 }
 function geminiMediaPart(part) {
@@ -132,7 +142,7 @@ function adaptOpenAIChat(input) {
           type: "tool_result",
           ...message.tool_call_id ? { id: message.tool_call_id } : {},
           ...message.name ? { name: message.name } : {},
-          content
+          content: openAIToolResultContent(message.content)
         }]
       }];
     }
@@ -157,11 +167,10 @@ function adaptOpenAIResponses(input) {
         arguments: argumentsValue(item.arguments ?? "")
       }] });
     } else if (item.type === "function_call_output") {
-      const output = typeof item.output === "string" ? [{ type: "text", text: item.output }] : [jsonValue(item.output)];
       messages.push({ role: "tool", content: [{
         type: "tool_result",
         ...item.call_id ? { id: item.call_id } : {},
-        content: output
+        content: openAIToolResultContent(item.output)
       }] });
     } else {
       messages.push({ role: item.role ?? (item.type === "message" ? "user" : item.type ?? "user"), content: openAIContent(item.content ?? item.input) });
@@ -1027,6 +1036,390 @@ async function prepareMedia(media, config = {}, signal, metrics) {
   }
 }
 
+// opencode-v2.js
+var TOOL_PREFIX = "px";
+var MAX_TOOL_NAME = 64;
+var MEDIA_KINDS = ["text", "image", "audio", "video", "pdf"];
+var TOOL_PLACEHOLDER_TIMEOUT_MS = 6e4;
+var SUBSCRIBE_READY_TIMEOUT_MS = 2e3;
+var USAGE_GRACE_MS = 3e3;
+var TRANSCRIPT_POLL_MS = 250;
+var NEVER = new Promise(() => {
+});
+var EMPTY_TOKENS = Object.freeze({ input: 0, output: 0, reasoning: 0, cache: Object.freeze({ read: 0, write: 0 }) });
+function delay(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    timer.unref?.();
+  });
+}
+function cancelled(signal) {
+  const error = signal?.reason;
+  if (error instanceof Error) return error;
+  const fallback = new Error("Request was cancelled.");
+  fallback.status = 499;
+  fallback.code = "cancelled";
+  return fallback;
+}
+function toolName(prefix, name, seen) {
+  let base = String(name ?? "").replace(/[^a-zA-Z0-9_]/g, "_") || "tool";
+  base = base.slice(0, MAX_TOOL_NAME - prefix.length - 4);
+  let candidate = `${prefix}${base}`;
+  let suffix = 2;
+  while (seen.has(candidate)) candidate = `${prefix}${base}_${suffix++}`;
+  seen.add(candidate);
+  return candidate;
+}
+function capMaxTokens(requested, ...limits) {
+  return Math.min(requested, ...limits.filter((limit) => typeof limit === "number" && limit > 0));
+}
+function normalizeV2Model(model) {
+  const input = Array.isArray(model.capabilities?.input) ? model.capabilities.input : [];
+  const capabilities = {
+    ...model.capabilities,
+    input: Object.fromEntries([.../* @__PURE__ */ new Set([...MEDIA_KINDS, ...input])].map((kind) => [kind, input.includes(kind)]))
+  };
+  return {
+    id: `${model.providerID}/${model.modelID}`,
+    providerID: model.providerID,
+    modelID: model.modelID,
+    name: model.name ?? model.modelID,
+    capabilities,
+    limit: model.limit,
+    cost: model.cost,
+    status: model.status,
+    variants: Object.fromEntries((model.variants ?? []).map((variant) => [variant.id, variant.settings ?? {}]))
+  };
+}
+function addTokens(total, tokens) {
+  if (!tokens) return total;
+  return {
+    input: total.input + (tokens.input ?? 0),
+    output: total.output + (tokens.output ?? 0),
+    reasoning: total.reasoning + (tokens.reasoning ?? 0),
+    cache: {
+      read: total.cache.read + (tokens.cache?.read ?? 0),
+      write: total.cache.write + (tokens.cache?.write ?? 0)
+    }
+  };
+}
+function mapFinish(finish) {
+  if (finish === "tool-calls") return "tool_calls";
+  return finish;
+}
+function structuredInstruction(format) {
+  return [
+    "Respond with only a JSON value that conforms to the following JSON Schema.",
+    "Do not wrap it in Markdown code fences and do not add any commentary.",
+    JSON.stringify(format.schema)
+  ].join("\n");
+}
+function parseStructured(text2) {
+  const trimmed = String(text2 ?? "").trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+  try {
+    return JSON.parse(fenced ? fenced[1] : trimmed);
+  } catch {
+    return void 0;
+  }
+}
+function assistantText(messages) {
+  return assistantRawText(messages).trim();
+}
+function assistantRawText(messages) {
+  const assistant = (messages ?? []).filter((message) => message.type === "assistant").at(-1);
+  return (assistant?.content ?? []).filter((part) => part.type === "text" && typeof part.text === "string").map((part) => part.text).join("");
+}
+function transcriptTokens(messages) {
+  return (messages ?? []).filter((message) => message.type === "assistant").reduce((total, message) => addTokens(total, message.tokens), EMPTY_TOKENS);
+}
+function toolInput(input) {
+  if (input && typeof input === "object" && !Array.isArray(input)) return input;
+  if (typeof input === "string") {
+    try {
+      const parsed = JSON.parse(input);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {
+    }
+  }
+  return {};
+}
+function transcriptOutcome(messages) {
+  const idle = (messages ?? []).findLast((message) => message.type === "idle");
+  if (!idle) return null;
+  const last = messages.filter((message) => message.type === "assistant").at(-1);
+  return {
+    kind: "done",
+    text: assistantRawText(messages),
+    finish: last?.finish,
+    tokens: transcriptTokens(messages),
+    error: idle.outcome === "failed" ? idle.error?.message ?? last?.error?.message ?? "Model call failed." : null
+  };
+}
+function transcriptToolCalls(messages, bridge) {
+  for (const message of messages ?? []) {
+    if (message.type !== "assistant") continue;
+    const parts = (message.content ?? []).filter((part) => part.type === "tool" && bridge.toolNames.has(part.name));
+    if (parts.length === 0) continue;
+    if (!message.time?.streamed) return null;
+    return {
+      kind: "tools",
+      calls: parts.map((part) => ({ id: part.id, name: bridge.nameMap.get(part.name), arguments: toolInput(part.state?.input) }))
+    };
+  }
+  return null;
+}
+function waitForAbort(signal, timeoutMs) {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve({ content: "The tool call was forwarded to the API caller." });
+    };
+    const timer = setTimeout(done, timeoutMs);
+    timer.unref?.();
+    if (signal?.aborted) return done();
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+function createV2Backend(ctx, options = {}) {
+  const turns = /* @__PURE__ */ new Map();
+  let nextTurn = 0;
+  const placeholderTimeoutMs = options.toolPlaceholderTimeoutMs ?? TOOL_PLACEHOLDER_TIMEOUT_MS;
+  const proxyToolPattern = new RegExp(`^${TOOL_PREFIX}\\d+_`);
+  async function install() {
+    await ctx.session.hook("context", (event) => {
+      const turn = turns.get(event.sessionID);
+      if (!turn) {
+        for (const name of Object.keys(event.tools)) {
+          if (proxyToolPattern.test(name)) delete event.tools[name];
+        }
+        return;
+      }
+      event.system = turn.system ? [{ type: "text", text: turn.system }] : [];
+      event.tools = Object.fromEntries(Object.entries(event.tools).filter(([name]) => turn.toolNames.has(name)));
+      const controls = turn.controls ?? {};
+      if (controls.temperature !== void 0) event.options.temperature = controls.temperature;
+      if (controls.topP !== void 0) event.options.topP = controls.topP;
+      if (controls.topK !== void 0) event.options.topK = controls.topK;
+      if (controls.maxTokens !== void 0) {
+        event.options.maxTokens = capMaxTokens(controls.maxTokens, event.options.maxTokens, turn.outputLimit);
+      }
+    });
+  }
+  async function listModels2() {
+    const result = await ctx.model.list();
+    const models = Array.isArray(result?.data) ? result.data : Array.isArray(result) ? result : [];
+    return models.filter((model) => model.enabled !== false).map(normalizeV2Model);
+  }
+  async function registerTools(tools) {
+    const prefix = `${TOOL_PREFIX}${nextTurn++}_`;
+    const seen = /* @__PURE__ */ new Set();
+    const nameMap = /* @__PURE__ */ new Map();
+    const definitions = tools.map((tool) => {
+      const name = toolName(prefix, tool.name, seen);
+      nameMap.set(name, tool.name);
+      return {
+        name,
+        description: tool.description || tool.name,
+        input: tool.parameters,
+        // Direct tools only: Code Mode tools are reachable solely through OpenCode's `execute` tool.
+        options: { codemode: false },
+        execute: (_input, context) => {
+          turns.get(context?.sessionID)?.onToolCall?.();
+          return waitForAbort(context?.signal, placeholderTimeoutMs);
+        }
+      };
+    });
+    const registration = await ctx.tool.transform((editor) => {
+      for (const definition of definitions) editor.add(definition);
+    });
+    return { registration, nameMap, toolNames: new Set(nameMap.keys()) };
+  }
+  function watchTranscript(sessionID, bridge, toolCalled, stop) {
+    const read = () => ctx.session.context({ sessionID }, { signal: stop });
+    const untilDone = async () => {
+      while (!stop.aborted) {
+        await ctx.session.wait({ sessionID }, { signal: stop });
+        const outcome = transcriptOutcome(await read());
+        if (outcome) return outcome;
+        await delay(TRANSCRIPT_POLL_MS);
+      }
+    };
+    const untilToolCalls = async () => {
+      await toolCalled;
+      while (!stop.aborted) {
+        const found = transcriptToolCalls(await read(), bridge);
+        if (found) return found;
+        await delay(TRANSCRIPT_POLL_MS);
+      }
+    };
+    const settle = (promise) => promise.then((result) => result ?? NEVER, () => NEVER);
+    return Promise.race([settle(untilDone()), ...bridge ? [settle(untilToolCalls())] : []]);
+  }
+  async function runTurn(input) {
+    const { model, system, text: text2, media = [], tools = [], format, variant, controls, onChunk, signal, keepSessions } = input;
+    if (signal?.aborted) throw cancelled(signal);
+    const bridge = tools.length > 0 ? await registerTools(tools) : null;
+    const subscription = new AbortController();
+    const abortSubscription = () => subscription.abort();
+    signal?.addEventListener("abort", abortSubscription, { once: true });
+    let onToolCall;
+    const toolCalled = new Promise((resolve) => {
+      onToolCall = resolve;
+    });
+    let sessionID;
+    let content = "";
+    let tokens = EMPTY_TOKENS;
+    let finish;
+    let errorMessage = null;
+    let toolMessageID = null;
+    const calls = /* @__PURE__ */ new Map();
+    const interrupt = () => ctx.session.interrupt({ sessionID }).catch(() => {
+    });
+    const applyTranscript = async (result) => {
+      if (result.kind === "tools") {
+        for (const call of result.calls) {
+          const seen = calls.get(call.id);
+          calls.set(call.id, seen && Object.keys(seen.arguments).length > 0 ? seen : call);
+        }
+        finish = "tool-calls";
+        await interrupt();
+        await Promise.race([ctx.session.wait({ sessionID }).catch(() => {
+        }), delay(USAGE_GRACE_MS)]);
+        try {
+          tokens = transcriptTokens(await ctx.session.context({ sessionID }));
+        } catch {
+        }
+        return;
+      }
+      if (result.text.length > content.length && result.text.startsWith(content)) {
+        const rest = result.text.slice(content.length);
+        content = result.text;
+        await onChunk?.(rest);
+      }
+      finish = result.finish;
+      tokens = result.tokens;
+      errorMessage = result.error ?? errorMessage;
+    };
+    try {
+      const session = await ctx.session.create({
+        title: `Proxy: ${model.id}`,
+        model: { providerID: model.providerID, id: model.modelID, ...variant ? { variant } : {} }
+      });
+      sessionID = session.id;
+      turns.set(sessionID, {
+        system: [system, format ? structuredInstruction(format) : ""].filter(Boolean).join("\n\n"),
+        toolNames: bridge?.toolNames ?? /* @__PURE__ */ new Set(),
+        controls,
+        outputLimit: model.limit?.output,
+        onToolCall
+      });
+      signal?.addEventListener("abort", interrupt, { once: true });
+      const events = ctx.event.subscribe({ signal: subscription.signal })[Symbol.asyncIterator]();
+      let pending = events.next();
+      const first = await Promise.race([pending, delay(SUBSCRIBE_READY_TIMEOUT_MS)]);
+      if (first && !first.done && first.value?.type === "server.connected") pending = null;
+      await ctx.session.prompt({
+        sessionID,
+        text: text2,
+        ...media.length > 0 ? { files: media.map((part) => ({ uri: part.url, ...part.filename ? { name: part.filename } : {} })) } : {}
+      });
+      const fallback = watchTranscript(sessionID, bridge, toolCalled, subscription.signal).then((result) => ({ fallback: result }));
+      let captured = false;
+      while (true) {
+        pending ??= events.next();
+        const raced = await Promise.race([
+          pending.then((next2) => ({ next: next2 })),
+          captured ? delay(USAGE_GRACE_MS).then(() => ({ next: null })) : fallback
+        ]);
+        if (raced.fallback) {
+          await applyTranscript(raced.fallback);
+          break;
+        }
+        pending = null;
+        const next = raced.next;
+        if (!next || next.done) break;
+        const event = next.value;
+        const data = event?.data;
+        if (data?.sessionID !== sessionID) continue;
+        if (event.type === "session.text.delta") {
+          if (typeof data.delta === "string" && data.delta.length > 0) {
+            content += data.delta;
+            await onChunk?.(data.delta);
+          }
+        } else if (event.type === "session.tool.input.started") {
+          if (bridge?.toolNames.has(data.name) && (!toolMessageID || data.assistantMessageID === toolMessageID)) {
+            toolMessageID = data.assistantMessageID;
+            calls.set(data.id, { id: data.id, name: bridge.nameMap.get(data.name), arguments: {} });
+          }
+        } else if (event.type === "session.tool.called") {
+          const call = calls.get(data.id);
+          if (call && data.input && typeof data.input === "object") call.arguments = data.input;
+        } else if (event.type === "session.step.streamed") {
+          if (!captured && calls.size > 0 && data.assistantMessageID === toolMessageID) {
+            captured = true;
+            void interrupt();
+          }
+        } else if (event.type === "session.step.ended") {
+          tokens = addTokens(tokens, data.tokens);
+          finish = data.finish;
+          if (calls.size > 0 && data.assistantMessageID === toolMessageID) {
+            if (!captured) await interrupt();
+            break;
+          }
+        } else if (event.type === "session.step.failed") {
+          tokens = addTokens(tokens, data.tokens);
+          errorMessage = data.error?.message ?? "Model call failed.";
+        } else if (event.type === "session.execution.failed") {
+          errorMessage = data.error?.message ?? errorMessage ?? "Model call failed.";
+          break;
+        } else if (event.type === "session.execution.succeeded" || event.type === "session.execution.interrupted" || event.type === "session.idle") {
+          break;
+        }
+      }
+      if (signal?.aborted) throw cancelled(signal);
+      const toolCalls = [...calls.values()];
+      if (errorMessage && toolCalls.length === 0) throw new Error(errorMessage);
+      if (!content && toolCalls.length === 0) {
+        try {
+          content = assistantText(await ctx.session.context({ sessionID }));
+        } catch {
+        }
+      }
+      const structured = format && toolCalls.length === 0 ? parseStructured(content) : void 0;
+      return {
+        sessionID,
+        content: structured === void 0 ? content : JSON.stringify(structured),
+        structured,
+        toolCalls,
+        tokens,
+        finish: toolCalls.length > 0 ? "tool_calls" : mapFinish(finish)
+      };
+    } catch (error) {
+      if (signal?.aborted) throw cancelled(signal);
+      throw error;
+    } finally {
+      signal?.removeEventListener("abort", abortSubscription);
+      signal?.removeEventListener("abort", interrupt);
+      subscription.abort();
+      if (sessionID) turns.delete(sessionID);
+      if (bridge) await bridge.registration.dispose().catch(() => {
+      });
+      if (sessionID && !keepSessions) await ctx.session.remove({ sessionID }).catch(() => {
+      });
+    }
+  }
+  function log(level, message, extra) {
+    const write = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
+    try {
+      write(`[opencode-llm-proxy] ${message}`, extra ?? "");
+    } catch {
+    }
+  }
+  return { v2: true, install, listModels: listModels2, runTurn, log };
+}
+
 // index.js
 var STATE_KEY = "__opencodeOpenAIProxyState";
 var BRIDGE_SCRIPT_PATH = fileURLToPath(new URL("./mcp-tool-bridge.js", import.meta.url));
@@ -1044,6 +1437,12 @@ var DEFAULTS = Object.freeze({
   bridgeAcquireTimeoutMs: 1e4,
   bridgeMaxQueue: 32
 });
+var BUN_MAX_IDLE_TIMEOUT_SECONDS = 255;
+function resolveIdleTimeoutSeconds(config) {
+  if (config.idleTimeoutSeconds !== void 0) return config.idleTimeoutSeconds;
+  const needed = Math.ceil(config.requestTimeoutMs / 1e3) + 5;
+  return needed > BUN_MAX_IDLE_TIMEOUT_SECONDS ? 0 : needed;
+}
 var ProxyError = class extends Error {
   constructor(message, status = 500, code = "server_error") {
     super(message);
@@ -1104,6 +1503,7 @@ function loadConfig() {
     corsOrigins: [...new Set(origins)],
     allowPrivateNetwork: process.env.OPENCODE_LLM_PROXY_ALLOW_PRIVATE_NETWORK === "true",
     requestTimeoutMs: integerEnv("OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS", DEFAULTS.requestTimeoutMs, { min: 1, max: 36e5 }),
+    idleTimeoutSeconds: process.env.OPENCODE_LLM_PROXY_IDLE_TIMEOUT_SECONDS?.trim() ? integerEnv("OPENCODE_LLM_PROXY_IDLE_TIMEOUT_SECONDS", 0, { min: 0, max: BUN_MAX_IDLE_TIMEOUT_SECONDS }) : void 0,
     maxRequestBytes,
     maxConcurrentRequests: integerEnv("OPENCODE_LLM_PROXY_MAX_CONCURRENT_REQUESTS", DEFAULTS.maxConcurrentRequests, { min: 1, max: 1e3 }),
     maxQueuedRequests: integerEnv("OPENCODE_LLM_PROXY_MAX_QUEUED_REQUESTS", DEFAULTS.maxQueuedRequests, { min: 0, max: 1e4 }),
@@ -1563,7 +1963,34 @@ function setGenerationControls(sessionID, controls) {
 function clearGenerationControls(sessionID) {
   getState().generationControls?.delete(sessionID);
 }
+function v2TurnInput(model, messages, system, callerTools, options, onChunk) {
+  const [prompt, ...media] = promptParts(messages, options.media, model, options.maxRequestBytes ?? DEFAULTS.maxRequestBytes);
+  return {
+    model,
+    system,
+    text: prompt.text,
+    media,
+    tools: Array.isArray(callerTools) ? callerTools : [],
+    format: options.format,
+    variant: options.variant,
+    controls: options.controls,
+    onChunk,
+    signal: options.signal,
+    keepSessions: options.keepSessions
+  };
+}
 async function executePrompt(client, _request, model, messages, system, callerTools = [], options = {}) {
+  if (client.v2) {
+    const result = await client.runTurn(v2TurnInput(model, messages, system, callerTools, options));
+    return {
+      content: result.content,
+      structured: result.structured,
+      toolCalls: result.toolCalls,
+      request: _request,
+      sessionID: result.sessionID,
+      completion: { data: { info: { finish: result.finish, tokens: result.tokens } } }
+    };
+  }
   if (Array.isArray(callerTools) && callerTools.length > 0) {
     const result = await runAgentTurn(client, model, messages, system, callerTools, () => {
     }, options);
@@ -1610,6 +2037,7 @@ async function executePrompt(client, _request, model, messages, system, callerTo
   }
 }
 async function executePromptStreaming(client, model, messages, system, onChunk, callerTools = [], options = {}) {
+  if (client.v2) return client.runTurn(v2TurnInput(model, messages, system, callerTools, options, onChunk));
   const result = await runAgentTurn(client, model, messages, system, callerTools, onChunk, options);
   return {
     sessionID: result.sessionID,
@@ -1723,6 +2151,7 @@ function mapFinishReason(finish) {
   return "stop";
 }
 async function safeLog(client, level, message, extra) {
+  if (client.v2) return client.log(level, message, extra);
   try {
     await client.app.log({
       body: {
@@ -1895,6 +2324,38 @@ function applyAnthropicToolChoice(tools, toolChoice) {
   }
   return tools;
 }
+var GEMINI_SCHEMA_CHILD_MAPS = ["properties", "patternProperties", "$defs", "definitions"];
+var GEMINI_SCHEMA_CHILD_LISTS = ["anyOf", "oneOf", "allOf", "prefixItems"];
+function geminiSchemaToJsonSchema(schema) {
+  if (Array.isArray(schema)) return schema.map(geminiSchemaToJsonSchema);
+  if (!isPlainObject(schema)) return schema;
+  const out = { ...schema };
+  if (typeof out.type === "string") {
+    if (out.type.toUpperCase() === "TYPE_UNSPECIFIED") delete out.type;
+    else out.type = out.type.toLowerCase();
+  } else if (Array.isArray(out.type)) {
+    out.type = out.type.map((type) => typeof type === "string" ? type.toLowerCase() : type);
+  }
+  for (const key of GEMINI_SCHEMA_CHILD_MAPS) {
+    if (isPlainObject(out[key])) {
+      out[key] = Object.fromEntries(
+        Object.entries(out[key]).map(([name, child]) => [name, geminiSchemaToJsonSchema(child)])
+      );
+    }
+  }
+  for (const key of GEMINI_SCHEMA_CHILD_LISTS) {
+    if (Array.isArray(out[key])) out[key] = out[key].map(geminiSchemaToJsonSchema);
+  }
+  for (const key of ["items", "additionalProperties", "not"]) {
+    if (isPlainObject(out[key]) || Array.isArray(out[key])) out[key] = geminiSchemaToJsonSchema(out[key]);
+  }
+  return out;
+}
+function geminiDeclarationParameters(decl) {
+  const jsonSchema = decl.parametersJsonSchema ?? decl.parameters_json_schema;
+  if (isPlainObject(jsonSchema)) return jsonSchema;
+  return normalizeParameters(geminiSchemaToJsonSchema(decl.parameters));
+}
 function parseGeminiTools(body) {
   const list = [];
   if (Array.isArray(body?.tools)) {
@@ -1905,7 +2366,7 @@ function parseGeminiTools(body) {
           list.push({
             name: decl.name,
             description: typeof decl.description === "string" ? decl.description : "",
-            parameters: normalizeParameters(decl.parameters)
+            parameters: geminiDeclarationParameters(decl)
           });
         }
       }
@@ -1974,6 +2435,47 @@ function buildToolsMap(baseTools, bridge) {
   for (const id of bridge.toolIDs) toolsMap[id] = true;
   return toolsMap;
 }
+var POLL_INTERVAL_MS = 300;
+async function pollAgentTurn(client, sessionID, ctx) {
+  while (!ctx.state.finished) {
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    if (ctx.state.finished || ctx.signal?.aborted) return void 0;
+    let list;
+    try {
+      const result = await client.session.messages({ path: { id: sessionID }, signal: ctx.signal });
+      list = result.data ?? [];
+    } catch {
+      continue;
+    }
+    if (ctx.state.finished) return void 0;
+    const assistants = list.filter((entry) => entry.info?.role === "assistant");
+    if (assistants.length === 0) continue;
+    const failed = assistants.find((entry) => entry.info?.error);
+    if (failed) {
+      const error = failed.info.error;
+      ctx.onError(error?.data?.message ?? error?.message ?? "Model call failed.");
+      return "done";
+    }
+    if (ctx.toolIDSet) {
+      const toolEntry = assistants.find(
+        (entry) => (entry.parts ?? []).some((part) => part.type === "tool" && ctx.toolIDSet.has(part.tool))
+      );
+      if (toolEntry) {
+        for (const part of toolEntry.parts ?? []) {
+          if (part.type === "tool" && ctx.toolIDSet.has(part.tool)) ctx.recordToolPart(part);
+        }
+        const stepDone = (toolEntry.parts ?? []).some((part) => part.type === "step-finish") || toolEntry.info?.finish === "tool-calls" || Boolean(toolEntry.info?.time?.completed);
+        if (stepDone) return "tool";
+        continue;
+      }
+    }
+    const text2 = assistants.flatMap((entry) => entry.parts ?? []).filter((part) => part.type === "text" && typeof part.text === "string" && !part.synthetic).map((part) => part.text).join("");
+    if (text2) ctx.onText(text2);
+    const last = assistants.at(-1);
+    if (last.info?.time?.completed && last.info?.finish && last.info.finish !== "tool-calls") return "done";
+  }
+  return void 0;
+}
 async function runAgentTurn(client, model, messages, system, callerTools, onChunk, options = {}) {
   const baseTools = await getDisabledTools(client);
   let toolsMap = baseTools;
@@ -1995,6 +2497,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   let content = "";
   const toolCallsByID = /* @__PURE__ */ new Map();
   let toolMessageID = null;
+  let turnState = null;
   const recordToolPart = (part) => {
     const callID = part.callID;
     if (!callID) return;
@@ -2035,44 +2538,84 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         ...options.variant ? { variant: options.variant } : {}
       }
     });
-    for await (const event of stream) {
-      if (event.type === "message.part.delta") {
-        const props = event.properties;
-        if (props?.sessionID === sessionID && props?.field === "text" && typeof props.delta === "string" && props.delta.length > 0) {
-          content += props.delta;
-          await onChunk?.(props.delta);
-        }
-      } else if (event.type === "message.part.updated") {
-        const part = event.properties?.part;
-        if (!part || part.sessionID !== sessionID) continue;
-        if (toolIDSet && part.type === "tool" && toolIDSet.has(part.tool) && (!toolMessageID || part.messageID === toolMessageID)) {
-          if (part.messageID) toolMessageID = part.messageID;
-          recordToolPart(part);
-        } else if (part.type === "step-finish" && toolCallsByID.size > 0 && (!toolMessageID || part.messageID === toolMessageID)) {
-          try {
-            await client.session.abort({ path: { id: sessionID } });
-          } catch {
+    turnState = { finished: false };
+    const eventLoop = (async () => {
+      for await (const event of stream) {
+        if (turnState.finished) break;
+        if (event.type === "message.part.delta") {
+          const props = event.properties;
+          if (props?.sessionID === sessionID && props?.field === "text" && typeof props.delta === "string" && props.delta.length > 0) {
+            content += props.delta;
+            await onChunk?.(props.delta);
+          }
+        } else if (event.type === "message.part.updated") {
+          const part = event.properties?.part;
+          if (!part || part.sessionID !== sessionID) continue;
+          if (toolIDSet && part.type === "tool" && toolIDSet.has(part.tool) && (!toolMessageID || part.messageID === toolMessageID)) {
+            if (part.messageID) toolMessageID = part.messageID;
+            recordToolPart(part);
+          } else if (part.type === "step-finish" && toolCallsByID.size > 0 && (!toolMessageID || part.messageID === toolMessageID)) {
+            try {
+              await client.session.abort({ path: { id: sessionID } });
+            } catch {
+            }
+            break;
+          }
+        } else if (event.type === "session.error") {
+          if (event.properties?.sessionID === sessionID) {
+            errorMessage = event.properties?.error?.message ?? "Model call failed.";
           }
           break;
-        }
-      } else if (event.type === "session.error") {
-        if (event.properties?.sessionID === sessionID) {
-          errorMessage = event.properties?.error?.message ?? "Model call failed.";
-        }
-        break;
-      } else if (event.type === "session.idle") {
-        if (event.properties?.sessionID === sessionID) {
-          break;
+        } else if (event.type === "session.idle") {
+          if (event.properties?.sessionID === sessionID) {
+            break;
+          }
         }
       }
+    })();
+    const pollLoop = pollAgentTurn(client, sessionID, {
+      state: turnState,
+      signal: options.signal,
+      toolIDSet,
+      recordToolPart,
+      onError: (message) => {
+        errorMessage = message;
+      },
+      onText: (fullText) => {
+        if (fullText.length > content.length && fullText.startsWith(content)) {
+          const delta = fullText.slice(content.length);
+          content = fullText;
+          Promise.resolve(onChunk?.(delta)).catch(() => {
+          });
+        }
+      }
+    });
+    eventLoop.catch(() => {
+    });
+    const winner = await Promise.race([
+      eventLoop.then(() => "events"),
+      pollLoop.then((outcome) => outcome ?? "aborted")
+    ]);
+    turnState.finished = true;
+    if (winner === "tool") {
+      try {
+        await client.session.abort({ path: { id: sessionID } });
+      } catch {
+      }
     }
+    if (options.signal?.aborted) throw options.signal.reason ?? new Error("Request was cancelled.");
   } catch (error) {
     await deleteSession(client, sessionID, options.keepSessions);
     throw error;
   } finally {
+    if (turnState) turnState.finished = true;
     removeAbortListener();
     try {
-      await eventStream?.return?.();
+      const disposal = eventStream?.return?.();
+      if (disposal && typeof disposal.then === "function") {
+        await Promise.race([disposal.catch(() => {
+        }), new Promise((resolve) => setTimeout(resolve, 250))]);
+      }
     } catch {
     }
     clearGenerationControls(sessionID);
@@ -2112,6 +2655,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   return result;
 }
 async function listModels(client) {
+  if (client.v2) return client.listModels();
   const result = await client.config.providers();
   const payload = result.data;
   const all = Array.isArray(payload?.providers) ? payload.providers : [];
@@ -2438,6 +2982,16 @@ function generationControls(body) {
   if (topK !== void 0) {
     if (!Number.isInteger(topK) || topK < 1) throw new ProxyError("'topK' must be a positive integer.", 400, "invalid_parameter");
     controls.topK = topK;
+  }
+  const maxTokensField = ["max_completion_tokens", "max_output_tokens", "max_tokens", "maxOutputTokens"].find(
+    (name) => source[name] != null
+  );
+  if (maxTokensField) {
+    const maxTokens = source[maxTokensField];
+    if (!Number.isInteger(maxTokens) || maxTokens < 1) {
+      throw new ProxyError(`'${maxTokensField}' must be a positive integer.`, 400, "invalid_parameter");
+    }
+    controls.maxTokens = maxTokens;
   }
   return controls;
 }
@@ -3335,10 +3889,10 @@ data: ${JSON.stringify(data)}
     return response;
   };
 }
-var OpenAIProxyPlugin = async ({ client }) => {
+async function startProxyServer(client) {
   const state = getState();
   if (state.started) {
-    return {};
+    return null;
   }
   const hostname = process.env.OPENCODE_LLM_PROXY_HOST ?? "127.0.0.1";
   const port = Number.parseInt(process.env.OPENCODE_LLM_PROXY_PORT ?? "4010", 10);
@@ -3355,13 +3909,14 @@ var OpenAIProxyPlugin = async ({ client }) => {
     await safeLog(client, "warn", "OpenAI proxy configuration is invalid", {
       error: error instanceof Error ? error.message : String(error)
     });
-    return {};
+    return null;
   }
   let server;
   try {
     server = Bun.serve({
       hostname,
       port,
+      idleTimeout: resolveIdleTimeoutSeconds(config),
       fetch: createProxyFetchHandler(client)
     });
   } catch (error) {
@@ -3370,7 +3925,7 @@ var OpenAIProxyPlugin = async ({ client }) => {
       port,
       error: error instanceof Error ? error.message : String(error)
     });
-    return {};
+    return null;
   }
   state.started = true;
   state.server = server;
@@ -3379,6 +3934,13 @@ var OpenAIProxyPlugin = async ({ client }) => {
     port,
     protected: Boolean(process.env.OPENCODE_LLM_PROXY_TOKEN)
   });
+  return server;
+}
+var OpenAIProxyPlugin = async ({ client }) => {
+  const server = await startProxyServer(client);
+  if (!server) {
+    return {};
+  }
   return {
     "chat.params": async (input, output) => {
       const controls = getState().generationControls?.get(input.sessionID);
@@ -3386,11 +3948,43 @@ var OpenAIProxyPlugin = async ({ client }) => {
       if (controls.temperature !== void 0) output.temperature = controls.temperature;
       if (controls.topP !== void 0) output.topP = controls.topP;
       if (controls.topK !== void 0) output.topK = controls.topK;
+      if (controls.maxTokens !== void 0) {
+        output.maxOutputTokens = capMaxTokens(controls.maxTokens, output.maxOutputTokens, input.model?.limit?.output);
+      }
     }
   };
 };
-var index_default = { id: "opencode-llm-proxy", server: OpenAIProxyPlugin };
+async function setupV2(ctx) {
+  const state = getState();
+  const backend = createV2Backend(ctx);
+  await backend.install();
+  state.v2Backends ??= [];
+  state.v2Backends.push(backend);
+  if (!state.v2Client) {
+    const current = () => state.v2Backends[0];
+    state.v2Client = {
+      v2: true,
+      listModels: (...args) => current().listModels(...args),
+      runTurn: (...args) => current().runTurn(...args),
+      log: (...args) => current().log(...args)
+    };
+  }
+  const server = await startProxyServer(state.v2Client);
+  if (server) state.v2Server = server;
+  return async () => {
+    state.v2Backends = state.v2Backends.filter((entry) => entry !== backend);
+    if (state.v2Backends.length > 0 || !state.v2Server) return;
+    const owned = state.v2Server;
+    state.v2Server = void 0;
+    state.v2Client = void 0;
+    state.started = false;
+    state.server = void 0;
+    await owned.stop(true);
+  };
+}
+var index_default = { id: "opencode-llm-proxy", setup: setupV2, server: OpenAIProxyPlugin };
 export {
+  BUN_MAX_IDLE_TIMEOUT_SECONDS,
   OpenAIProxyPlugin,
   applyAnthropicToolChoice,
   applyGeminiToolChoice,
@@ -3403,6 +3997,7 @@ export {
   index_default as default,
   extractAssistantText,
   extractGeminiSystemInstruction,
+  geminiSchemaToJsonSchema,
   mapFinishReason,
   mapFinishReasonToAnthropic,
   mapFinishReasonToGemini,
@@ -3416,7 +4011,9 @@ export {
   parseOpenAITools,
   registerToolBridge,
   releaseToolBridge,
+  resolveIdleTimeoutSeconds,
   resolveModel,
   sanitizeToolName,
+  setupV2,
   toTextContent
 };
