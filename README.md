@@ -197,6 +197,7 @@ curl -o .opencode/plugins/llm-proxy.js \
 | `OPENCODE_LLM_PROXY_TOOL_BRIDGE_ACQUIRE_TIMEOUT_MS` | `10000` | Maximum wait for a tool-bridge slot, from 1 to 3,600,000 ms. |
 | `OPENCODE_LLM_PROXY_TOOL_BRIDGE_MAX_QUEUE` | `32` | Maximum tool-calling requests waiting for a bridge slot, from 0 to 10,000; excess requests receive `429`. |
 | `OPENCODE_LLM_PROXY_KEEP_SESSIONS` | `false` | Set to `true` to retain temporary OpenCode sessions; otherwise they are deleted after use. Kept sessions are still swept after 24h idle (see [Session lifecycle](#session-lifecycle-safe-teardown)). |
+| `OPENCODE_LLM_PROXY_DELETE_TIMEOUT_MS` | `5000` | Maximum wait for the post-request session delete, from 100 to 60,000 ms. A delete that exceeds it is abandoned and the stale-session sweep reaps the session later, so a hung delete can never block the response. |
 | `OPENCODE_LLM_PROXY_MODEL_ALIASES` | `{}` | JSON object mapping aliases to a model ID string or ordered array of fallback model IDs. |
 | `OPENCODE_LLM_PROXY_METRICS_ENABLED` | `false` | Set to `true` to expose the authenticated Prometheus endpoint at `GET /metrics`. |
 | `OPENCODE_LLM_PROXY_REMOTE_MEDIA_ENABLED` | `false` | Set to `true` to fetch remote media URLs and convert them to embedded data URLs. Leave disabled unless required. |

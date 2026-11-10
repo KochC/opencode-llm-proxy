@@ -1567,12 +1567,10 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
       }
     }
     if (options.signal?.aborted) throw options.signal.reason ?? new Error("Request was cancelled.")
-  } catch (error) {
+  } finally {
     // Safe teardown: no delete on abort/error — it races the server's final
     // persist of the aborted turn (FOREIGN KEY failures under bulk cancels).
     // The session leaks inert; sweepStaleProxySessions reaps it once long idle.
-    throw error
-  } finally {
     if (turnState) turnState.finished = true
     removeAbortListener()
     // Don't block on iterator disposal: when the turn was ended by the poller, the event
@@ -1602,14 +1600,10 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
 
   // Each list item is { info: Message, parts: Part[] } - matching the shape
   // client.session.prompt() (the non-tool-calling path) already returns directly.
-  let assistantEntry
-  try {
-    const messagesResult = await client.session.messages({ path: { id: sessionID }, signal: options.signal })
-    assistantEntry = (messagesResult.data ?? []).filter((m) => m.info?.role === "assistant").at(-1)
-  } catch (error) {
-    // Safe teardown: leak-on-error (was: delete then throw).
-    throw error
-  }
+  // Safe teardown: a failed fetch leaks the session (no delete) so the sweep
+  // reaps it once long idle, avoiding the FOREIGN KEY race on aborted turns.
+  const messagesResult = await client.session.messages({ path: { id: sessionID }, signal: options.signal })
+  const assistantEntry = (messagesResult.data ?? []).filter((m) => m.info?.role === "assistant").at(-1)
   const assistantInfo = assistantEntry?.info
 
   // Fallback for turns where message.part.delta never fired (observed for some

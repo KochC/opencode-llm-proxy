@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { Buffer } from "node:buffer"
 import http from "node:http"
 import test from "node:test"
 
@@ -46,7 +47,7 @@ function createMockClient({ promptMode = "hang", streamEvents = null } = {}) {
         pendingSubscription = path.id
         return { data: true }
       },
-      messages: async ({ path }) => ({
+      messages: async (_request) => ({
         data: [{
           info: { role: "assistant", tokens: TOKENS, finish: "stop" },
           parts: [{ type: "text", text: "streamed answer" }],

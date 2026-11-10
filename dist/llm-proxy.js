@@ -1947,12 +1947,65 @@ function validateUnsupportedControls(request) {
     throw new ProxyError(`Unsupported generation controls: ${unsupported.join(", ")}.`, 400, "unsupported_parameter");
   }
 }
-async function deleteSession(client, sessionID, keepSessions) {
+function deleteTimeoutMs() {
+  return integerEnv("OPENCODE_LLM_PROXY_DELETE_TIMEOUT_MS", 5e3, { min: 100, max: 6e4 });
+}
+async function deleteSession(client, sessionID, keepSessions, signal) {
   if (keepSessions || !sessionID || typeof client.session.delete !== "function") return;
+  const attempt = client.session.delete({ path: { id: sessionID }, signal });
   try {
-    await client.session.delete({ path: { id: sessionID } });
+    await Promise.race([
+      attempt,
+      new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error("session delete timed out")), deleteTimeoutMs());
+        timer.unref?.();
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(new Error("session delete aborted"));
+        }, { once: true });
+      })
+    ]);
   } catch {
   }
+}
+async function sweepStaleProxySessions(client, maxAgeMs = 24 * 60 * 60 * 1e3) {
+  if (typeof client.session.list !== "function") return;
+  let sessions;
+  try {
+    const result = await client.session.list();
+    sessions = result.data ?? [];
+  } catch (error) {
+    await safeLog(client, "warn", "OpenAI proxy stale-session sweep could not list sessions", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return;
+  }
+  const cutoff = Date.now() - maxAgeMs;
+  let reaped = 0;
+  for (const s of sessions) {
+    if (!s?.title?.startsWith("Proxy:")) continue;
+    const updated = Number(s.time_updated ?? s.timeUpdated ?? 0);
+    if (!(updated > 1e12) || updated >= cutoff) continue;
+    try {
+      await client.session.delete({ path: { id: s.id } });
+      reaped++;
+    } catch {
+    }
+  }
+  if (reaped > 0) {
+    await safeLog(client, "info", "OpenAI proxy stale-session sweep", { reaped });
+  }
+}
+var SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1e3;
+function scheduleSessionSweeps(client) {
+  void sweepStaleProxySessions(client).catch(() => {
+  });
+  const timer = setInterval(() => {
+    void sweepStaleProxySessions(client).catch(() => {
+    });
+  }, SWEEP_INTERVAL_MS);
+  timer.unref?.();
+  return timer;
 }
 function setGenerationControls(sessionID, controls) {
   if (!sessionID || !controls || Object.keys(controls).length === 0) return;
@@ -2011,6 +2064,7 @@ async function executePrompt(client, _request, model, messages, system, callerTo
   }
   const tools = await getDisabledTools(client);
   let sessionID;
+  let settled = false;
   try {
     const session = await client.session.create({ body: { title: `Proxy: ${model.id}` }, signal: options.signal });
     sessionID = session.data.id;
@@ -2030,10 +2084,11 @@ async function executePrompt(client, _request, model, messages, system, callerTo
     const structured = completion.data.info?.structured;
     const content = structured === void 0 ? extractAssistantText(completion.data.parts ?? []) : JSON.stringify(structured);
     if (!content && completion.data.info?.error) throw new Error(completion.data.info.error.message ?? "Model call failed.");
+    settled = true;
     return { content, structured, toolCalls: [], completion, request: _request, sessionID };
   } finally {
     clearGenerationControls(sessionID);
-    await deleteSession(client, sessionID, options.keepSessions);
+    if (settled) await deleteSession(client, sessionID, options.keepSessions, options.signal);
   }
 }
 async function executePromptStreaming(client, model, messages, system, onChunk, callerTools = [], options = {}) {
@@ -2147,7 +2202,6 @@ function createResponsesApiResponse(result, model) {
 function mapFinishReason(finish) {
   if (!finish) return "stop";
   if (finish.includes("length")) return "length";
-  if (finish.includes("tool")) return "tool_calls";
   return "stop";
 }
 async function safeLog(client, level, message, extra) {
@@ -2604,9 +2658,6 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
       }
     }
     if (options.signal?.aborted) throw options.signal.reason ?? new Error("Request was cancelled.");
-  } catch (error) {
-    await deleteSession(client, sessionID, options.keepSessions);
-    throw error;
   } finally {
     if (turnState) turnState.finished = true;
     removeAbortListener();
@@ -2627,17 +2678,10 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     arguments: call.arguments ?? {}
   }));
   if (errorMessage && toolCalls.length === 0) {
-    await deleteSession(client, sessionID, options.keepSessions);
     throw new Error(errorMessage);
   }
-  let assistantEntry;
-  try {
-    const messagesResult = await client.session.messages({ path: { id: sessionID }, signal: options.signal });
-    assistantEntry = (messagesResult.data ?? []).filter((m) => m.info?.role === "assistant").at(-1);
-  } catch (error) {
-    await deleteSession(client, sessionID, options.keepSessions);
-    throw error;
-  }
+  const messagesResult = await client.session.messages({ path: { id: sessionID }, signal: options.signal });
+  const assistantEntry = (messagesResult.data ?? []).filter((m) => m.info?.role === "assistant").at(-1);
   const assistantInfo = assistantEntry?.info;
   if (!content && toolCalls.length === 0) {
     content = extractAssistantText(assistantEntry?.parts ?? []);
@@ -2651,7 +2695,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     finish: toolCalls.length > 0 ? "tool_calls" : assistantInfo?.finish,
     structured: assistantInfo?.structured
   };
-  await deleteSession(client, sessionID, options.keepSessions);
+  if (!errorMessage) await deleteSession(client, sessionID, options.keepSessions, options.signal);
   return result;
 }
 async function listModels(client) {
@@ -2906,7 +2950,6 @@ function normalizeAnthropicSystem(system) {
 function mapFinishReasonToAnthropic(finish) {
   if (!finish) return "end_turn";
   if (finish.includes("length")) return "max_tokens";
-  if (finish.includes("tool")) return "tool_use";
   return "end_turn";
 }
 function createAnthropicResponse(result, model) {
@@ -3929,6 +3972,7 @@ async function startProxyServer(client) {
   }
   state.started = true;
   state.server = server;
+  state.sweepTimer = scheduleSessionSweeps(client);
   await safeLog(client, "info", "OpenAI proxy server started", {
     hostname,
     port,
@@ -4015,5 +4059,6 @@ export {
   resolveModel,
   sanitizeToolName,
   setupV2,
+  sweepStaleProxySessions,
   toTextContent
 };

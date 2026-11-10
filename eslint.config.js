@@ -21,8 +21,12 @@ export default [
         TextEncoder: "readonly",
         ReadableStream: "readonly",
         AbortController: "readonly",
+        AbortSignal: "readonly",
         setTimeout: "readonly",
         clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        fetch: "readonly",
         // Logging sink for OpenCode V2 plugins (opencode-v2.js)
         console: "readonly",
       },
