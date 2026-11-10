@@ -2277,6 +2277,48 @@ test("parseGeminiTools flattens functionDeclarations across tool groups", () => 
   assert.equal(tools[1].name, "get_time")
 })
 
+test("parseGeminiTools converts OpenAPI-subset schemas to JSON Schema for the MCP bridge", () => {
+  const [tool] = parseGeminiTools({
+    tools: [{
+      functionDeclarations: [{
+        name: "classify",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            // A property literally named "type" must keep its name; only its schema's type changes.
+            type: { type: "STRING", enum: ["A", "B"], nullable: true },
+            items: { type: "ARRAY", items: { type: "OBJECT", properties: { score: { type: "NUMBER" } } } },
+            choice: { anyOf: [{ type: "INTEGER" }, { type: "BOOLEAN" }] },
+            loose: { type: "TYPE_UNSPECIFIED", description: "anything" },
+          },
+          required: ["type"],
+        },
+      }],
+    }],
+  })
+  assert.deepEqual(tool.parameters, {
+    type: "object",
+    properties: {
+      type: { type: "string", enum: ["A", "B"], nullable: true },
+      items: { type: "array", items: { type: "object", properties: { score: { type: "number" } } } },
+      choice: { anyOf: [{ type: "integer" }, { type: "boolean" }] },
+      loose: { description: "anything" },
+    },
+    required: ["type"],
+  })
+})
+
+test("parseGeminiTools prefers parametersJsonSchema verbatim and does not mutate input", () => {
+  const jsonSchema = { type: "object", properties: { a: { type: "string" } }, additionalProperties: false }
+  const parameters = { type: "OBJECT", properties: { b: { type: "STRING" } } }
+  const snapshot = JSON.parse(JSON.stringify(parameters))
+  const [preferred] = parseGeminiTools({ tools: [{ functionDeclarations: [{ name: "f", parametersJsonSchema: jsonSchema, parameters }] }] })
+  assert.equal(preferred.parameters, jsonSchema)
+  const [converted] = parseGeminiTools({ tools: [{ functionDeclarations: [{ name: "g", parameters }] }] })
+  assert.equal(converted.parameters.type, "object")
+  assert.deepEqual(parameters, snapshot)
+})
+
 test("applyGeminiToolChoice supports NONE mode and allowedFunctionNames", () => {
   const tools = [{ name: "a" }, { name: "b" }]
   assert.deepEqual(applyGeminiToolChoice(tools, { functionCallingConfig: { mode: "NONE" } }), [])

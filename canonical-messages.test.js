@@ -187,3 +187,35 @@ test("rendering is deterministic and does not mutate canonical messages", () => 
   assert.deepEqual(renderOpenCodePrompt(value), renderOpenCodePrompt(value))
   assert.deepEqual(value, snapshot)
 })
+
+test("tool results keep non-text payloads instead of dropping them", () => {
+  const payload = { failureClass: "type", stage: "verify", ranked: [{ z: 1, a: 2 }] }
+  const resultContent = (canonical) =>
+    canonical.messages.find((message) => message.role === "tool").content[0].content
+
+  assert.deepEqual(
+    resultContent(adaptOpenAIChat({ messages: [{ role: "tool", tool_call_id: "c1", content: payload }] })),
+    [{ type: "json", value: payload }],
+  )
+  assert.deepEqual(
+    resultContent(adaptOpenAIChat({ messages: [{ role: "tool", tool_call_id: "c1", content: [
+      { type: "text", text: "ok" },
+      { type: "custom", data: payload },
+    ] }] })),
+    [{ type: "text", text: "ok" }, { type: "json", value: { type: "custom", data: payload } }],
+  )
+  assert.deepEqual(
+    resultContent(adaptAnthropic({ messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: [
+      { type: "text", text: "ok" },
+      { type: "search_result", source: "s", content: [] },
+    ] }] }] })),
+    [{ type: "text", text: "ok" }, { type: "json", value: { type: "search_result", source: "s", content: [] } }],
+  )
+  assert.deepEqual(
+    resultContent(adaptOpenAIResponses({ input: [{ type: "function_call_output", call_id: "c1", output: [
+      { type: "input_text", text: "ok" },
+      { type: "input_image", image_url: "data:image/png;base64,AA==" },
+    ] }] })),
+    [{ type: "text", text: "ok" }, { type: "media", mime: "image/png", url: "data:image/png;base64,AA==" }],
+  )
+})

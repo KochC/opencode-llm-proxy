@@ -57,6 +57,20 @@ function openAIContent(content) {
   })
 }
 
+// Tool results carry caller-defined payloads, so nothing may be silently dropped:
+// recognised text/media parts are converted, and anything else (objects, unknown
+// part types) is kept verbatim as a JSON value for the model to read.
+function openAIToolResultContent(content) {
+  if (typeof content === "string") return [{ type: "text", text: content }]
+  if (content === undefined || content === null) return []
+  if (!Array.isArray(content)) return [jsonValue(content)]
+  return content.flatMap((part) => {
+    if (part === undefined || part === null) return []
+    if (typeof part === "string") return [{ type: "text", text: part }]
+    return [textPart(part.text ?? part.input_text ?? part.output_text) ?? openAIMediaPart(part) ?? jsonValue(part)]
+  })
+}
+
 function mediaFromAnthropic(block) {
   if (!block || !["image", "document"].includes(block.type)) return null
   const source = block.source
@@ -83,9 +97,9 @@ function anthropicResultContent(content) {
   if (typeof content === "string") return [{ type: "text", text: content }]
   if (!Array.isArray(content)) return content === undefined ? [] : [jsonValue(content)]
   return content.flatMap((block) => {
-    const text = block?.type === "text" ? textPart(block.text) : null
-    const media = mediaFromAnthropic(block)
-    return text ? [text] : media ? [media] : []
+    if (block === undefined || block === null) return []
+    const text = block.type === "text" ? textPart(block.text) : null
+    return [text ?? mediaFromAnthropic(block) ?? jsonValue(block)]
   })
 }
 
@@ -137,7 +151,7 @@ export function adaptOpenAIChat(input) {
           type: "tool_result",
           ...(message.tool_call_id ? { id: message.tool_call_id } : {}),
           ...(message.name ? { name: message.name } : {}),
-          content,
+          content: openAIToolResultContent(message.content),
         }],
       }]
     }
@@ -163,13 +177,10 @@ export function adaptOpenAIResponses(input) {
         arguments: argumentsValue(item.arguments ?? ""),
       }] })
     } else if (item.type === "function_call_output") {
-      const output = typeof item.output === "string"
-        ? [{ type: "text", text: item.output }]
-        : [jsonValue(item.output)]
       messages.push({ role: "tool", content: [{
         type: "tool_result",
         ...(item.call_id ? { id: item.call_id } : {}),
-        content: output,
+        content: openAIToolResultContent(item.output),
       }] })
     } else {
       messages.push({ role: item.role ?? (item.type === "message" ? "user" : item.type ?? "user"), content: openAIContent(item.content ?? item.input) })

@@ -1084,6 +1084,48 @@ export function applyAnthropicToolChoice(tools, toolChoice) {
   return tools
 }
 
+// Gemini `parameters` use an OpenAPI-subset Schema whose `type` is an uppercase enum
+// ("OBJECT", "STRING", ...). The bridge exposes tools over MCP, which requires JSON
+// Schema (`inputSchema.type` must be "object"), so lowercase the type enums
+// recursively. Everything else - property names, `required`, `enum`, `nullable`,
+// `additionalProperties`, descriptions, key order - is preserved verbatim.
+const GEMINI_SCHEMA_CHILD_MAPS = ["properties", "patternProperties", "$defs", "definitions"]
+const GEMINI_SCHEMA_CHILD_LISTS = ["anyOf", "oneOf", "allOf", "prefixItems"]
+
+export function geminiSchemaToJsonSchema(schema) {
+  if (Array.isArray(schema)) return schema.map(geminiSchemaToJsonSchema)
+  if (!isPlainObject(schema)) return schema
+  const out = { ...schema }
+  if (typeof out.type === "string") {
+    if (out.type.toUpperCase() === "TYPE_UNSPECIFIED") delete out.type
+    else out.type = out.type.toLowerCase()
+  } else if (Array.isArray(out.type)) {
+    out.type = out.type.map((type) => (typeof type === "string" ? type.toLowerCase() : type))
+  }
+  for (const key of GEMINI_SCHEMA_CHILD_MAPS) {
+    if (isPlainObject(out[key])) {
+      out[key] = Object.fromEntries(
+        Object.entries(out[key]).map(([name, child]) => [name, geminiSchemaToJsonSchema(child)]),
+      )
+    }
+  }
+  for (const key of GEMINI_SCHEMA_CHILD_LISTS) {
+    if (Array.isArray(out[key])) out[key] = out[key].map(geminiSchemaToJsonSchema)
+  }
+  for (const key of ["items", "additionalProperties", "not"]) {
+    if (isPlainObject(out[key]) || Array.isArray(out[key])) out[key] = geminiSchemaToJsonSchema(out[key])
+  }
+  return out
+}
+
+function geminiDeclarationParameters(decl) {
+  // `parametersJsonSchema` (newer Gemini API / google-genai SDK) is already JSON
+  // Schema and takes precedence over the OpenAPI-subset `parameters`.
+  const jsonSchema = decl.parametersJsonSchema ?? decl.parameters_json_schema
+  if (isPlainObject(jsonSchema)) return jsonSchema
+  return normalizeParameters(geminiSchemaToJsonSchema(decl.parameters))
+}
+
 export function parseGeminiTools(body) {
   const list = []
   if (Array.isArray(body?.tools)) {
@@ -1094,7 +1136,7 @@ export function parseGeminiTools(body) {
           list.push({
             name: decl.name,
             description: typeof decl.description === "string" ? decl.description : "",
-            parameters: normalizeParameters(decl.parameters),
+            parameters: geminiDeclarationParameters(decl),
           })
         }
       }
