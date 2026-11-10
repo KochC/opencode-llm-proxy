@@ -3939,3 +3939,125 @@ describe("resolveIdleTimeoutSeconds", () => {
     assert.equal(mod.resolveIdleTimeoutSeconds({ requestTimeoutMs: 120000, idleTimeoutSeconds: 0 }), 0)
   })
 })
+
+// ---------------------------------------------------------------------------
+// No-op generation controls (issue #111)
+// ---------------------------------------------------------------------------
+
+function createSuccessClient() {
+  return {
+    app: { log: async () => {} },
+    tool: { ids: async () => ({ data: [] }) },
+    config: {
+      providers: async () => ({ data: { providers: [{ id: "openai", models: { first: { id: "first" } } }] } }),
+    },
+    session: {
+      create: async () => ({ data: { id: "s1" } }),
+      prompt: async () => ({
+        data: { parts: [{ type: "text", text: "hi" }], info: { tokens: { input: 1, output: 1 }, finish: "stop" } },
+      }),
+      delete: async () => ({ data: true }),
+    },
+  }
+}
+
+describe("no-op generation controls are accepted", () => {
+  const post = (body) =>
+    createProxyFetchHandler(createSuccessClient())(
+      new Request("http://127.0.0.1:4010/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "openai/first", messages: [{ role: "user", content: "hi" }], ...body }),
+      }),
+    )
+
+  // VS Code always sends n: 1; several SDKs send null for every unset field.
+  for (const [label, body] of Object.entries({
+    "n: 1 (VS Code default)": { n: 1 },
+    "n: null": { n: null },
+    "stop: []": { stop: [] },
+    "stop: ['']": { stop: [""] },
+    "stop: ''": { stop: "" },
+    "seed: null": { seed: null },
+    "frequency_penalty: 0": { frequency_penalty: 0 },
+    "presence_penalty: 0": { presence_penalty: 0 },
+    "logprobs: false": { logprobs: false },
+  })) {
+    it(`accepts ${label}`, async () => {
+      const response = await post(body)
+      assert.equal(response.status, 200)
+    })
+  }
+
+  for (const [label, body] of Object.entries({
+    "n: 2 (asks for multiple choices)": { n: 2 },
+    "seed: 42 (asks for determinism)": { seed: 42 },
+    "stop: [DONE] (asks for a stop sequence)": { stop: ["DONE"] },
+    "frequency_penalty: 0.5": { frequency_penalty: 0.5 },
+    "presence_penalty: -1": { presence_penalty: -1 },
+    "logprobs: true": { logprobs: true },
+  })) {
+    it(`still rejects ${label}`, async () => {
+      const response = await post(body)
+      assert.equal(response.status, 400)
+      const { error } = await response.json()
+      assert.match(error.message, /Unsupported generation controls/)
+      assert.match(error.message, /single choice/)
+    })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Upstream error reporting and redaction (issue #112)
+// ---------------------------------------------------------------------------
+
+describe("upstream failure messages", () => {
+  const failWith = (errorMessage) =>
+    createProxyFetchHandler({
+      app: { log: async () => {} },
+      tool: { ids: async () => ({ data: [] }) },
+      config: {
+        providers: async () => ({ data: { providers: [{ id: "opencode", models: { pickle: { id: "pickle" } } }] } }),
+      },
+      session: {
+        create: async () => ({ data: { id: "s1" } }),
+        prompt: async () => ({
+          data: { info: { finish: "error", tokens: { input: 0, output: 0 }, error: { message: errorMessage } }, parts: [] },
+        }),
+        delete: async () => ({ data: true }),
+      },
+    })(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "opencode/pickle", messages: [{ role: "user", content: "hi" }] }),
+    }))
+
+  it("surfaces the upstream reason instead of a bare 502", async () => {
+    const response = await failWith("Free usage limit reached")
+    const { error } = await response.json()
+    assert.equal(response.status, 502)
+    assert.match(error.message, /Free usage limit reached/)
+  })
+
+  it("redacts credentials that the provider echoes back", async () => {
+    const { error } = await (await failWith("Invalid key sk-abcdefghijklmnop1234 for Bearer eyJhbGciOi.test.token")).json()
+    assert.doesNotMatch(error.message, /sk-abcdefghijklmnop1234/)
+    assert.doesNotMatch(error.message, /eyJhbGciOi/)
+    assert.match(error.message, /Invalid key/)
+  })
+
+  it("scrubs tokens, keys and long hex digests", () => {
+    assert.equal(mod.scrubUpstreamMessage("api_key: supersecretvalue123 rejected"), "api_key [redacted] rejected")
+    assert.equal(mod.scrubUpstreamMessage("ghp_abcdefghijklmnopqrstuvwxyz0123"), "[redacted]")
+    assert.equal(mod.scrubUpstreamMessage("digest 0123456789abcdef0123456789abcdef here"), "digest [redacted] here")
+  })
+
+  it("collapses whitespace, trims, and caps the length", () => {
+    assert.equal(mod.scrubUpstreamMessage("  spaced   out\n message  "), "spaced out message")
+    assert.equal(mod.scrubUpstreamMessage(""), "")
+    assert.equal(mod.scrubUpstreamMessage(null), "")
+    const capped = mod.scrubUpstreamMessage("x".repeat(600))
+    assert.equal(capped.length, 501)
+    assert.ok(capped.endsWith("…"))
+  })
+})
