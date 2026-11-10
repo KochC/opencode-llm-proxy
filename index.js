@@ -632,11 +632,33 @@ function structuredFormat(request) {
   return { type: "json_schema", schema }
 }
 
+// The proxy returns exactly one choice and cannot pass these controls to OpenCode,
+// so a request that actually asks for different behaviour is rejected rather than
+// silently answered with something else. Values that mean "not set" or that match
+// the documented default change nothing when ignored, and rejecting them only
+// breaks clients that always send them: VS Code sends `n: 1`, and several SDKs send
+// `null` for every unset optional field.
+const UNSUPPORTED_CONTROLS = {
+  stop: (value) => !(value === null || value === "" || (Array.isArray(value) && value.every((item) => item === ""))),
+  seed: (value) => value !== null,
+  frequency_penalty: (value) => value !== 0 && value !== null,
+  presence_penalty: (value) => value !== 0 && value !== null,
+  logprobs: (value) => value !== false && value !== null,
+  n: (value) => value !== 1 && value !== null,
+}
+
 function validateUnsupportedControls(request) {
-  const unsupported = ["stop", "seed", "frequency_penalty", "presence_penalty", "logprobs", "n"]
-    .filter((name) => request[name] !== undefined)
+  const unsupported = Object.entries(UNSUPPORTED_CONTROLS)
+    .filter(([name, isMeaningful]) => request[name] !== undefined && isMeaningful(request[name]))
+    .map(([name]) => name)
   if (unsupported.length > 0) {
-    throw new ProxyError(`Unsupported generation controls: ${unsupported.join(", ")}.`, 400, "unsupported_parameter")
+    throw new ProxyError(
+      `Unsupported generation controls: ${unsupported.join(", ")}. ` +
+        "The proxy returns a single choice and cannot forward these to OpenCode; " +
+        "remove them or send the default value.",
+      400,
+      "unsupported_parameter",
+    )
   }
 }
 
@@ -1713,6 +1735,37 @@ function upstreamOutcome(error) {
   return "error"
 }
 
+// Upstream failures used to be reported as a bare "Upstream request failed.",
+// which hides the only useful information: the provider's own reason (an
+// exhausted free tier, a revoked key, a missing model). That turned a
+// one-line fix into an issue report nobody could act on (see #112).
+//
+// Surface the reason, but scrub it: provider messages can echo an API key,
+// bearer token or a full upstream URL containing one. Anything that looks like
+// a credential is replaced before the text leaves the proxy.
+const SECRET_PATTERNS = [
+  [/\b(sk|pk|rk|ghp|gho|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}/gi, "[redacted]"],
+  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]"],
+  [/\b(api[-_]?key|access[-_]?token|authorization|token|secret|password)\b\s*[:=]\s*["']?[^\s"',;}]{6,}/gi, "$1 [redacted]"],
+  [/\b[A-Fa-f0-9]{32,}\b/g, "[redacted]"],
+]
+
+export function scrubUpstreamMessage(message, maxLength = 500) {
+  let text = typeof message === "string" ? message.trim() : ""
+  if (!text) return ""
+  for (const [pattern, replacement] of SECRET_PATTERNS) text = text.replace(pattern, replacement)
+  const collapsed = text.replace(/\s+/g, " ")
+  return collapsed.length > maxLength ? `${collapsed.slice(0, maxLength)}…` : collapsed
+}
+
+// Builds the client-facing error for a failed upstream call. ProxyError messages
+// are already written for callers, so they pass through unchanged.
+function upstreamErrorMessage(error) {
+  if (error instanceof ProxyError) return error.message
+  const reason = scrubUpstreamMessage(error instanceof Error ? error.message : String(error ?? ""))
+  return reason ? `Upstream request failed: ${reason}` : "Upstream request failed."
+}
+
 function recordExecutionMetrics(result) {
   const tokens = result?.tokens ?? result?.completion?.data?.info?.tokens
   getMetrics().recordUpstreamAttempt("success")
@@ -2314,7 +2367,7 @@ export function createProxyFetchHandler(client) {
                 requestedModel: body.model,
               })
               const errChunk = JSON.stringify({
-                error: { message: "Upstream request failed.", type: "server_error" },
+                error: { message: upstreamErrorMessage(err), type: "server_error" },
               })
               queue.enqueue(`data: ${errChunk}\n\ndata: [DONE]\n\n`)
             })
@@ -2345,7 +2398,7 @@ export function createProxyFetchHandler(client) {
           error: message,
           requestedModel: body.model,
         })
-        return badRequest(error instanceof ProxyError ? message : "Upstream request failed.", error.status ?? 502, request)
+        return badRequest(upstreamErrorMessage(error), error.status ?? 502, request)
       }
     }
 
@@ -2612,7 +2665,7 @@ export function createProxyFetchHandler(client) {
                     object: "response",
                     created_at: now,
                     status: "failed",
-                    error: { message: "Upstream request failed.", code: "server_error" },
+                    error: { message: upstreamErrorMessage(err), code: "server_error" },
                   },
                 }),
               )
@@ -2644,7 +2697,7 @@ export function createProxyFetchHandler(client) {
           error: message,
           requestedModel: body.model,
         })
-        return badRequest(error instanceof ProxyError ? message : "Upstream request failed.", error.status ?? 502, request)
+        return badRequest(upstreamErrorMessage(error), error.status ?? 502, request)
       }
     }
 
@@ -2810,7 +2863,7 @@ export function createProxyFetchHandler(client) {
             .catch(async (err) => {
               const errMsg = err instanceof Error ? err.message : String(err)
               await safeLog(client, "error", "Anthropic proxy streaming call failed", { error: errMsg, requestedModel: body.model })
-              queue.enqueue(sseEvent("error", { type: "error", error: { type: "api_error", message: "Upstream request failed." } }))
+              queue.enqueue(sseEvent("error", { type: "error", error: { type: "api_error", message: upstreamErrorMessage(err) } }))
             })
             .finally(() => {
               queue.finish()
@@ -2835,7 +2888,7 @@ export function createProxyFetchHandler(client) {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(client, "error", "Anthropic proxy call failed", { error: message, requestedModel: body.model })
-        return anthropicInternalError(error instanceof ProxyError ? message : "Upstream request failed.", error.status ?? 502, request)
+        return anthropicInternalError(upstreamErrorMessage(error), error.status ?? 502, request)
       }
     }
 
@@ -2928,7 +2981,7 @@ export function createProxyFetchHandler(client) {
             .catch(async (err) => {
               const errMsg = err instanceof Error ? err.message : String(err)
               await safeLog(client, "error", "Gemini proxy streaming call failed", { error: errMsg, requestedModel: geminiModelName })
-              const errChunk = JSON.stringify({ error: { code: 502, message: "Upstream request failed.", status: "UNAVAILABLE" } })
+              const errChunk = JSON.stringify({ error: { code: 502, message: upstreamErrorMessage(err), status: "UNAVAILABLE" } })
               queue.enqueue(errChunk + "\n")
             })
             .finally(() => {
@@ -2959,7 +3012,7 @@ export function createProxyFetchHandler(client) {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         await safeLog(client, "error", "Gemini proxy call failed", { error: message, requestedModel: geminiModelName })
-        return badRequest(error instanceof ProxyError ? message : "Upstream request failed.", error.status ?? 502, request)
+        return badRequest(upstreamErrorMessage(error), error.status ?? 502, request)
       }
     }
 

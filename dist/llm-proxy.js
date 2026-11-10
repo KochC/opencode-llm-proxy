@@ -1942,10 +1942,22 @@ function structuredFormat(request) {
   if (!isPlainObject(schema)) throw new ProxyError("Structured output schema must be a JSON object.", 400, "invalid_schema");
   return { type: "json_schema", schema };
 }
+var UNSUPPORTED_CONTROLS = {
+  stop: (value) => !(value === null || value === "" || Array.isArray(value) && value.every((item) => item === "")),
+  seed: (value) => value !== null,
+  frequency_penalty: (value) => value !== 0 && value !== null,
+  presence_penalty: (value) => value !== 0 && value !== null,
+  logprobs: (value) => value !== false && value !== null,
+  n: (value) => value !== 1 && value !== null
+};
 function validateUnsupportedControls(request) {
-  const unsupported = ["stop", "seed", "frequency_penalty", "presence_penalty", "logprobs", "n"].filter((name) => request[name] !== void 0);
+  const unsupported = Object.entries(UNSUPPORTED_CONTROLS).filter(([name, isMeaningful]) => request[name] !== void 0 && isMeaningful(request[name])).map(([name]) => name);
   if (unsupported.length > 0) {
-    throw new ProxyError(`Unsupported generation controls: ${unsupported.join(", ")}.`, 400, "unsupported_parameter");
+    throw new ProxyError(
+      `Unsupported generation controls: ${unsupported.join(", ")}. The proxy returns a single choice and cannot forward these to OpenCode; remove them or send the default value.`,
+      400,
+      "unsupported_parameter"
+    );
   }
 }
 function deleteTimeoutMs() {
@@ -2774,6 +2786,24 @@ function upstreamOutcome(error) {
   if (error?.code === "cancelled" || error?.status === 499) return "cancelled";
   return "error";
 }
+var SECRET_PATTERNS = [
+  [/\b(sk|pk|rk|ghp|gho|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}/gi, "[redacted]"],
+  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]"],
+  [/\b(api[-_]?key|access[-_]?token|authorization|token|secret|password)\b\s*[:=]\s*["']?[^\s"',;}]{6,}/gi, "$1 [redacted]"],
+  [/\b[A-Fa-f0-9]{32,}\b/g, "[redacted]"]
+];
+function scrubUpstreamMessage(message, maxLength = 500) {
+  let text2 = typeof message === "string" ? message.trim() : "";
+  if (!text2) return "";
+  for (const [pattern, replacement] of SECRET_PATTERNS) text2 = text2.replace(pattern, replacement);
+  const collapsed = text2.replace(/\s+/g, " ");
+  return collapsed.length > maxLength ? `${collapsed.slice(0, maxLength)}\u2026` : collapsed;
+}
+function upstreamErrorMessage(error) {
+  if (error instanceof ProxyError) return error.message;
+  const reason = scrubUpstreamMessage(error instanceof Error ? error.message : String(error ?? ""));
+  return reason ? `Upstream request failed: ${reason}` : "Upstream request failed.";
+}
 function recordExecutionMetrics(result) {
   const tokens = result?.tokens ?? result?.completion?.data?.info?.tokens;
   getMetrics().recordUpstreamAttempt("success");
@@ -3293,7 +3323,7 @@ data: [DONE]
                 requestedModel: body.model
               });
               const errChunk = JSON.stringify({
-                error: { message: "Upstream request failed.", type: "server_error" }
+                error: { message: upstreamErrorMessage(err), type: "server_error" }
               });
               queue.enqueue(`data: ${errChunk}
 
@@ -3322,7 +3352,7 @@ data: [DONE]
             error: message,
             requestedModel: body.model
           });
-          return badRequest(error instanceof ProxyError ? message : "Upstream request failed.", error.status ?? 502, request);
+          return badRequest(upstreamErrorMessage(error), error.status ?? 502, request);
         }
       }
       if (request.method === "POST" && url.pathname === "/v1/responses") {
@@ -3575,7 +3605,7 @@ data: ${JSON.stringify(data)}
                     object: "response",
                     created_at: now,
                     status: "failed",
-                    error: { message: "Upstream request failed.", code: "server_error" }
+                    error: { message: upstreamErrorMessage(err), code: "server_error" }
                   }
                 })
               );
@@ -3601,7 +3631,7 @@ data: ${JSON.stringify(data)}
             error: message,
             requestedModel: body.model
           });
-          return badRequest(error instanceof ProxyError ? message : "Upstream request failed.", error.status ?? 502, request);
+          return badRequest(upstreamErrorMessage(error), error.status ?? 502, request);
         }
       }
       if (request.method === "POST" && url.pathname === "/v1/messages") {
@@ -3751,7 +3781,7 @@ data: ${JSON.stringify(data)}
             }).catch(async (err) => {
               const errMsg = err instanceof Error ? err.message : String(err);
               await safeLog(client, "error", "Anthropic proxy streaming call failed", { error: errMsg, requestedModel: body.model });
-              queue.enqueue(sseEvent("error", { type: "error", error: { type: "api_error", message: "Upstream request failed." } }));
+              queue.enqueue(sseEvent("error", { type: "error", error: { type: "api_error", message: upstreamErrorMessage(err) } }));
             }).finally(() => {
               queue.finish();
             });
@@ -3771,7 +3801,7 @@ data: ${JSON.stringify(data)}
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           await safeLog(client, "error", "Anthropic proxy call failed", { error: message, requestedModel: body.model });
-          return anthropicInternalError(error instanceof ProxyError ? message : "Upstream request failed.", error.status ?? 502, request);
+          return anthropicInternalError(upstreamErrorMessage(error), error.status ?? 502, request);
         }
       }
       const isGeminiNonStream = request.method === "POST" && url.pathname.endsWith(":generateContent");
@@ -3849,7 +3879,7 @@ data: ${JSON.stringify(data)}
             }).catch(async (err) => {
               const errMsg = err instanceof Error ? err.message : String(err);
               await safeLog(client, "error", "Gemini proxy streaming call failed", { error: errMsg, requestedModel: geminiModelName });
-              const errChunk = JSON.stringify({ error: { code: 502, message: "Upstream request failed.", status: "UNAVAILABLE" } });
+              const errChunk = JSON.stringify({ error: { code: 502, message: upstreamErrorMessage(err), status: "UNAVAILABLE" } });
               queue.enqueue(errChunk + "\n");
             }).finally(() => {
               queue.finish();
@@ -3875,7 +3905,7 @@ data: ${JSON.stringify(data)}
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           await safeLog(client, "error", "Gemini proxy call failed", { error: message, requestedModel: geminiModelName });
-          return badRequest(error instanceof ProxyError ? message : "Upstream request failed.", error.status ?? 502, request);
+          return badRequest(upstreamErrorMessage(error), error.status ?? 502, request);
         }
       }
       return text("Not found", 404, request, config);
@@ -4059,6 +4089,7 @@ export {
   resolveIdleTimeoutSeconds,
   resolveModel,
   sanitizeToolName,
+  scrubUpstreamMessage,
   setupV2,
   sweepStaleProxySessions,
   toTextContent
