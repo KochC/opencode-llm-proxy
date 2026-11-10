@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.12.1](https://github.com/KochC/opencode-llm-proxy/compare/v1.12.0...v1.12.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* accept no-op generation controls and explain upstream failures ([f77a5e5](https://github.com/KochC/opencode-llm-proxy/commit/f77a5e598ce704d3fb71a39bd724c2c9f08ca559))
+* accept no-op generation controls and explain upstream failures ([6b58270](https://github.com/KochC/opencode-llm-proxy/commit/6b58270b36b3f309ce5ba921e1a5d12e8375c06c))
+
 ## [1.12.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.11.2...v1.12.0) (2026-11-10)
 
 
