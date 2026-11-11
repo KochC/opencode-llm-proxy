@@ -192,7 +192,7 @@ curl -o .opencode/plugins/llm-proxy.js \
 | `OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS` | `120000` | Total request timeout, from 1 to 3,600,000 ms. |
 | `OPENCODE_LLM_PROXY_IDLE_TIMEOUT_SECONDS` | request timeout + 5 s | Seconds a connection may stay silent before the server closes it, from 0 (disabled) to 255. Defaults to the request timeout plus 5 s, or 0 when that exceeds 255 s. |
 | `OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES` | `33554432` | Maximum JSON request body and embedded data-URL size, up to 100 MiB. The 32 MiB default accommodates whole-session compaction prompts. |
-| `OPENCODE_LLM_PROXY_PASSTHROUGH_CONFIG` | `~/.config/opencode/llm-proxy-passthrough.json` | Path to a JSON passthrough config (`baseUrl`, optional `prefix`). Missing or invalid config disables passthrough. Keep this file local. |
+| `OPENCODE_LLM_PROXY_PASSTHROUGH_CONFIG` | `~/.config/opencode/llm-proxy-passthrough.json` | Path to a JSON passthrough config (`baseUrl`, optional `prefix`, `unprefixed`, `apiKey`, `authHeader`). Missing or invalid config disables passthrough. Keep this file local. |
 | `OPENCODE_LLM_PROXY_MAX_CONCURRENT_REQUESTS` | `8` | Maximum active POST requests. |
 | `OPENCODE_LLM_PROXY_MAX_QUEUED_REQUESTS` | `32` | Maximum POST requests waiting for capacity; excess requests receive `503`. |
 | `OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE` | `8` | Max concurrent in-flight requests using [tool calling](#tool-calling). |
@@ -221,7 +221,7 @@ When an upstream call fails, the error names the reason the provider gave (for e
 
 ### Direct upstream passthrough
 
-For clients that already speak an upstream's native API, the proxy can forward requests **verbatim** instead of running them through an OpenCode session and tool bridge. This preserves the upstream's own streaming, tool-call, and error behavior, and bypasses the proxy's request-body cap.
+For clients that already speak an upstream's native API, the proxy can forward requests **verbatim** instead of running them through an OpenCode session and tool bridge. This preserves the upstream's own streaming, tool-call, and error behavior.
 
 Create a local config file (`~/.config/opencode/llm-proxy-passthrough.json` by default, or point `OPENCODE_LLM_PROXY_PASSTHROUGH_CONFIG` at another path):
 

@@ -375,7 +375,7 @@ async function withPassthroughConfig(config, fn) {
   }
 }
 
-async function withMockUpstream(fn) {
+async function withMockUpstream(fn, { responseHeaders = {} } = {}) {
   const calls = []
   const originalFetch = globalThis.fetch
   globalThis.fetch = async (url, init = {}) => {
@@ -390,7 +390,7 @@ async function withMockUpstream(fn) {
     }
     return new Response("upstream-body", {
       status: 200,
-      headers: { "content-type": "text/plain", "x-upstream": "yes" },
+      headers: { "content-type": "text/plain", "x-upstream": "yes", ...responseHeaders },
     })
   }
   try {
@@ -505,6 +505,78 @@ test("passthrough applies a configured upstream custom auth header", async () =>
   })
 })
 
+test("passthrough authenticates the model probe and never sends caller credentials", async () => {
+  await withPassthroughConfig({
+    baseUrl: "http://upstream.test",
+    prefix: "up/",
+    unprefixed: true,
+    apiKey: "upstream-secret",
+    authHeader: "x-api-key",
+  }, async () => {
+    await withMockUpstream(async (calls) => {
+      const handler = createProxyFetchHandler(createClient())
+      const response = await handler(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer proxy-token" },
+        body: JSON.stringify({ model: "model-b", messages: [{ role: "user", content: "hi" }] }),
+      }))
+
+      assert.equal(response.status, 200)
+      const probe = calls.find((entry) => entry.url.endsWith("/v1/models"))
+      assert.ok(probe, "the unprefixed model probe must run")
+      assert.equal(probe.headers.get("x-api-key"), "upstream-secret")
+      assert.equal(probe.headers.get("authorization"), null)
+    })
+  })
+})
+
+test("a reserved passthrough auth header disables passthrough", async () => {
+  for (const authHeader of ["host", "content-length", "content-type", "connection", "bad header"]) {
+    await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/", apiKey: "secret", authHeader }, async () => {
+      await withMockUpstream(async (calls) => {
+        const handler = createProxyFetchHandler(createModelsClient([]))
+        const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "up/model-a", input: "hi" }),
+        }))
+
+        assert.notEqual(response.headers.get("x-opencode-passthrough"), "true", `${authHeader} must disable passthrough`)
+        assert.equal(calls.length, 0)
+      })
+    })
+  }
+})
+
+test("passthrough strips upstream hop-by-hop response headers", async () => {
+  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
+    await withMockUpstream(async () => {
+      const handler = createProxyFetchHandler(createClient())
+      const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "up/model-a", input: "hi" }),
+      }))
+
+      assert.equal(response.status, 200)
+      for (const name of ["connection", "keep-alive", "transfer-encoding", "te", "upgrade", "trailer", "x-remove-me"]) {
+        assert.equal(response.headers.get(name), null, `${name} must not reach the client`)
+      }
+      assert.equal(response.headers.get("x-upstream"), "yes")
+    }, {
+      responseHeaders: {
+        connection: "keep-alive, x-remove-me",
+        "x-remove-me": "yes",
+        "keep-alive": "timeout=5",
+        "transfer-encoding": "chunked",
+        te: "trailers",
+        upgrade: "h2c",
+        trailer: "x-checksum",
+      },
+    })
+  })
+})
+
 test("passthrough strips caller hop-by-hop headers", async () => {
   await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
     await withMockUpstream(async (calls) => {
@@ -540,16 +612,18 @@ test("passthrough enforces the request-body cap before buffering", async () => {
     await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
       await withMockUpstream(async (calls) => {
         const handler = createProxyFetchHandler(createClient())
-        const response = await handler(new Request("http://127.0.0.1:4010/v1/chat/completions", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            model: "other/model-x",
-            messages: [{ role: "user", content: "x".repeat(4096) }],
-          }),
-        }))
+        for (const model of ["up/model-a", "other/model-x"]) {
+          const response = await handler(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              model,
+              messages: [{ role: "user", content: "x".repeat(4096) }],
+            }),
+          }))
 
-        assert.equal(response.status, 413)
+          assert.equal(response.status, 413, `${model} must be rejected before forwarding`)
+        }
         assert.equal(calls.length, 0)
       })
     })
@@ -558,7 +632,7 @@ test("passthrough enforces the request-body cap before buffering", async () => {
   }
 })
 
-test("passthrough bypasses the normal request-body cap", async () => {
+test("passthrough forwards bodies above the old 1 MiB default", async () => {
   await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
     await withMockUpstream(async (calls) => {
       const handler = createProxyFetchHandler(createClient())

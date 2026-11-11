@@ -143,6 +143,27 @@ function loadConfig() {
   }
 }
 
+const HOP_BY_HOP_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]
+
+// An authHeader names the header that carries the upstream credential. Setting
+// a framing or hop-by-hop header there would corrupt the request, so reject
+// those at load time instead of failing every forwarded call.
+const RESERVED_AUTH_HEADERS = new Set([
+  ...HOP_BY_HOP_HEADERS,
+  "host",
+  "content-length",
+  "content-type",
+])
+
 // Optional direct-upstream passthrough. The config file is local and is never
 // committed: it names an upstream base URL and an optional model prefix.
 // Requests whose model matches are forwarded verbatim (minus the prefix), with
@@ -167,9 +188,11 @@ function loadPassthroughConfig() {
     const authHeader = typeof parsed.authHeader === "string" && parsed.authHeader.trim() !== ""
       ? parsed.authHeader.trim().toLowerCase()
       : "authorization"
-    // Reject an invalid header name at load time instead of failing a request.
+    if (RESERVED_AUTH_HEADERS.has(authHeader)) return null
+    // Reject an invalid header name or value at load time instead of failing a
+    // request: Headers rejects both, so a key with a newline cannot slip in.
     try {
-      new Headers({ [authHeader]: "probe" })
+      new Headers({ [authHeader]: apiKey ?? "probe" })
     } catch {
       return null
     }
@@ -185,17 +208,6 @@ function loadPassthroughConfig() {
   }
 }
 
-const HOP_BY_HOP_HEADERS = [
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-]
-
 function applyUpstreamAuth(headers, config) {
   if (!config.apiKey) return headers
   headers.set(
@@ -205,14 +217,18 @@ function applyUpstreamAuth(headers, config) {
   return headers
 }
 
-function passthroughHeaders(request, config) {
-  const headers = new Headers(request.headers)
+function stripHopByHop(headers, source) {
   // RFC 9110: a Connection header can list additional hop-by-hop fields.
-  for (const token of (request.headers.get("connection") ?? "").split(",")) {
+  for (const token of (source.get("connection") ?? "").split(",")) {
     const name = token.trim().toLowerCase()
     if (name) headers.delete(name)
   }
   for (const name of HOP_BY_HOP_HEADERS) headers.delete(name)
+  return headers
+}
+
+function passthroughHeaders(request, config) {
+  const headers = stripHopByHop(new Headers(request.headers), request.headers)
   headers.delete("host")
   headers.delete("content-length")
   headers.delete("authorization")
@@ -2291,7 +2307,10 @@ export function createProxyFetchHandler(client) {
       return badRequest(`Passthrough request failed: ${message}`, 502, request)
     }
 
-    const responseHeaders = new Headers(upstream.headers)
+    // fetch has already decoded the body, so content-encoding no longer
+    // applies. Strip hop-by-hop fields in both directions as well: Bun's server
+    // handles connection framing itself.
+    const responseHeaders = stripHopByHop(new Headers(upstream.headers), upstream.headers)
     responseHeaders.delete("content-encoding")
     responseHeaders.delete("content-length")
     responseHeaders.set("x-opencode-passthrough", "true")
