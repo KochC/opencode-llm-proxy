@@ -867,6 +867,24 @@ test("HTTP metrics record exact auth, CORS, route, and stream statuses", async (
   assert.match(output, /method="POST",route="\/v1\/chat\/completions",status="200"\} 1/)
 })
 
+test("passthrough responses are recorded in HTTP metrics", async () => {
+  resetMetrics()
+  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
+    await withMockUpstream(async () => {
+      const handler = createProxyFetchHandler(createClient())
+      const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "up/model-a", input: "hi" }),
+      }))
+
+      assert.equal(response.status, 200)
+      const output = getMetrics().metrics()
+      assert.match(output, /method="POST",route="\/v1\/responses",status="200"\} 1/)
+    })
+  })
+})
+
 test("metrics endpoint is available only when enabled", async () => {
   let response = await createProxyFetchHandler(createClient())(new Request("http://127.0.0.1:4010/metrics"))
   assert.equal(response.status, 404)
