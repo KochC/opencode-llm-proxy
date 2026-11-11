@@ -17,6 +17,7 @@ export default [
         // Web API globals available in both Node and Bun
         Request: "readonly",
         Response: "readonly",
+        Headers: "readonly",
         URL: "readonly",
         TextEncoder: "readonly",
         ReadableStream: "readonly",

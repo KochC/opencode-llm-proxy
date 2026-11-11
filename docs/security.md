@@ -68,6 +68,21 @@ When enabled, the fetcher defaults to HTTPS only and converts successful downloa
 
 Do not add `http` to `OPENCODE_LLM_PROXY_REMOTE_MEDIA_ALLOWED_SCHEMES` unless transport security is provided by a trusted environment and the risk is understood. These controls reduce SSRF risk but do not make arbitrary untrusted URL fetching preferable to leaving the feature disabled.
 
+## Direct upstream passthrough
+
+Passthrough is a second, separate egress path. When enabled, requests for matching models are forwarded verbatim to the `baseUrl` in `OPENCODE_LLM_PROXY_PASSTHROUGH_CONFIG` (default `~/.config/opencode/llm-proxy-passthrough.json`). The proxy does not validate that endpoint for SSRF or allowlist reasons: it is an operator-supplied upstream, not user-supplied remote media.
+
+Treat the config file as a secret and keep it local, mode `600`, and outside version control:
+
+- It can contain an internal endpoint and an `apiKey`.
+- The default path is outside the repository, and `llm-proxy-passthrough.json` is git-ignored.
+- The proxy applies the configured credential to both the upstream request and the `GET /v1/models` probe. Caller credentials are never forwarded.
+- Hop-by-hop headers, `host`, `content-length`, and caller auth headers are stripped before forwarding.
+- The request body is read with the `OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES` cap before forwarding, so a client cannot make the proxy buffer an unbounded body.
+- Unprefixed model discovery is opt-in (`"unprefixed": true`) because it can shadow local OpenCode models with the same ids.
+
+Enabling passthrough grants every authenticated proxy client the same upstream access that the configured credential has. Use a dedicated, least-privilege key where the upstream supports one, and keep the proxy bound to localhost or behind a trusted network and firewall.
+
 ## Checklist
 
 - [ ] Localhost binding unless network access is genuinely required
@@ -77,4 +92,5 @@ Do not add `http` to `OPENCODE_LLM_PROXY_REMOTE_MEDIA_ALLOWED_SCHEMES` unless tr
 - [ ] Firewall restricts inbound access to known hosts
 - [ ] Tool-using clients are trusted and reviewed
 - [ ] Remote media remains disabled, or its HTTPS-only limits are reviewed
+- [ ] Passthrough config stays local (mode `600`) and uses a least-privilege upstream key
 - [ ] Tokens never written to logs

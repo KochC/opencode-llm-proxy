@@ -2,6 +2,9 @@
 import { fileURLToPath } from "node:url";
 import { Buffer as Buffer2 } from "node:buffer";
 import { timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 // canonical-messages.js
 function isObject(value) {
@@ -1432,7 +1435,10 @@ function getState() {
 }
 var DEFAULTS = Object.freeze({
   requestTimeoutMs: 12e4,
-  maxRequestBytes: 1024 * 1024,
+  // Coding agents routinely send whole-session compaction prompts above 1 MiB.
+  // Keep a bounded default, but do not reject an otherwise valid request at
+  // the old 1 MiB mark. Override with OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES.
+  maxRequestBytes: 32 * 1024 * 1024,
   maxConcurrentRequests: 8,
   maxQueuedRequests: 32,
   bridgeAcquireTimeoutMs: 1e4,
@@ -1516,13 +1522,86 @@ function loadConfig() {
     remoteMedia: {
       enabled: booleanEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_ENABLED"),
       allowedSchemes: jsonArrayEnvDefault("OPENCODE_LLM_PROXY_REMOTE_MEDIA_ALLOWED_SCHEMES", ["https"]),
-      maxBytes: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_BYTES", maxRequestBytes || 1024 * 1024, { min: 1, max: 100 * 1024 * 1024 }),
+      // Keep the media download budget independent: raising the JSON body cap
+      // must not silently raise how much the proxy will fetch from remote URLs.
+      maxBytes: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_BYTES", 1024 * 1024, { min: 1, max: 100 * 1024 * 1024 }),
       maxItems: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_ITEMS", 4, { min: 0, max: 1e4 }),
       maxTotalItems: integerEnv("OPENCODE_LLM_PROXY_MAX_MEDIA_ITEMS", 64, { min: 1, max: 1e4 }),
       maxRedirects: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_REDIRECTS", 3, { min: 0, max: 100 }),
       timeoutMs: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_TIMEOUT_MS", 1e4, { min: 1, max: 36e5 })
     }
   };
+}
+var HOP_BY_HOP_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade"
+];
+var RESERVED_AUTH_HEADERS = /* @__PURE__ */ new Set([
+  ...HOP_BY_HOP_HEADERS,
+  "host",
+  "content-length",
+  "content-type"
+]);
+function loadPassthroughConfig() {
+  const path = process.env.OPENCODE_LLM_PROXY_PASSTHROUGH_CONFIG ?? join(homedir(), ".config", "opencode", "llm-proxy-passthrough.json");
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (typeof parsed?.baseUrl !== "string" || parsed.baseUrl.trim() === "") return null;
+    const url = new URL(parsed.baseUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    const prefix = typeof parsed.prefix === "string" ? parsed.prefix : "";
+    const unprefixed = parsed.unprefixed === true;
+    if (!prefix && !unprefixed) return null;
+    const apiKey = typeof parsed.apiKey === "string" && parsed.apiKey.trim() !== "" ? parsed.apiKey : void 0;
+    const authHeader = typeof parsed.authHeader === "string" && parsed.authHeader.trim() !== "" ? parsed.authHeader.trim().toLowerCase() : "authorization";
+    if (RESERVED_AUTH_HEADERS.has(authHeader)) return null;
+    try {
+      new Headers({ [authHeader]: apiKey ?? "probe" });
+    } catch {
+      return null;
+    }
+    return {
+      prefix,
+      baseUrl: parsed.baseUrl.replace(/\/+$/, ""),
+      unprefixed,
+      apiKey,
+      authHeader
+    };
+  } catch {
+    return null;
+  }
+}
+function applyUpstreamAuth(headers, config) {
+  if (!config.apiKey) return headers;
+  headers.set(
+    config.authHeader,
+    config.authHeader === "authorization" ? `Bearer ${config.apiKey}` : config.apiKey
+  );
+  return headers;
+}
+function stripHopByHop(headers, source) {
+  for (const token of (source.get("connection") ?? "").split(",")) {
+    const name = token.trim().toLowerCase();
+    if (name) headers.delete(name);
+  }
+  for (const name of HOP_BY_HOP_HEADERS) headers.delete(name);
+  return headers;
+}
+function passthroughHeaders(request, config) {
+  const headers = stripHopByHop(new Headers(request.headers), request.headers);
+  headers.delete("host");
+  headers.delete("content-length");
+  headers.delete("authorization");
+  headers.delete("x-api-key");
+  headers.delete("anthropic-api-key");
+  headers.set("content-type", "application/json");
+  return applyUpstreamAuth(headers, config);
 }
 function commonHeaders(request, config) {
   return {
@@ -1629,7 +1708,7 @@ function isAuthorized(request, config = loadConfig()) {
 function isPlainObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
-async function readJsonBody(request, maxBytes, signal) {
+async function readTextBody(request, maxBytes, signal) {
   const declared = Number(request.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > maxBytes) {
     throw new ProxyError("Request body is too large.", 413, "request_too_large");
@@ -1667,15 +1746,24 @@ async function readJsonBody(request, maxBytes, signal) {
       }
       chunks.push(value);
     }
-    const body = JSON.parse(Buffer2.concat(chunks.map((chunk) => Buffer2.from(chunk))).toString("utf8"));
-    if (!isPlainObject(body)) throw new ProxyError("Request body must be a JSON object.", 400, "invalid_json");
-    return body;
+    return Buffer2.concat(chunks.map((chunk) => Buffer2.from(chunk))).toString("utf8");
   } catch (error) {
     if (error instanceof ProxyError) throw error;
     throw new ProxyError("Request body must be valid JSON.", 400, "invalid_json");
   } finally {
     signal?.removeEventListener("abort", onAbort);
     reader.releaseLock();
+  }
+}
+async function readJsonBody(request, maxBytes, signal) {
+  const text2 = await readTextBody(request, maxBytes, signal);
+  try {
+    const body = JSON.parse(text2);
+    if (!isPlainObject(body)) throw new ProxyError("Request body must be a JSON object.", 400, "invalid_json");
+    return body;
+  } catch (error) {
+    if (error instanceof ProxyError) throw error;
+    throw new ProxyError("Request body must be valid JSON.", 400, "invalid_json");
   }
 }
 function createRequestSignal(request, timeoutMs) {
@@ -3105,8 +3193,60 @@ function geminiModelFromPath(pathname) {
   const match = pathname.match(/^\/v1beta\/models\/(.+):(?:generateContent|streamGenerateContent)$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
+var PASSTHROUGH_PATHS = /* @__PURE__ */ new Set(["/v1/chat/completions", "/v1/responses", "/v1/messages"]);
+var UPSTREAM_MODELS_TTL_MS = 6e4;
 function createProxyFetchHandler(client) {
   const config = loadConfig();
+  const passthrough = loadPassthroughConfig();
+  let upstreamModelsCache = null;
+  async function isUpstreamModel(model) {
+    if (!passthrough.unprefixed) return false;
+    const now = Date.now();
+    if (!upstreamModelsCache || now - upstreamModelsCache.at > UPSTREAM_MODELS_TTL_MS) {
+      let ids = /* @__PURE__ */ new Set();
+      try {
+        const response = await fetch(`${passthrough.baseUrl}/v1/models`, {
+          headers: applyUpstreamAuth(new Headers(), passthrough),
+          signal: AbortSignal.timeout(3e3)
+        });
+        if (response.ok) {
+          const data = await response.json();
+          ids = new Set((data?.data ?? []).map((entry) => entry?.id).filter((id) => typeof id === "string"));
+        }
+      } catch {
+      }
+      upstreamModelsCache = { at: now, ids };
+    }
+    return upstreamModelsCache.ids.has(model);
+  }
+  async function proxyPassthrough(request, url, body, upstreamModel) {
+    const upstreamBody = JSON.stringify({ ...body, model: upstreamModel });
+    const headers = passthroughHeaders(request, passthrough);
+    let upstream;
+    try {
+      upstream = await fetch(`${passthrough.baseUrl}${url.pathname}${url.search}`, {
+        method: "POST",
+        headers,
+        body: upstreamBody,
+        signal: request.signal
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await safeLog(client, "error", "Passthrough request failed", {
+        error: message,
+        path: url.pathname
+      });
+      return badRequest(`Passthrough request failed: ${message}`, 502, request);
+    }
+    const responseHeaders = stripHopByHop(new Headers(upstream.headers), upstream.headers);
+    responseHeaders.delete("content-encoding");
+    responseHeaders.delete("content-length");
+    responseHeaders.set("x-opencode-passthrough", "true");
+    for (const [key, value] of Object.entries(commonHeaders(request, config))) {
+      responseHeaders.set(key, value);
+    }
+    return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
+  }
   const handleRequest = async (request) => {
     const url = new URL(request.url);
     const origin = request.headers.get("origin");
@@ -3125,6 +3265,44 @@ function createProxyFetchHandler(client) {
     }
     if (!isAuthorized(request, config)) {
       return unauthorized(request);
+    }
+    if (passthrough && request.method === "POST" && PASSTHROUGH_PATHS.has(url.pathname)) {
+      let rawBody;
+      try {
+        rawBody = await readTextBody(request, config.maxRequestBytes, request.signal);
+      } catch (error) {
+        if (error instanceof ProxyError) {
+          return badRequest(error.message, error.status, request, error.code);
+        }
+        return badRequest("Failed to read request body.", 400, request);
+      }
+      let parsedBody;
+      try {
+        parsedBody = JSON.parse(rawBody);
+      } catch {
+        parsedBody = void 0;
+      }
+      if (typeof parsedBody?.model === "string") {
+        if (passthrough.prefix && parsedBody.model.startsWith(passthrough.prefix)) {
+          return proxyPassthrough(
+            request,
+            url,
+            parsedBody,
+            parsedBody.model.slice(passthrough.prefix.length)
+          );
+        }
+        if (passthrough.unprefixed && await isUpstreamModel(parsedBody.model)) {
+          return proxyPassthrough(request, url, parsedBody, parsedBody.model);
+        }
+      }
+      const replayHeaders = new Headers(request.headers);
+      replayHeaders.delete("content-length");
+      request = new Request(request.url, {
+        method: request.method,
+        headers: replayHeaders,
+        body: rawBody,
+        signal: request.signal
+      });
     }
     const started = Date.now();
     const context = createRequestSignal(request, config.requestTimeoutMs);

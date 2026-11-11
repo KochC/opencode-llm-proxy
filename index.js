@@ -1,6 +1,9 @@
 import { fileURLToPath } from "node:url"
 import { Buffer } from "node:buffer"
 import { timingSafeEqual } from "node:crypto"
+import { readFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import {
   adaptAnthropic,
   adaptGemini,
@@ -24,7 +27,10 @@ function getState() {
 
 const DEFAULTS = Object.freeze({
   requestTimeoutMs: 120000,
-  maxRequestBytes: 1024 * 1024,
+  // Coding agents routinely send whole-session compaction prompts above 1 MiB.
+  // Keep a bounded default, but do not reject an otherwise valid request at
+  // the old 1 MiB mark. Override with OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES.
+  maxRequestBytes: 32 * 1024 * 1024,
   maxConcurrentRequests: 8,
   maxQueuedRequests: 32,
   bridgeAcquireTimeoutMs: 10000,
@@ -126,13 +132,110 @@ function loadConfig() {
     remoteMedia: {
       enabled: booleanEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_ENABLED"),
       allowedSchemes: jsonArrayEnvDefault("OPENCODE_LLM_PROXY_REMOTE_MEDIA_ALLOWED_SCHEMES", ["https"]),
-      maxBytes: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_BYTES", maxRequestBytes || 1024 * 1024, { min: 1, max: 100 * 1024 * 1024 }),
+      // Keep the media download budget independent: raising the JSON body cap
+      // must not silently raise how much the proxy will fetch from remote URLs.
+      maxBytes: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_BYTES", 1024 * 1024, { min: 1, max: 100 * 1024 * 1024 }),
       maxItems: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_ITEMS", 4, { min: 0, max: 10000 }),
       maxTotalItems: integerEnv("OPENCODE_LLM_PROXY_MAX_MEDIA_ITEMS", 64, { min: 1, max: 10000 }),
       maxRedirects: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_REDIRECTS", 3, { min: 0, max: 100 }),
       timeoutMs: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_TIMEOUT_MS", 10000, { min: 1, max: 3600000 }),
     },
   }
+}
+
+const HOP_BY_HOP_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]
+
+// An authHeader names the header that carries the upstream credential. Setting
+// a framing or hop-by-hop header there would corrupt the request, so reject
+// those at load time instead of failing every forwarded call.
+const RESERVED_AUTH_HEADERS = new Set([
+  ...HOP_BY_HOP_HEADERS,
+  "host",
+  "content-length",
+  "content-type",
+])
+
+// Optional direct-upstream passthrough. The config file is local and is never
+// committed: it names an upstream base URL and an optional model prefix.
+// Requests whose model matches are forwarded verbatim (minus the prefix), with
+// no OpenCode session and no tool bridge, so streaming, tools, and large bodies
+// behave exactly like the upstream API.
+function loadPassthroughConfig() {
+  const path = process.env.OPENCODE_LLM_PROXY_PASSTHROUGH_CONFIG
+    ?? join(homedir(), ".config", "opencode", "llm-proxy-passthrough.json")
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"))
+    if (typeof parsed?.baseUrl !== "string" || parsed.baseUrl.trim() === "") return null
+    const url = new URL(parsed.baseUrl)
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null
+    const prefix = typeof parsed.prefix === "string" ? parsed.prefix : ""
+    const unprefixed = parsed.unprefixed === true
+    // An empty prefix with unprefixed discovery disabled would make every
+    // request read and replay its body for no reason.
+    if (!prefix && !unprefixed) return null
+    const apiKey = typeof parsed.apiKey === "string" && parsed.apiKey.trim() !== ""
+      ? parsed.apiKey
+      : undefined
+    const authHeader = typeof parsed.authHeader === "string" && parsed.authHeader.trim() !== ""
+      ? parsed.authHeader.trim().toLowerCase()
+      : "authorization"
+    if (RESERVED_AUTH_HEADERS.has(authHeader)) return null
+    // Reject an invalid header name or value at load time instead of failing a
+    // request: Headers rejects both, so a key with a newline cannot slip in.
+    try {
+      new Headers({ [authHeader]: apiKey ?? "probe" })
+    } catch {
+      return null
+    }
+    return {
+      prefix,
+      baseUrl: parsed.baseUrl.replace(/\/+$/, ""),
+      unprefixed,
+      apiKey,
+      authHeader,
+    }
+  } catch {
+    return null
+  }
+}
+
+function applyUpstreamAuth(headers, config) {
+  if (!config.apiKey) return headers
+  headers.set(
+    config.authHeader,
+    config.authHeader === "authorization" ? `Bearer ${config.apiKey}` : config.apiKey,
+  )
+  return headers
+}
+
+function stripHopByHop(headers, source) {
+  // RFC 9110: a Connection header can list additional hop-by-hop fields.
+  for (const token of (source.get("connection") ?? "").split(",")) {
+    const name = token.trim().toLowerCase()
+    if (name) headers.delete(name)
+  }
+  for (const name of HOP_BY_HOP_HEADERS) headers.delete(name)
+  return headers
+}
+
+function passthroughHeaders(request, config) {
+  const headers = stripHopByHop(new Headers(request.headers), request.headers)
+  headers.delete("host")
+  headers.delete("content-length")
+  headers.delete("authorization")
+  headers.delete("x-api-key")
+  headers.delete("anthropic-api-key")
+  headers.set("content-type", "application/json")
+  return applyUpstreamAuth(headers, config)
 }
 
 function commonHeaders(request, config) {
@@ -254,7 +357,7 @@ function isPlainObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value))
 }
 
-async function readJsonBody(request, maxBytes, signal) {
+async function readTextBody(request, maxBytes, signal) {
   const declared = Number(request.headers.get("content-length"))
   if (Number.isFinite(declared) && declared > maxBytes) {
     throw new ProxyError("Request body is too large.", 413, "request_too_large")
@@ -291,15 +394,25 @@ async function readJsonBody(request, maxBytes, signal) {
       }
       chunks.push(value)
     }
-    const body = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"))
-    if (!isPlainObject(body)) throw new ProxyError("Request body must be a JSON object.", 400, "invalid_json")
-    return body
+    return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8")
   } catch (error) {
     if (error instanceof ProxyError) throw error
     throw new ProxyError("Request body must be valid JSON.", 400, "invalid_json")
   } finally {
     signal?.removeEventListener("abort", onAbort)
     reader.releaseLock()
+  }
+}
+
+async function readJsonBody(request, maxBytes, signal) {
+  const text = await readTextBody(request, maxBytes, signal)
+  try {
+    const body = JSON.parse(text)
+    if (!isPlainObject(body)) throw new ProxyError("Request body must be a JSON object.", 400, "invalid_json")
+    return body
+  } catch (error) {
+    if (error instanceof ProxyError) throw error
+    throw new ProxyError("Request body must be valid JSON.", 400, "invalid_json")
   }
 }
 
@@ -2138,8 +2251,75 @@ function geminiModelFromPath(pathname) {
   return match ? decodeURIComponent(match[1]) : null
 }
 
+const PASSTHROUGH_PATHS = new Set(["/v1/chat/completions", "/v1/responses", "/v1/messages"])
+const UPSTREAM_MODELS_TTL_MS = 60_000
+
 export function createProxyFetchHandler(client) {
   const config = loadConfig()
+  const passthrough = loadPassthroughConfig()
+  let upstreamModelsCache = null
+
+  // Accept both prefixed model ids and the upstream's own ids, so a client
+  // that omits the prefix still gets a transparent passthrough instead of the
+  // OpenCode session path.
+  async function isUpstreamModel(model) {
+    if (!passthrough.unprefixed) return false
+    const now = Date.now()
+    if (!upstreamModelsCache || now - upstreamModelsCache.at > UPSTREAM_MODELS_TTL_MS) {
+      let ids = new Set()
+      try {
+        const response = await fetch(`${passthrough.baseUrl}/v1/models`, {
+          headers: applyUpstreamAuth(new Headers(), passthrough),
+          signal: AbortSignal.timeout(3000),
+        })
+        if (response.ok) {
+          const data = await response.json()
+          ids = new Set((data?.data ?? [])
+            .map((entry) => entry?.id)
+            .filter((id) => typeof id === "string"))
+        }
+      } catch {
+        // Model discovery is best-effort; prefixed requests still work.
+      }
+      upstreamModelsCache = { at: now, ids }
+    }
+    return upstreamModelsCache.ids.has(model)
+  }
+
+  async function proxyPassthrough(request, url, body, upstreamModel) {
+    const upstreamBody = JSON.stringify({ ...body, model: upstreamModel })
+    const headers = passthroughHeaders(request, passthrough)
+
+    let upstream
+    try {
+      upstream = await fetch(`${passthrough.baseUrl}${url.pathname}${url.search}`, {
+        method: "POST",
+        headers,
+        body: upstreamBody,
+        signal: request.signal,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      await safeLog(client, "error", "Passthrough request failed", {
+        error: message,
+        path: url.pathname,
+      })
+      return badRequest(`Passthrough request failed: ${message}`, 502, request)
+    }
+
+    // fetch has already decoded the body, so content-encoding no longer
+    // applies. Strip hop-by-hop fields in both directions as well: Bun's server
+    // handles connection framing itself.
+    const responseHeaders = stripHopByHop(new Headers(upstream.headers), upstream.headers)
+    responseHeaders.delete("content-encoding")
+    responseHeaders.delete("content-length")
+    responseHeaders.set("x-opencode-passthrough", "true")
+    for (const [key, value] of Object.entries(commonHeaders(request, config))) {
+      responseHeaders.set(key, value)
+    }
+    return new Response(upstream.body, { status: upstream.status, headers: responseHeaders })
+  }
+
   const handleRequest = async (request) => {
     const url = new URL(request.url)
     const origin = request.headers.get("origin")
@@ -2162,6 +2342,51 @@ export function createProxyFetchHandler(client) {
 
     if (!isAuthorized(request, config)) {
       return unauthorized(request)
+    }
+
+    if (passthrough && request.method === "POST" && PASSTHROUGH_PATHS.has(url.pathname)) {
+      let rawBody
+      try {
+        rawBody = await readTextBody(request, config.maxRequestBytes, request.signal)
+      } catch (error) {
+        if (error instanceof ProxyError) {
+          return badRequest(error.message, error.status, request, error.code)
+        }
+        return badRequest("Failed to read request body.", 400, request)
+      }
+      let parsedBody
+      try {
+        parsedBody = JSON.parse(rawBody)
+      } catch {
+        // Leave malformed JSON to the endpoint-specific handler so each API
+        // keeps its native error shape (for example Anthropic's `type: error`).
+        parsedBody = undefined
+      }
+
+      if (typeof parsedBody?.model === "string") {
+        if (passthrough.prefix && parsedBody.model.startsWith(passthrough.prefix)) {
+          return proxyPassthrough(
+            request,
+            url,
+            parsedBody,
+            parsedBody.model.slice(passthrough.prefix.length),
+          )
+        }
+        if (passthrough.unprefixed && await isUpstreamModel(parsedBody.model)) {
+          return proxyPassthrough(request, url, parsedBody, parsedBody.model)
+        }
+      }
+
+      // Not a passthrough model: replay the consumed body for the regular
+      // OpenCode-backed handler.
+      const replayHeaders = new Headers(request.headers)
+      replayHeaders.delete("content-length")
+      request = new Request(request.url, {
+        method: request.method,
+        headers: replayHeaders,
+        body: rawBody,
+        signal: request.signal,
+      })
     }
 
     const started = Date.now()
