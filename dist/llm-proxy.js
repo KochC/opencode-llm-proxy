@@ -2,6 +2,9 @@
 import { fileURLToPath } from "node:url";
 import { Buffer as Buffer2 } from "node:buffer";
 import { timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 // canonical-messages.js
 function isObject(value) {
@@ -1432,7 +1435,10 @@ function getState() {
 }
 var DEFAULTS = Object.freeze({
   requestTimeoutMs: 12e4,
-  maxRequestBytes: 1024 * 1024,
+  // Coding agents routinely send whole-session compaction prompts above 1 MiB.
+  // Keep a bounded default, but do not reject an otherwise valid request at
+  // the old 1 MiB mark. Override with OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES.
+  maxRequestBytes: 32 * 1024 * 1024,
   maxConcurrentRequests: 8,
   maxQueuedRequests: 32,
   bridgeAcquireTimeoutMs: 1e4,
@@ -1516,13 +1522,28 @@ function loadConfig() {
     remoteMedia: {
       enabled: booleanEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_ENABLED"),
       allowedSchemes: jsonArrayEnvDefault("OPENCODE_LLM_PROXY_REMOTE_MEDIA_ALLOWED_SCHEMES", ["https"]),
-      maxBytes: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_BYTES", maxRequestBytes || 1024 * 1024, { min: 1, max: 100 * 1024 * 1024 }),
+      // Keep the media download budget independent: raising the JSON body cap
+      // must not silently raise how much the proxy will fetch from remote URLs.
+      maxBytes: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_BYTES", 1024 * 1024, { min: 1, max: 100 * 1024 * 1024 }),
       maxItems: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_ITEMS", 4, { min: 0, max: 1e4 }),
       maxTotalItems: integerEnv("OPENCODE_LLM_PROXY_MAX_MEDIA_ITEMS", 64, { min: 1, max: 1e4 }),
       maxRedirects: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_REDIRECTS", 3, { min: 0, max: 100 }),
       timeoutMs: integerEnv("OPENCODE_LLM_PROXY_REMOTE_MEDIA_TIMEOUT_MS", 1e4, { min: 1, max: 36e5 })
     }
   };
+}
+function loadPassthroughConfig() {
+  const path = process.env.OPENCODE_LLM_PROXY_PASSTHROUGH_CONFIG ?? join(homedir(), ".config", "opencode", "llm-proxy-passthrough.json");
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (typeof parsed?.baseUrl !== "string" || parsed.baseUrl.trim() === "") return null;
+    const url = new URL(parsed.baseUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    const prefix = typeof parsed.prefix === "string" ? parsed.prefix : "";
+    return { prefix, baseUrl: parsed.baseUrl.replace(/\/+$/, "") };
+  } catch {
+    return null;
+  }
 }
 function commonHeaders(request, config) {
   return {
@@ -3105,8 +3126,64 @@ function geminiModelFromPath(pathname) {
   const match = pathname.match(/^\/v1beta\/models\/(.+):(?:generateContent|streamGenerateContent)$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
+var PASSTHROUGH_PATHS = /* @__PURE__ */ new Set(["/v1/chat/completions", "/v1/responses", "/v1/messages"]);
+var UPSTREAM_MODELS_TTL_MS = 6e4;
 function createProxyFetchHandler(client) {
   const config = loadConfig();
+  const passthrough = loadPassthroughConfig();
+  let upstreamModelsCache = null;
+  async function isUpstreamModel(model) {
+    const now = Date.now();
+    if (!upstreamModelsCache || now - upstreamModelsCache.at > UPSTREAM_MODELS_TTL_MS) {
+      let ids = /* @__PURE__ */ new Set();
+      try {
+        const response = await fetch(`${passthrough.baseUrl}/v1/models`, {
+          signal: AbortSignal.timeout(3e3)
+        });
+        if (response.ok) {
+          const data = await response.json();
+          ids = new Set((data?.data ?? []).map((entry) => entry?.id).filter((id) => typeof id === "string"));
+        }
+      } catch {
+      }
+      upstreamModelsCache = { at: now, ids };
+    }
+    return upstreamModelsCache.ids.has(model);
+  }
+  async function proxyPassthrough(request, url, body, upstreamModel) {
+    const upstreamBody = JSON.stringify({ ...body, model: upstreamModel });
+    const headers = new Headers(request.headers);
+    headers.delete("host");
+    headers.delete("content-length");
+    headers.delete("authorization");
+    headers.delete("x-api-key");
+    headers.delete("anthropic-api-key");
+    headers.set("content-type", "application/json");
+    let upstream;
+    try {
+      upstream = await fetch(`${passthrough.baseUrl}${url.pathname}${url.search}`, {
+        method: "POST",
+        headers,
+        body: upstreamBody,
+        signal: request.signal
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await safeLog(client, "error", "Passthrough request failed", {
+        error: message,
+        path: url.pathname
+      });
+      return badRequest(`Passthrough request failed: ${message}`, 502, request);
+    }
+    const responseHeaders = new Headers(upstream.headers);
+    responseHeaders.delete("content-encoding");
+    responseHeaders.delete("content-length");
+    responseHeaders.set("x-opencode-passthrough", "true");
+    for (const [key, value] of Object.entries(commonHeaders(request, config))) {
+      responseHeaders.set(key, value);
+    }
+    return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
+  }
   const handleRequest = async (request) => {
     const url = new URL(request.url);
     const origin = request.headers.get("origin");
@@ -3125,6 +3202,41 @@ function createProxyFetchHandler(client) {
     }
     if (!isAuthorized(request, config)) {
       return unauthorized(request);
+    }
+    if (passthrough && request.method === "POST" && PASSTHROUGH_PATHS.has(url.pathname)) {
+      let rawBody;
+      try {
+        rawBody = await request.text();
+      } catch {
+        return badRequest("Failed to read request body.", 400, request);
+      }
+      let parsedBody;
+      try {
+        parsedBody = JSON.parse(rawBody);
+      } catch {
+        parsedBody = void 0;
+      }
+      if (typeof parsedBody?.model === "string") {
+        if (passthrough.prefix && parsedBody.model.startsWith(passthrough.prefix)) {
+          return proxyPassthrough(
+            request,
+            url,
+            parsedBody,
+            parsedBody.model.slice(passthrough.prefix.length)
+          );
+        }
+        if (await isUpstreamModel(parsedBody.model)) {
+          return proxyPassthrough(request, url, parsedBody, parsedBody.model);
+        }
+      }
+      const replayHeaders = new Headers(request.headers);
+      replayHeaders.delete("content-length");
+      request = new Request(request.url, {
+        method: request.method,
+        headers: replayHeaders,
+        body: rawBody,
+        signal: request.signal
+      });
     }
     const started = Date.now();
     const context = createRequestSignal(request, config.requestTimeoutMs);

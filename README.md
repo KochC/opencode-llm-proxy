@@ -71,6 +71,7 @@ See also: [Security](docs/security.md) · [Comparisons](docs/comparisons.md) · 
 - [Quickstart](#quickstart)
 - [Install](#install)
 - [Configuration](#configuration)
+  - [Direct upstream passthrough](#direct-upstream-passthrough)
 - [Tool calling](#tool-calling)
 - [Using with SDKs and tools](#using-with-sdks-and-tools)
   - [n8n](#n8n)
@@ -190,7 +191,8 @@ curl -o .opencode/plugins/llm-proxy.js \
 | `OPENCODE_LLM_PROXY_ALLOW_PRIVATE_NETWORK` | `false` | Set to `true` to allow browser Private Network Access preflights. |
 | `OPENCODE_LLM_PROXY_REQUEST_TIMEOUT_MS` | `120000` | Total request timeout, from 1 to 3,600,000 ms. |
 | `OPENCODE_LLM_PROXY_IDLE_TIMEOUT_SECONDS` | request timeout + 5 s | Seconds a connection may stay silent before the server closes it, from 0 (disabled) to 255. Defaults to the request timeout plus 5 s, or 0 when that exceeds 255 s. |
-| `OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES` | `1048576` | Maximum JSON request body and embedded data-URL size, up to 100 MiB. |
+| `OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES` | `33554432` | Maximum JSON request body and embedded data-URL size, up to 100 MiB. The 32 MiB default accommodates whole-session compaction prompts. |
+| `OPENCODE_LLM_PROXY_PASSTHROUGH_CONFIG` | `~/.config/opencode/llm-proxy-passthrough.json` | Path to a JSON passthrough config (`baseUrl`, optional `prefix`). Missing or invalid config disables passthrough. Keep this file local. |
 | `OPENCODE_LLM_PROXY_MAX_CONCURRENT_REQUESTS` | `8` | Maximum active POST requests. |
 | `OPENCODE_LLM_PROXY_MAX_QUEUED_REQUESTS` | `32` | Maximum POST requests waiting for capacity; excess requests receive `503`. |
 | `OPENCODE_LLM_PROXY_TOOL_BRIDGE_POOL_SIZE` | `8` | Max concurrent in-flight requests using [tool calling](#tool-calling). |
@@ -202,7 +204,7 @@ curl -o .opencode/plugins/llm-proxy.js \
 | `OPENCODE_LLM_PROXY_METRICS_ENABLED` | `false` | Set to `true` to expose the authenticated Prometheus endpoint at `GET /metrics`. |
 | `OPENCODE_LLM_PROXY_REMOTE_MEDIA_ENABLED` | `false` | Set to `true` to fetch remote media URLs and convert them to embedded data URLs. Leave disabled unless required. |
 | `OPENCODE_LLM_PROXY_REMOTE_MEDIA_ALLOWED_SCHEMES` | `["https"]` | JSON array of allowed remote URL schemes (`https` and, if explicitly enabled, `http`). HTTPS-only is strongly recommended. |
-| `OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_BYTES` | value of `OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES` (`1048576` by default) | Maximum downloaded bytes per remote media item, up to 100 MiB. |
+| `OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_BYTES` | `1048576` | Maximum downloaded bytes per remote media item, up to 100 MiB. |
 | `OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_ITEMS` | `4` | Maximum remote media downloads in one request, from 0 to 10,000. |
 | `OPENCODE_LLM_PROXY_MAX_MEDIA_ITEMS` | `64` | Maximum total embedded and remote media items in one request. |
 | `OPENCODE_LLM_PROXY_REMOTE_MEDIA_MAX_REDIRECTS` | `3` | Maximum redirects per remote media download, from 0 to 100. |
@@ -216,6 +218,29 @@ Generation `temperature`, top-p (`top_p`/`topP`), top-k (`topK`), and maximum ou
 The proxy returns a single choice and cannot forward `stop`, `seed`, `frequency_penalty`, `presence_penalty`, `logprobs`, or `n` to OpenCode, so a request that asks for *different* behaviour with them gets `400`. Values that mean "unset" or match the default are accepted and ignored, because rejecting them only breaks clients that always send them: `n: 1`, empty or all-empty `stop` arrays, `seed: null`, `frequency_penalty: 0`, `presence_penalty: 0`, `logprobs: false`, and `null` for any of these. For example, VS Code sends `n: 1` on every request, and several SDKs send `null` for each optional field.
 
 When an upstream call fails, the error names the reason the provider gave (for example `Upstream request failed: Free usage limit reached`) instead of a bare `Upstream request failed.` Credentials that a provider echoes back are redacted, and the text is truncated to 500 characters, so the detail is useful without exposing a key or token.
+
+### Direct upstream passthrough
+
+For clients that already speak an upstream's native API, the proxy can forward requests **verbatim** instead of running them through an OpenCode session and tool bridge. This preserves the upstream's own streaming, tool-call, and error behavior, and bypasses the proxy's request-body cap.
+
+Create a local config file (`~/.config/opencode/llm-proxy-passthrough.json` by default, or point `OPENCODE_LLM_PROXY_PASSTHROUGH_CONFIG` at another path):
+
+```json
+{
+  "baseUrl": "https://upstream.example.com",
+  "prefix": "upstream/"
+}
+```
+
+- `POST /v1/chat/completions`, `POST /v1/responses`, and `POST /v1/messages` are eligible.
+- A model that starts with `prefix` is forwarded to `baseUrl` with the prefix removed (`upstream/model-a` → `model-a`).
+- A model that the upstream lists in `GET /v1/models` is forwarded unchanged, even without the prefix.
+- The proxy's own bearer auth and CORS checks still apply. The caller's `Authorization`, `x-api-key`, and `anthropic-api-key` headers are removed before forwarding.
+- Passthrough requests bypass the proxy's concurrency queue and request timeout; the upstream's own limits apply.
+- Responses carry `x-opencode-passthrough: true`.
+- The file is read at plugin start. Do not commit it; it may contain an internal endpoint.
+
+Requests for models that match neither rule continue through the normal OpenCode-backed path.
 
 ### Session lifecycle (safe teardown)
 

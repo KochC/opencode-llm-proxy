@@ -2,6 +2,9 @@ import test, { describe, it, after, beforeEach } from "node:test"
 import assert from "node:assert/strict"
 import { setTimeout as delay } from "node:timers/promises"
 import { PassThrough } from "node:stream"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 import * as mod from "./index.js"
 import {
@@ -353,6 +356,172 @@ test("any configured bearer token is accepted", async () => {
     }))
     assert.equal(response.status, 200)
   }
+})
+
+// ---------------------------------------------------------------------------
+// Integration: direct upstream passthrough
+// ---------------------------------------------------------------------------
+
+async function withPassthroughConfig(config, fn) {
+  const dir = mkdtempSync(join(tmpdir(), "llm-proxy-passthrough-"))
+  const file = join(dir, "passthrough.json")
+  writeFileSync(file, JSON.stringify(config))
+  process.env.OPENCODE_LLM_PROXY_PASSTHROUGH_CONFIG = file
+  try {
+    return await fn()
+  } finally {
+    delete process.env.OPENCODE_LLM_PROXY_PASSTHROUGH_CONFIG
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+async function withMockUpstream(fn) {
+  const calls = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url, init = {}) => {
+    const body = typeof init.body === "string" ? JSON.parse(init.body) : null
+    calls.push({
+      url: String(url),
+      body,
+      headers: new Headers(init.headers ?? {}),
+    })
+    if (String(url).endsWith("/v1/models")) {
+      return Response.json({ data: [{ id: "model-a" }, { id: "model-b" }] })
+    }
+    return new Response("upstream-body", {
+      status: 200,
+      headers: { "content-type": "text/plain", "x-upstream": "yes" },
+    })
+  }
+  try {
+    return await fn(calls)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+}
+
+test("passthrough forwards a prefixed model verbatim and strips proxy auth", async () => {
+  await withPassthroughConfig({ baseUrl: "http://upstream.test/", prefix: "up/" }, async () => {
+    await withMockUpstream(async (calls) => {
+      const handler = createProxyFetchHandler(createClient())
+      const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer proxy-token",
+          "x-request-id": "req-1",
+        },
+        body: JSON.stringify({ model: "up/model-a", input: "hi", stream: true }),
+      }))
+
+      assert.equal(response.status, 200)
+      assert.equal(response.headers.get("x-opencode-passthrough"), "true")
+      assert.equal(response.headers.get("x-upstream"), "yes")
+      assert.equal(await response.text(), "upstream-body")
+
+      const call = calls.find((entry) => entry.url.endsWith("/v1/responses"))
+      assert.equal(call.url, "http://upstream.test/v1/responses")
+      assert.equal(call.body.model, "model-a")
+      assert.equal(call.headers.get("authorization"), null)
+      assert.equal(call.headers.get("x-request-id"), "req-1")
+    })
+  })
+})
+
+test("passthrough accepts an upstream model id without the prefix", async () => {
+  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
+    await withMockUpstream(async (calls) => {
+      const handler = createProxyFetchHandler(createClient())
+      const response = await handler(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "model-b",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }))
+
+      assert.equal(response.status, 200)
+      assert.equal(response.headers.get("x-opencode-passthrough"), "true")
+      assert.equal(calls.filter((entry) => entry.url.endsWith("/v1/models")).length, 1)
+      const call = calls.find((entry) => entry.url.endsWith("/v1/chat/completions"))
+      assert.equal(call.body.model, "model-b")
+    })
+  })
+})
+
+test("passthrough bypasses the normal request-body cap", async () => {
+  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
+    await withMockUpstream(async (calls) => {
+      const handler = createProxyFetchHandler(createClient())
+      const input = "x".repeat(2 * 1024 * 1024)
+      const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "up/model-a", input }),
+      }))
+
+      assert.equal(response.status, 200)
+      const call = calls.find((entry) => entry.url.endsWith("/v1/responses"))
+      assert.equal(call.body.input.length, input.length)
+    })
+  })
+})
+
+test("a non-upstream model still uses the normal OpenCode path", async () => {
+  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
+    await withMockUpstream(async (calls) => {
+      const handler = createProxyFetchHandler(createModelsClient([]))
+      const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "other/model-x", input: "hi" }),
+      }))
+
+      assert.equal(response.status, 400)
+      assert.equal(response.headers.get("x-opencode-passthrough"), null)
+      assert.equal(calls.some((entry) => entry.url.endsWith("/v1/responses")), false)
+      assert.equal(calls.filter((entry) => entry.url.endsWith("/v1/models")).length, 1)
+    })
+  })
+})
+
+test("passthrough still enforces the proxy bearer token", async () => {
+  process.env.OPENCODE_LLM_PROXY_TOKEN = "secret-token"
+  try {
+    await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
+      await withMockUpstream(async (calls) => {
+        const handler = createProxyFetchHandler(createClient())
+        const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "up/model-a", input: "hi" }),
+        }))
+
+        assert.equal(response.status, 401)
+        assert.equal(calls.length, 0)
+      })
+    })
+  } finally {
+    delete process.env.OPENCODE_LLM_PROXY_TOKEN
+  }
+})
+
+test("an invalid passthrough base URL disables passthrough", async () => {
+  await withPassthroughConfig({ baseUrl: "file:///etc/passwd", prefix: "up/" }, async () => {
+    await withMockUpstream(async (calls) => {
+      const handler = createProxyFetchHandler(createModelsClient([]))
+      const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "up/model-a", input: "hi" }),
+      }))
+
+      assert.equal(response.status, 400)
+      assert.equal(response.headers.get("x-opencode-passthrough"), null)
+      assert.equal(calls.length, 0)
+    })
+  })
 })
 
 // ---------------------------------------------------------------------------
