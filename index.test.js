@@ -1427,6 +1427,47 @@ test("POST /v1/responses stream: true returns SSE lifecycle events", async () =>
   assert.ok(text.includes("response.completed"))
 })
 
+test("POST /v1/responses stream: true includes the final output array on response.completed (text turn)", async () => {
+  const events = [
+    {
+      type: "message.part.delta",
+      properties: { sessionID: "sess-123", field: "text", delta: "The answer" },
+    },
+    {
+      type: "message.part.delta",
+      properties: { sessionID: "sess-123", field: "text", delta: " is 42." },
+    },
+    { type: "session.idle", properties: { sessionID: "sess-123" } },
+  ]
+
+  const handler = createProxyFetchHandler(createStreamingClient(events))
+  const request = new Request("http://127.0.0.1:4010/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      input: "What is 6 times 7?",
+    }),
+  })
+
+  const response = await handler(request)
+  const completed = parseSseStream(await response.text())
+    .find((entry) => entry.event === "response.completed")
+
+  // Clients such as langchainjs-openai build the final message from
+  // response.output and throw on `response.output.map(...)` when it is missing.
+  assert.ok(completed)
+  const output = completed.data.response.output
+  assert.ok(Array.isArray(output))
+  assert.equal(output.length, 1)
+  assert.equal(output[0].type, "message")
+  assert.equal(output[0].role, "assistant")
+  assert.deepEqual(output[0].content, [
+    { type: "output_text", text: "The answer is 42.", annotations: [] },
+  ])
+})
+
 test("POST /v1/responses stream: true emits content_part.done with accumulated text per OpenAI spec", async () => {
   const events = [
     {
@@ -2968,6 +3009,36 @@ test("POST /v1/responses stream: true emits function_call SSE events", async () 
   assert.ok(text.includes("response.function_call_arguments.done"))
   assert.ok(text.includes("get_weather"))
   assert.ok(text.includes('"type":"function_call"'))
+})
+
+test("POST /v1/responses stream: true includes function_call items in response.completed output", async () => {
+  const client = createToolCallClient({ toolName: "get_weather", toolArgs: { city: "NYC" } })
+  const handler = createProxyFetchHandler(client)
+  const request = new Request("http://127.0.0.1:4010/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      input: "What's the weather in NYC?",
+      tools: [{ type: "function", name: "get_weather" }],
+    }),
+  })
+
+  const response = await handler(request)
+  const completed = parseSseStream(await response.text())
+    .find((entry) => entry.event === "response.completed")
+
+  // Same contract as the text turn: the aggregated output must be present.
+  assert.ok(completed)
+  const output = completed.data.response.output
+  assert.ok(Array.isArray(output))
+  assert.equal(output.length, 1)
+  assert.equal(output[0].type, "function_call")
+  assert.equal(output[0].status, "completed")
+  assert.equal(output[0].call_id, "call_1")
+  assert.equal(output[0].name, "get_weather")
+  assert.deepEqual(JSON.parse(output[0].arguments), { city: "NYC" })
 })
 
 test("tool_choice: none disables tool calling even when tools are supplied", async () => {
