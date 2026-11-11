@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.12.2](https://github.com/KochC/opencode-llm-proxy/compare/v1.12.1...v1.12.2) (2026-11-11)
+
+
+### Bug Fixes
+
+* include response.output on /v1/responses response.completed for streamed turns ([#120](https://github.com/KochC/opencode-llm-proxy/issues/120)) ([09224c0](https://github.com/KochC/opencode-llm-proxy/commit/09224c008f326ef154ce219d520cc7e269954345))
+
 ## [1.12.1](https://github.com/KochC/opencode-llm-proxy/compare/v1.12.0...v1.12.1) (2026-11-10)
 
 
