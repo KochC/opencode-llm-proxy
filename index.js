@@ -157,10 +157,69 @@ function loadPassthroughConfig() {
     const url = new URL(parsed.baseUrl)
     if (url.protocol !== "http:" && url.protocol !== "https:") return null
     const prefix = typeof parsed.prefix === "string" ? parsed.prefix : ""
-    return { prefix, baseUrl: parsed.baseUrl.replace(/\/+$/, "") }
+    const unprefixed = parsed.unprefixed === true
+    // An empty prefix with unprefixed discovery disabled would make every
+    // request read and replay its body for no reason.
+    if (!prefix && !unprefixed) return null
+    const apiKey = typeof parsed.apiKey === "string" && parsed.apiKey.trim() !== ""
+      ? parsed.apiKey
+      : undefined
+    const authHeader = typeof parsed.authHeader === "string" && parsed.authHeader.trim() !== ""
+      ? parsed.authHeader.trim().toLowerCase()
+      : "authorization"
+    // Reject an invalid header name at load time instead of failing a request.
+    try {
+      new Headers({ [authHeader]: "probe" })
+    } catch {
+      return null
+    }
+    return {
+      prefix,
+      baseUrl: parsed.baseUrl.replace(/\/+$/, ""),
+      unprefixed,
+      apiKey,
+      authHeader,
+    }
   } catch {
     return null
   }
+}
+
+const HOP_BY_HOP_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]
+
+function applyUpstreamAuth(headers, config) {
+  if (!config.apiKey) return headers
+  headers.set(
+    config.authHeader,
+    config.authHeader === "authorization" ? `Bearer ${config.apiKey}` : config.apiKey,
+  )
+  return headers
+}
+
+function passthroughHeaders(request, config) {
+  const headers = new Headers(request.headers)
+  // RFC 9110: a Connection header can list additional hop-by-hop fields.
+  for (const token of (request.headers.get("connection") ?? "").split(",")) {
+    const name = token.trim().toLowerCase()
+    if (name) headers.delete(name)
+  }
+  for (const name of HOP_BY_HOP_HEADERS) headers.delete(name)
+  headers.delete("host")
+  headers.delete("content-length")
+  headers.delete("authorization")
+  headers.delete("x-api-key")
+  headers.delete("anthropic-api-key")
+  headers.set("content-type", "application/json")
+  return applyUpstreamAuth(headers, config)
 }
 
 function commonHeaders(request, config) {
@@ -282,7 +341,7 @@ function isPlainObject(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value))
 }
 
-async function readJsonBody(request, maxBytes, signal) {
+async function readTextBody(request, maxBytes, signal) {
   const declared = Number(request.headers.get("content-length"))
   if (Number.isFinite(declared) && declared > maxBytes) {
     throw new ProxyError("Request body is too large.", 413, "request_too_large")
@@ -319,15 +378,25 @@ async function readJsonBody(request, maxBytes, signal) {
       }
       chunks.push(value)
     }
-    const body = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"))
-    if (!isPlainObject(body)) throw new ProxyError("Request body must be a JSON object.", 400, "invalid_json")
-    return body
+    return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8")
   } catch (error) {
     if (error instanceof ProxyError) throw error
     throw new ProxyError("Request body must be valid JSON.", 400, "invalid_json")
   } finally {
     signal?.removeEventListener("abort", onAbort)
     reader.releaseLock()
+  }
+}
+
+async function readJsonBody(request, maxBytes, signal) {
+  const text = await readTextBody(request, maxBytes, signal)
+  try {
+    const body = JSON.parse(text)
+    if (!isPlainObject(body)) throw new ProxyError("Request body must be a JSON object.", 400, "invalid_json")
+    return body
+  } catch (error) {
+    if (error instanceof ProxyError) throw error
+    throw new ProxyError("Request body must be valid JSON.", 400, "invalid_json")
   }
 }
 
@@ -2178,11 +2247,13 @@ export function createProxyFetchHandler(client) {
   // that omits the prefix still gets a transparent passthrough instead of the
   // OpenCode session path.
   async function isUpstreamModel(model) {
+    if (!passthrough.unprefixed) return false
     const now = Date.now()
     if (!upstreamModelsCache || now - upstreamModelsCache.at > UPSTREAM_MODELS_TTL_MS) {
       let ids = new Set()
       try {
         const response = await fetch(`${passthrough.baseUrl}/v1/models`, {
+          headers: applyUpstreamAuth(new Headers(), passthrough),
           signal: AbortSignal.timeout(3000),
         })
         if (response.ok) {
@@ -2201,13 +2272,7 @@ export function createProxyFetchHandler(client) {
 
   async function proxyPassthrough(request, url, body, upstreamModel) {
     const upstreamBody = JSON.stringify({ ...body, model: upstreamModel })
-    const headers = new Headers(request.headers)
-    headers.delete("host")
-    headers.delete("content-length")
-    headers.delete("authorization")
-    headers.delete("x-api-key")
-    headers.delete("anthropic-api-key")
-    headers.set("content-type", "application/json")
+    const headers = passthroughHeaders(request, passthrough)
 
     let upstream
     try {
@@ -2263,8 +2328,11 @@ export function createProxyFetchHandler(client) {
     if (passthrough && request.method === "POST" && PASSTHROUGH_PATHS.has(url.pathname)) {
       let rawBody
       try {
-        rawBody = await request.text()
-      } catch {
+        rawBody = await readTextBody(request, config.maxRequestBytes, request.signal)
+      } catch (error) {
+        if (error instanceof ProxyError) {
+          return badRequest(error.message, error.status, request, error.code)
+        }
         return badRequest("Failed to read request body.", 400, request)
       }
       let parsedBody
@@ -2285,7 +2353,7 @@ export function createProxyFetchHandler(client) {
             parsedBody.model.slice(passthrough.prefix.length),
           )
         }
-        if (await isUpstreamModel(parsedBody.model)) {
+        if (passthrough.unprefixed && await isUpstreamModel(parsedBody.model)) {
           return proxyPassthrough(request, url, parsedBody, parsedBody.model)
         }
       }

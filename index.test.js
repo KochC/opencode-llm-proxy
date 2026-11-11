@@ -428,8 +428,8 @@ test("passthrough forwards a prefixed model verbatim and strips proxy auth", asy
   })
 })
 
-test("passthrough accepts an upstream model id without the prefix", async () => {
-  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
+test("passthrough accepts an upstream model id without the prefix when opted in", async () => {
+  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/", unprefixed: true }, async () => {
     await withMockUpstream(async (calls) => {
       const handler = createProxyFetchHandler(createClient())
       const response = await handler(new Request("http://127.0.0.1:4010/v1/chat/completions", {
@@ -448,6 +448,114 @@ test("passthrough accepts an upstream model id without the prefix", async () => 
       assert.equal(call.body.model, "model-b")
     })
   })
+})
+
+test("passthrough does not take over an unprefixed model unless opted in", async () => {
+  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
+    await withMockUpstream(async (calls) => {
+      const handler = createProxyFetchHandler(createModelsClient([]))
+      const response = await handler(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "model-b",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }))
+
+      assert.equal(response.status, 400)
+      assert.equal(response.headers.get("x-opencode-passthrough"), null)
+      assert.equal(calls.filter((entry) => entry.url.endsWith("/v1/models")).length, 0)
+    })
+  })
+})
+
+test("passthrough applies a configured upstream bearer credential", async () => {
+  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/", apiKey: "upstream-secret" }, async () => {
+    await withMockUpstream(async (calls) => {
+      const handler = createProxyFetchHandler(createClient())
+      const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer proxy-token" },
+        body: JSON.stringify({ model: "up/model-a", input: "hi" }),
+      }))
+
+      assert.equal(response.status, 200)
+      const call = calls.find((entry) => entry.url.endsWith("/v1/responses"))
+      assert.equal(call.headers.get("authorization"), "Bearer upstream-secret")
+    })
+  })
+})
+
+test("passthrough applies a configured upstream custom auth header", async () => {
+  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/", apiKey: "upstream-secret", authHeader: "x-api-key" }, async () => {
+    await withMockUpstream(async (calls) => {
+      const handler = createProxyFetchHandler(createClient())
+      const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer proxy-token" },
+        body: JSON.stringify({ model: "up/model-a", input: "hi" }),
+      }))
+
+      assert.equal(response.status, 200)
+      const call = calls.find((entry) => entry.url.endsWith("/v1/responses"))
+      assert.equal(call.headers.get("x-api-key"), "upstream-secret")
+      assert.equal(call.headers.get("authorization"), null)
+    })
+  })
+})
+
+test("passthrough strips caller hop-by-hop headers", async () => {
+  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
+    await withMockUpstream(async (calls) => {
+      const handler = createProxyFetchHandler(createClient())
+      const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          connection: "x-remove-me",
+          "x-remove-me": "yes",
+          "transfer-encoding": "chunked",
+          te: "trailers",
+          upgrade: "h2c",
+          "keep-alive": "timeout=5",
+          "x-keep": "yes",
+        },
+        body: JSON.stringify({ model: "up/model-a", input: "hi" }),
+      }))
+
+      assert.equal(response.status, 200)
+      const call = calls.find((entry) => entry.url.endsWith("/v1/responses"))
+      for (const name of ["connection", "x-remove-me", "transfer-encoding", "te", "upgrade", "keep-alive"]) {
+        assert.equal(call.headers.get(name), null, `${name} must not be forwarded`)
+      }
+      assert.equal(call.headers.get("x-keep"), "yes")
+    })
+  })
+})
+
+test("passthrough enforces the request-body cap before buffering", async () => {
+  process.env.OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES = "1024"
+  try {
+    await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
+      await withMockUpstream(async (calls) => {
+        const handler = createProxyFetchHandler(createClient())
+        const response = await handler(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "other/model-x",
+            messages: [{ role: "user", content: "x".repeat(4096) }],
+          }),
+        }))
+
+        assert.equal(response.status, 413)
+        assert.equal(calls.length, 0)
+      })
+    })
+  } finally {
+    delete process.env.OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES
+  }
 })
 
 test("passthrough bypasses the normal request-body cap", async () => {
@@ -469,7 +577,7 @@ test("passthrough bypasses the normal request-body cap", async () => {
 })
 
 test("a non-upstream model still uses the normal OpenCode path", async () => {
-  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/" }, async () => {
+  await withPassthroughConfig({ baseUrl: "http://upstream.test", prefix: "up/", unprefixed: true }, async () => {
     await withMockUpstream(async (calls) => {
       const handler = createProxyFetchHandler(createModelsClient([]))
       const response = await handler(new Request("http://127.0.0.1:4010/v1/responses", {

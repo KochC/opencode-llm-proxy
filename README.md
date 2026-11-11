@@ -228,17 +228,23 @@ Create a local config file (`~/.config/opencode/llm-proxy-passthrough.json` by d
 ```json
 {
   "baseUrl": "https://upstream.example.com",
-  "prefix": "upstream/"
+  "prefix": "upstream/",
+  "unprefixed": false,
+  "apiKey": "optional-upstream-key",
+  "authHeader": "authorization"
 }
 ```
 
 - `POST /v1/chat/completions`, `POST /v1/responses`, and `POST /v1/messages` are eligible.
-- A model that starts with `prefix` is forwarded to `baseUrl` with the prefix removed (`upstream/model-a` → `model-a`).
-- A model that the upstream lists in `GET /v1/models` is forwarded unchanged, even without the prefix.
+- A model that starts with `prefix` is forwarded to `baseUrl` with the prefix removed (`upstream/model-a` → `model-a`). Prefix matching always wins.
+- Unprefixed discovery is **opt-in**: with `"unprefixed": true`, a model that the upstream lists in `GET /v1/models` is forwarded unchanged, even without the prefix. Because this can silently shadow a local OpenCode model with the same id, it is off by default.
 - The proxy's own bearer auth and CORS checks still apply. The caller's `Authorization`, `x-api-key`, and `anthropic-api-key` headers are removed before forwarding.
+- If `apiKey` is set, it replaces the caller's credentials. `authHeader` defaults to `authorization`, which is sent as `Bearer <apiKey>`; any other header name (for example `x-api-key`) receives the raw key. The same credential is used for the `GET /v1/models` probe.
+- Hop-by-hop headers (`connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`, `transfer-encoding`, `upgrade`), plus any header named in `Connection`, `host`, `content-length`, and the caller's auth headers are stripped before forwarding.
+- The request body is read with the `OPENCODE_LLM_PROXY_MAX_REQUEST_BYTES` cap **before** forwarding (HTTP 413 when exceeded), including for requests that end up on the normal OpenCode-backed path.
 - Passthrough requests bypass the proxy's concurrency queue and request timeout; the upstream's own limits apply.
 - Responses carry `x-opencode-passthrough: true`.
-- The file is read at plugin start. Do not commit it; it may contain an internal endpoint.
+- The file is read at plugin start. Keep it local and mode `600`; it may contain an internal endpoint or credential. The default path is outside the repository, and `llm-proxy-passthrough.json` is git-ignored.
 
 Requests for models that match neither rule continue through the normal OpenCode-backed path.
 
