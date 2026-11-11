@@ -2535,7 +2535,7 @@ export function createProxyFetchHandler(client) {
               const toolCalls = streamResult.toolCalls ?? []
               if (toolCalls.length > 0) {
                 // Each parallel tool call is its own output item with a distinct output_index.
-                toolCalls.forEach((call, index) => {
+                const outputItems = toolCalls.map((call, index) => {
                   const args = JSON.stringify(call.arguments ?? {})
                   const callItemID = `fc_${crypto.randomUUID().replace(/-/g, "")}`
                   const outputIndex = index
@@ -2569,20 +2569,22 @@ export function createProxyFetchHandler(client) {
                       arguments: args,
                     }),
                   )
+                  const completedItem = {
+                    id: callItemID,
+                    type: "function_call",
+                    status: "completed",
+                    call_id: call.id,
+                    name: call.name,
+                    arguments: args,
+                  }
                   queue.enqueue(
                     sseEvent("response.output_item.done", {
                       type: "response.output_item.done",
                       output_index: outputIndex,
-                      item: {
-                        id: callItemID,
-                        type: "function_call",
-                        status: "completed",
-                        call_id: call.id,
-                        name: call.name,
-                        arguments: args,
-                      },
+                      item: completedItem,
                     }),
                   )
+                  return completedItem
                 })
                 queue.enqueue(
                   sseEvent("response.completed", {
@@ -2593,6 +2595,12 @@ export function createProxyFetchHandler(client) {
                       created_at: now,
                       status: "completed",
                       model: model.id,
+                      // The Responses API includes the final `output` array on
+                      // response.completed (mirroring the empty one on
+                      // response.created). Clients such as langchainjs-openai
+                      // build the aggregated message from it and throw on
+                      // `response.output.map(...)` when the field is missing.
+                      output: outputItems,
                       usage: {
                         input_tokens: streamResult.tokens.input,
                         output_tokens: streamResult.tokens.output,
@@ -2626,11 +2634,18 @@ export function createProxyFetchHandler(client) {
                   }),
                 )
               }
+              const completedMessage = {
+                id: itemID,
+                type: "message",
+                status: "completed",
+                role: "assistant",
+                content: [{ type: "output_text", text: accumulatedText, annotations: [] }],
+              }
               queue.enqueue(
                 sseEvent("response.output_item.done", {
                   type: "response.output_item.done",
                   output_index: 0,
-                  item: { id: itemID, type: "message", status: "completed", role: "assistant" },
+                  item: completedMessage,
                 }),
               )
               queue.enqueue(
@@ -2642,6 +2657,10 @@ export function createProxyFetchHandler(client) {
                     created_at: now,
                     status: "completed",
                     model: model.id,
+                    // See the tool-call branch above: `output` is required here,
+                    // and the message item must carry its content so clients can
+                    // build the final answer from `response.output`.
+                    output: [completedMessage],
                     usage: {
                       input_tokens: streamResult.tokens.input,
                       output_tokens: streamResult.tokens.output,
