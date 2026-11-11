@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.13.0](https://github.com/KochC/opencode-llm-proxy/compare/v1.12.2...v1.13.0) (2026-11-11)
+
+
+### Features
+
+* add direct upstream passthrough ([#123](https://github.com/KochC/opencode-llm-proxy/issues/123)) ([8c383e6](https://github.com/KochC/opencode-llm-proxy/commit/8c383e69d1ce8a41e189690287fa86e8932d43fa))
+
 ## [1.12.2](https://github.com/KochC/opencode-llm-proxy/compare/v1.12.1...v1.12.2) (2026-11-11)
 
 
